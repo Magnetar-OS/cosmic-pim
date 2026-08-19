@@ -1,31 +1,85 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Mail for the COSMIC PIM suite: message model, maildir store, threading, and
-//! IMAP sync.
+//! Mail for the COSMIC PIM suite: the message model, a maildir store,
+//! threading, and IMAP sync.
 //!
-//! Stands *beside* `cosmic-pim-caldav` rather than on it. IMAP is not a WebDAV
-//! flavour and shares none of its plumbing — but it does share the invariants,
-//! and they are the reason this crate is shaped the way it is:
+//! # Where this sits
 //!
-//! - **Files are the source of truth.** Maildir, not SQLite. A SQLite message
-//!   store would be the first place the suite breaks its own rule, and the
-//!   "walk away with your data" promise goes with it. `mbsync`, `notmuch`, and
-//!   `mu` read the same directories.
-//! - **Message bytes are verbatim.** The maildir file holds the server's RFC
-//!   5322 bytes exactly as the vdir holds a server's iCalendar text. The model
-//!   extracts; it never re-serialises.
-//! - **The index is disposable.** Whatever ranks search (tantivy, ported from
-//!   the donor) has the same status as the calendar's SQLite cache: delete it,
-//!   it rebuilds.
-//! - **Push before pull.** Flag changes are writeback. "My read marks keep
-//!   reverting" is the same bug as "my edits keep reverting", with the same
-//!   cause and the same fix.
-//! - **UIDVALIDITY is the 412 analogue.** A change means the server's numbering
-//!   was rebuilt underneath us and local state for that mailbox is stale — it
-//!   exits the retry loop into a resync, exactly as a stale etag does.
+//! Beside `cosmic-pim-caldav`, not on top of it. CalDAV and CardDAV are the
+//! same protocol with four substitutions, which is why they share one engine
+//! behind a `Flavor` enum. IMAP is not a third flavour of anything: it is a
+//! stateful session protocol with its own consistency model (UIDVALIDITY,
+//! MODSEQ), and pretending otherwise would mean a fifth field on `Flavor` that
+//! every DAV code path has to ignore.
 //!
-//! See `ARCHITECTURE.md` in this repository for the full set, and `04-envelope`
-//! for the port plan.
+//! What *is* shared is everything below the protocol: `cosmic_pim_core::atomic`
+//! for crash-safe writes, `cosmic_pim_core::model::Contact` for resolving a
+//! sender to a real person out of the same address book Circle shows, and
+//! `cosmic-pim-accounts` for credentials — one Fastmail account, not one per
+//! app.
+//!
+//! # Shape
+//!
+//! - [`model`] — what a message *is*, extracted from bytes we never rewrite.
+//! - [`text`] — HTML → what a human would actually see, and a count of what was
+//!   hidden.
+//! - [`auth`] — `Authentication-Results` (RFC 8601), per hop and mechanism.
+//! - [`threading`] — JWZ threading with deterministic thread ids.
+//! - [`folder`] — mailbox names, hierarchy, and RFC 6154 special use.
+//! - [`store`] — the [`MailStore`] trait: what a backing store must provide.
+//! - [`maildir`] — [`MailStore`] over a maildir, so `mbsync`, `mu`, and
+//!   `notmuch` read the same files.
+//! - [`plan`] — the reconciliation decision, as a pure function.
+//! - [`push`] — durable writeback for flag changes, moves, and deletions.
+//! - [`imap`] — the session, and the cycle that ties the rest together.
+//!
+//! # The invariants, translated
+//!
+//! `ARCHITECTURE.md` states these for calendars. They are not analogies here;
+//! they are the same invariants over a different wire format.
+//!
+//! **Files are the truth, the index is disposable.** A maildir, not a SQLite
+//! message table — a SQLite message store would be the first place the suite
+//! breaks its own rule, and the "walk away with your data" promise goes with
+//! it. Sync state — UIDVALIDITY, the UID cursor, MODSEQ — is server-opaque and
+//! cannot be reconstructed from the files, so it lives in a sidecar beside
+//! them, never in an index.
+//!
+//! **Server bytes are stored verbatim.** [`model::Message`] covers what the UI
+//! shows, which is a fraction of what an RFC 5322 message carries. Storing the
+//! model instead of the bytes would discard MIME structure, signatures, and
+//! every header nobody has thought about yet — and a signature that survives
+//! the trip is the *entire* value of DKIM.
+//!
+//! **Writeback is queued and durable.** A `\Seen` flag that fails to reach the
+//! server and is then forgotten diverges permanently, for exactly the reason a
+//! dropped CalDAV PUT does: the server's state never changed, so the next pull
+//! finds nothing to reconcile.
+//!
+//! **Push before pull.** The other order lets a pull overwrite a local flag
+//! change with the server's older copy. It presents as "my read marks keep
+//! reverting" — the same bug as "my edits keep reverting", one wire format over.
+//!
+//! **UIDVALIDITY is the 412.** A stale etag means "re-read before you write".
+//! A changed UIDVALIDITY means the same thing about an entire mailbox: every UID
+//! we hold now names a different message, or nothing. It is never retryable and
+//! must never be handled by pushing harder.
 
-// Scaffold: this crate is being built out. Modules land here as they are
-// ported — model and maildir store first, then threading, then IMAP.
+pub mod auth;
+pub mod error;
+pub mod folder;
+pub mod imap;
+pub mod maildir;
+pub mod model;
+pub mod plan;
+pub mod push;
+pub mod store;
+pub mod text;
+pub mod threading;
+
+pub use error::{Error, Result};
+pub use folder::{Folder, SpecialUse};
+pub use model::{Flags, Mailbox, Message};
+pub use plan::{MailboxPlan, plan_fetch, plan_reconcile};
+pub use store::{Cursor, MailStore, MailboxState, MemoryStore, RemoteMessage};
+pub use threading::{ThreadIndex, ThreadResolution, Threadable, resolve_thread};

@@ -191,7 +191,7 @@ pub fn patch_attendee_partstat(ical: &str, me_email: &str, partstat: &str) -> Op
         let (raw, unfolded) = (line.raw(), line.unfolded());
         emit_rsvp_logical_line(
             raw,
-            &unfolded,
+            unfolded,
             me_lower,
             partstat,
             term,
@@ -475,7 +475,7 @@ pub fn patch_event_ics(ical: &str, target_rid: &str, patch: &LocalEventPatch) ->
 
     for line in logical_lines(ical) {
         let (raw, unfolded) = (line.raw(), line.unfolded());
-        if let Some((is_begin, name)) = component_delimiter(&unfolded) {
+        if let Some((is_begin, name)) = component_delimiter(unfolded) {
             if is_begin {
                 if name == "VEVENT" && !in_vevent {
                     in_vevent = true;
@@ -524,10 +524,10 @@ pub fn patch_event_ics(ical: &str, target_rid: &str, patch: &LocalEventPatch) ->
             if subcomponent_depth > 0 {
                 continue; // dropped VALARM content
             }
-            match line_property_name(&unfolded).as_str() {
+            match line_property_name(unfolded).as_str() {
                 "SUMMARY" | "LOCATION" | "DESCRIPTION" | "RRULE" | "DURATION" | "DTSTAMP" => {}
                 "SEQUENCE" => {
-                    let colon = find_unquoted_colon(&unfolded).unwrap_or(unfolded.len());
+                    let colon = find_unquoted_colon(unfolded).unwrap_or(unfolded.len());
                     orig_sequence = unfolded
                         .get(colon + 1..)
                         .unwrap_or("")

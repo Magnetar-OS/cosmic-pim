@@ -11,7 +11,7 @@ on so that a sync bug is fixed once rather than three times.
 | Repository | App | What it is | State |
 |---|---|---|---|
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
-| [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book. Writing is blocked on the content-line patcher moving to `core` — see ARCHITECTURE |
+| [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
 | [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Scaffold — the mail engine is not in the substrate yet |
 | **cosmic-pim** | — | This substrate | 290 tests |
 

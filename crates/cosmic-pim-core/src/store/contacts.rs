@@ -64,18 +64,38 @@ pub fn read_book(meta: &CalendarMeta) -> Vec<Contact> {
     out
 }
 
-/// Writes a contact, atomically.
+/// Writes a contact, atomically and losslessly.
 ///
-/// **Lossy for a synced contact.** [`to_vcard`] serialises only the modelled
-/// fields, so a contact that came from a server loses its PHOTO and every other
-/// property this crate does not represent. Callers must not use this to save an
-/// edit to a synced contact until a vCard patcher exists — see
-/// [`crate::vcard`].
+/// A contact that came from a server carries its source bytes in
+/// [`Contact::raw`]; this **patches** those, so PHOTO, GEO, `X-` properties,
+/// and Apple-grouped labels all survive an edit. Only a contact with no source
+/// — one this app created — is serialised from the model.
+///
+/// The distinction is not cosmetic. Re-serialising a synced card would delete
+/// whatever the model does not represent, and the loss would only become
+/// visible after the next push, on every device the user owns.
 pub fn write_contact(meta: &CalendarMeta, contact: &Contact) -> Result<(), StoreError> {
     if meta.read_only {
         return Err(StoreError::ReadOnly(meta.name.clone()));
     }
-    crate::atomic::write(&meta.path.join(&contact.file_name), &to_vcard(contact), None)
+
+    let text = match crate::vcard::patch_vcard(&contact.raw, contact) {
+        Some(patched) => patched,
+        None => {
+            // No source to patch: a new contact, or a `raw` that holds no
+            // VCARD. Building from the model is correct here and lossless by
+            // definition — there is nothing to lose.
+            if !contact.raw.trim().is_empty() {
+                tracing::warn!(
+                    uid = contact.uid,
+                    "stored vCard could not be patched; rebuilding from the model"
+                );
+            }
+            to_vcard(contact)
+        }
+    };
+
+    crate::atomic::write(&meta.path.join(&contact.file_name), &text, None)
         .map(|_| ())
         .map_err(Into::into)
 }
@@ -340,5 +360,92 @@ mod tests {
         assert!(store.books().is_empty());
         assert!(store.default_book().is_none());
         assert!(store.contacts().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lossless_write_tests {
+    use super::*;
+    use crate::model::Rgb;
+
+    const SYNCED: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:ada@server\r\n\
+FN:Ada Lovelace\r\nEMAIL;TYPE=work:ada@work.example\r\n\
+item1.EMAIL;type=INTERNET:ada@home.example\r\nitem1.X-ABLabel:Summer house\r\n\
+PHOTO;ENCODING=b:AAAABBBB\r\nX-ABShowAs:COMPANY\r\nEND:VCARD\r\n";
+
+    fn book() -> (tempfile::TempDir, ContactStore, CalendarMeta) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ContactStore::open(&dir.path().join("contacts")).unwrap();
+        let meta = store.create_book("Contacts", Rgb(1, 2, 3)).unwrap();
+        (dir, store, meta)
+    }
+
+    #[test]
+    fn editing_a_synced_contact_keeps_everything_the_model_does_not_carry() {
+        let (_dir, mut store, meta) = book();
+        write_contact_raw(&meta, "ada.vcf", SYNCED).unwrap();
+
+        let mut contact = store.contacts().remove(0);
+        contact.display_name = "Ada Byron".into();
+        store.save(&contact).unwrap();
+
+        let on_disk = std::fs::read_to_string(meta.path.join("ada.vcf")).unwrap();
+        assert!(on_disk.contains("FN:Ada Byron"), "the edit did not land");
+        assert!(
+            on_disk.contains("PHOTO;ENCODING=b:AAAABBBB"),
+            "the photo was destroyed by a name change: {on_disk}"
+        );
+        assert!(on_disk.contains("X-ABShowAs:COMPANY"));
+        assert!(on_disk.contains("item1.X-ABLabel:Summer house"));
+    }
+
+    #[test]
+    fn a_grouped_address_is_not_duplicated_by_a_save() {
+        let (_dir, mut store, meta) = book();
+        write_contact_raw(&meta, "ada.vcf", SYNCED).unwrap();
+
+        // Save twice — the bug this guards against grew a duplicate each time.
+        for _ in 0..2 {
+            let contact = store.contacts().remove(0);
+            store.save(&contact).unwrap();
+        }
+
+        let back = store.contacts().remove(0);
+        assert_eq!(
+            back.emails.len(),
+            2,
+            "a grouped address was rewritten as an ungrouped duplicate"
+        );
+        let on_disk = std::fs::read_to_string(meta.path.join("ada.vcf")).unwrap();
+        assert_eq!(on_disk.matches("ada@home.example").count(), 1);
+    }
+
+    #[test]
+    fn a_contact_this_app_created_is_still_written_from_the_model() {
+        let (_dir, mut store, meta) = book();
+        let mut contact = Contact::draft(&meta.id);
+        contact.display_name = "New Person".into();
+        assert!(contact.raw.is_empty(), "a draft should carry no source");
+
+        store.save(&contact).unwrap();
+        assert_eq!(store.contacts()[0].label(), "New Person");
+    }
+
+    #[test]
+    fn clearing_a_modelled_field_removes_it_without_touching_the_rest() {
+        let (_dir, mut store, meta) = book();
+        write_contact_raw(&meta, "ada.vcf", SYNCED).unwrap();
+
+        let mut contact = store.contacts().remove(0);
+        contact.emails.clear();
+        store.save(&contact).unwrap();
+
+        let on_disk = std::fs::read_to_string(meta.path.join("ada.vcf")).unwrap();
+        assert!(!on_disk.contains("EMAIL;TYPE=work"), "{on_disk}");
+        assert!(
+            on_disk.contains("item1.EMAIL"),
+            "clearing the list removed a grouped address it does not own"
+        );
+        assert!(on_disk.contains("PHOTO;ENCODING=b:AAAABBBB"));
     }
 }

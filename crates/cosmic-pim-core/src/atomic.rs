@@ -178,6 +178,23 @@ pub fn write(
     contents: &str,
     expected: Option<FileState>,
 ) -> Result<FileState, Error> {
+    write_bytes(target, contents.as_bytes(), expected)
+}
+
+/// [`write`] for content that is not text.
+///
+/// The iCalendar and vCard writers hand this a `&str` because their formats are
+/// defined over characters. A stored mail message is not: RFC 5322 is a byte
+/// format, bodies arrive in every legacy charset there has ever been, and 8-bit
+/// MIME is not required to be valid UTF-8 anywhere. Routing those bytes through
+/// a `&str` would mean either a lossy conversion — silently corrupting the
+/// message *and* invalidating its DKIM signature — or refusing to store mail
+/// that every other client handles.
+pub fn write_bytes(
+    target: &Path,
+    contents: &[u8],
+    expected: Option<FileState>,
+) -> Result<FileState, Error> {
     let parent = target
         .parent()
         .ok_or_else(|| Error::NoParent(target.to_path_buf()))?;
@@ -191,7 +208,7 @@ pub fn write(
     // for the rename. `fs::write` alone would only reach the page cache.
     {
         let mut file = fs::File::create(&temp_path)?;
-        file.write_all(contents.as_bytes())?;
+        file.write_all(contents)?;
         file.sync_all()?;
     }
 

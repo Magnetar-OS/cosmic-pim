@@ -269,13 +269,21 @@ pub fn fold(line: &str, terminator: &str, out: &mut String) {
 /// two.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Edit {
-    /// The **ungrouped** occurrences of this property become exactly these
-    /// complete logical lines, in order. Empty removes them.
+    /// What the **ungrouped** occurrences of this property become.
     ///
-    /// Surplus existing lines are dropped; surplus new lines are inserted where
-    /// the first one was, or before the component's END if it had none. Each
-    /// entry is a whole logical line, e.g. `"EMAIL;TYPE=work:ada@example.com"`.
-    pub lines: Vec<String>,
+    /// Three distinct states, and the distinction matters:
+    ///
+    /// - `Some(lines)` — replace them with exactly these, in order. Surplus
+    ///   existing lines are dropped; surplus new lines are inserted where the
+    ///   first one was, or before the component's END if it had none.
+    /// - `Some(vec![])` — remove them.
+    /// - `None` — leave them alone. For an edit that only rewrites a grouped
+    ///   value, where collapsing "no opinion" into "remove" would delete the
+    ///   user's other addresses as a side effect.
+    ///
+    /// Each entry is a whole logical line, e.g.
+    /// `"EMAIL;TYPE=work:ada@example.com"`.
+    pub lines: Option<Vec<String>>,
 
     /// Group name → new value, for grouped occurrences.
     ///
@@ -290,7 +298,7 @@ impl Edit {
     #[must_use]
     pub fn set(lines: Vec<String>) -> Self {
         Self {
-            lines,
+            lines: Some(lines),
             groups: BTreeMap::new(),
         }
     }
@@ -298,6 +306,12 @@ impl Edit {
     /// Remove the ungrouped occurrences, leaving grouped ones alone.
     #[must_use]
     pub fn remove() -> Self {
+        Self::set(Vec::new())
+    }
+
+    /// Touch only grouped occurrences; leave ungrouped ones exactly as they are.
+    #[must_use]
+    pub fn groups_only() -> Self {
         Self::default()
     }
 
@@ -415,11 +429,13 @@ pub fn patch_nth_component(
             // Any other grouped line is untouchable — see the module docs.
             (_, Some(_)) => out.push_str(line.raw()),
 
+            (Some(Edit { lines: None, .. }), None) => out.push_str(line.raw()),
+
             (Some(edit), None) => {
                 // The replacement set is authoritative: emit it once, at the
                 // position of the first occurrence, and drop the rest.
                 if emitted.insert(name.clone(), true).is_none() {
-                    for replacement in &edit.lines {
+                    for replacement in edit.lines.iter().flatten() {
                         fold(replacement, terminator, &mut out);
                     }
                 }
@@ -433,7 +449,7 @@ pub fn patch_nth_component(
     let mut additions = String::new();
     for (name, edit) in edits {
         if !emitted.contains_key(name) {
-            for replacement in &edit.lines {
+            for replacement in edit.lines.iter().flatten() {
                 fold(replacement, terminator, &mut additions);
             }
         }
@@ -603,7 +619,7 @@ END:VCARD\r\n";
             "VCARD",
             &edits(&[(
                 "EMAIL",
-                Edit::remove().with_group("item1", "moved@home.example"),
+                Edit::groups_only().with_group("item1", "moved@home.example"),
             )]),
         )
         .expect("patched");

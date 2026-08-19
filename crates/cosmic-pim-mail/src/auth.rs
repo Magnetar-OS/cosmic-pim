@@ -419,11 +419,25 @@ mod tests {
     }
 
     #[test]
-    fn a_partially_authenticated_message_is_reported_as_partial() {
-        let hops = parse("mx.example; spf=pass smtp.mailfrom=x@example.com; dkim=none");
-        assert_eq!(rollup(&hops), "pass", "dkim=none is absent, not failed");
-        let hops = parse("mx.example; spf=pass smtp.mailfrom=x@example.com; dkim=neutral header.d=example.com");
-        assert_eq!(rollup(&hops), "partial");
+    fn a_mechanism_that_neither_passed_nor_failed_makes_the_verdict_partial() {
+        // `none` and `neutral` are both "this mechanism asserted nothing".
+        // Reporting the message as a clean pass on the strength of SPF alone
+        // would overstate what was actually verified; reporting it as a
+        // failure would be worse. It is partial, and it says so.
+        for weak in ["none", "neutral header.d=example.com", "temperror"] {
+            let hops = parse(&format!(
+                "mx.example; spf=pass smtp.mailfrom=x@example.com; dkim={weak}"
+            ));
+            assert_eq!(rollup(&hops), "partial", "dkim={weak}");
+        }
+    }
+
+    #[test]
+    fn a_mechanism_the_hop_never_mentioned_does_not_count_against_it() {
+        // Absent is not the same as inconclusive: a hop that only checked SPF
+        // is a clean pass, not a partial one.
+        let hops = parse("mx.example; spf=pass smtp.mailfrom=x@example.com");
+        assert_eq!(rollup(&hops), "pass");
     }
 
     #[test]
