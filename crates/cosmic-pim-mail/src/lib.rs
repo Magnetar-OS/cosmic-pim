@@ -25,6 +25,7 @@
 //!   hidden.
 //! - [`auth`] — `Authentication-Results` (RFC 8601), per hop and mechanism.
 //! - [`compose`] — drafts, and how a reply or a forward is built from a message.
+//! - [`drafts`] — unsent messages, kept on this device.
 //! - [`smtp`] — sending, and the one failure that must never be auto-retried.
 //! - [`threading`] — JWZ threading with deterministic thread ids.
 //! - [`folder`] — mailbox names, hierarchy, and RFC 6154 special use.
@@ -70,6 +71,7 @@
 
 pub mod auth;
 pub mod compose;
+pub mod drafts;
 pub mod error;
 pub mod folder;
 pub mod imap;
@@ -85,6 +87,7 @@ pub mod threading;
 
 pub use error::{Error, Result};
 pub use compose::Draft;
+pub use drafts::Drafts;
 pub use smtp::{Outcome, SmtpEndpoint};
 pub use folder::{Folder, SpecialUse};
 pub use index::{Conversation, Index, Summary};

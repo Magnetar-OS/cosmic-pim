@@ -213,6 +213,13 @@ pub struct Message {
     pub from: Vec<Mailbox>,
     pub to: Vec<Mailbox>,
     pub cc: Vec<Mailbox>,
+    /// Blind carbon copies.
+    ///
+    /// Empty on essentially every *received* message — the header is stripped
+    /// before delivery, which is what the field means. It is present on the
+    /// copies we file ourselves: a message in Sent, and a saved draft, both
+    /// keep it so the sender can still see who they copied.
+    pub bcc: Vec<Mailbox>,
     pub reply_to: Vec<Mailbox>,
     pub subject: String,
     /// The subject with `Re:`/`Fwd:`/`[list]` prefixes stripped — the key
@@ -271,6 +278,7 @@ impl Message {
             from: mailboxes(msg.from()),
             to: mailboxes(msg.to()),
             cc: mailboxes(msg.cc()),
+            bcc: mailboxes(msg.bcc()),
             reply_to: mailboxes(msg.reply_to()),
             subject_norm: crate::threading::normalize_subject(&subject),
             subject,

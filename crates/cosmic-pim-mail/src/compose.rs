@@ -38,7 +38,14 @@ use crate::model::{Mailbox, Message};
 const QUOTE_LIMIT_LINES: usize = 50;
 
 /// A message being written.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Serialisable because that is how a draft is kept between sessions — see
+/// [`crate::drafts`] for why a saved draft is this record rather than RFC 5322
+/// bytes. Note the asymmetry with a *stored* message, which is bytes precisely
+/// because it must never be re-serialised: a draft has never been signed, never
+/// left this machine, and holds only what this type can express.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Draft {
     pub from: Mailbox,
     pub to: Vec<Mailbox>,
