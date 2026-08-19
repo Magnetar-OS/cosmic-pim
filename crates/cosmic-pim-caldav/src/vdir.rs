@@ -34,9 +34,41 @@ use serde::{Deserialize, Serialize};
 use crate::dav::Flavor;
 use crate::error::{Error, Result};
 use crate::push::{PendingPush, PushOp, PushQueue};
-use crate::store::{CalDavStore, CollectionState, RemoteEvent};
+use crate::store::{CalDavStore, CollectionState, Conflict, RemoteEvent};
 
 const STATE_FILE: &str = ".caldav-state.json";
+
+/// Files another sync engine leaves in a collection it owns.
+///
+/// vdirsyncer keeps its status database outside the collection, but writes
+/// per-collection metadata beside the items, and the names are its own.
+/// Anything starting with this prefix means something else is already
+/// synchronising this directory.
+const FOREIGN_SYNC_PREFIX: &str = ".vdirsyncer";
+
+/// The name of a foreign sync engine's file in `path`, if there is one.
+///
+/// # Why this check exists
+///
+/// A vdir can legitimately be synced by vdirsyncer *or* by this crate. Both at
+/// once is a divergence machine: the two keep independent state and neither
+/// knows the other exists, so each sees the other's writes as an unexpected
+/// etag, re-fetches, re-pushes, and the collection oscillates between two
+/// versions for as long as both are running. Nothing in either engine detects
+/// it, because from the inside each one is behaving correctly.
+///
+/// The check is deliberately shallow — one directory read, matching on a name
+/// prefix. Parsing vdirsyncer's configuration to find out which collections it
+/// claims would be more thorough and much more fragile; a marker file in the
+/// directory is evidence that needs no interpretation.
+#[must_use]
+pub fn foreign_sync_marker(path: &std::path::Path) -> Option<String> {
+    std::fs::read_dir(path)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with(FOREIGN_SYNC_PREFIX))
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SidecarState {
@@ -46,6 +78,19 @@ struct SidecarState {
     /// later sync can find its way back without re-running discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     href: Option<String>,
+    /// The user has been warned that another engine syncs this collection and
+    /// asked for it to be synced anyway. See
+    /// [`VdirStore::acknowledge_sole_ownership`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sole_owner_acknowledged: bool,
+    /// Whether this directory holds calendars or contacts.
+    ///
+    /// Recorded rather than inferred from which root it sits under: the
+    /// collection is then self-describing, and every entry point that opens one
+    /// — writeback, conflict resolution, a future repair tool — gets the right
+    /// file extension and payload check without being told which kind it is.
+    #[serde(default)]
+    flavor: Flavor,
     /// The server's `current-user-privilege-set` grant, as discovered.
     ///
     /// Kept here rather than derived from directory permissions: the vdir is
@@ -64,6 +109,15 @@ struct SidecarState {
     /// so the next pull sees nothing to reconcile. See [`crate::push`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<PendingPush>,
+    /// Resources both sides changed, awaiting a decision from the user.
+    ///
+    /// The server's bytes live here rather than on disk because the local file
+    /// is still holding the local edit — that is the point. Bounded by the
+    /// number of unresolved conflicts, which is a handful at worst, so keeping
+    /// payloads in the sidecar costs nothing the way keeping every item's
+    /// payload would. See [`crate::store::Conflict`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts: Vec<Conflict>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,17 +156,21 @@ impl VdirStore {
         };
         Ok(Self {
             meta,
+            flavor: state.flavor,
             state,
-            flavor: Flavor::CalDav,
         })
     }
 
-    /// Opens an address-book collection rather than a calendar.
+    /// Opens a collection as an address book, whatever its sidecar says.
+    ///
+    /// Only provisioning needs this: a collection being set up for the first
+    /// time has no sidecar to have recorded a flavour in yet. Afterwards
+    /// [`Self::open`] reads it back and this is unnecessary.
     pub fn open_carddav(meta: CalendarMeta) -> Result<Self> {
-        Ok(Self {
-            flavor: Flavor::CardDav,
-            ..Self::open(meta)?
-        })
+        let mut store = Self::open(meta)?;
+        store.flavor = Flavor::CardDav;
+        store.state.flavor = Flavor::CardDav;
+        Ok(store)
     }
 
     #[must_use]
@@ -145,10 +203,38 @@ impl VdirStore {
         self.state.read_only
     }
 
+    /// Another sync engine's marker file in this collection, if there is one.
+    ///
+    /// See [`foreign_sync_marker`]. Provisioning refuses such a collection
+    /// until [`Self::acknowledge_sole_ownership`] says a human has been asked.
+    #[must_use]
+    pub fn foreign_sync_marker(&self) -> Option<String> {
+        if self.state.sole_owner_acknowledged {
+            return None;
+        }
+        foreign_sync_marker(&self.meta.path)
+    }
+
+    /// Records that the user was told another engine syncs this collection and
+    /// chose to proceed anyway.
+    ///
+    /// Durable, because the question is about the collection rather than about
+    /// this run, and asking it again every five seconds would train the user to
+    /// dismiss it. Reversible only by editing the sidecar — which is the right
+    /// weight for "yes, I really do want two sync engines here".
+    pub fn acknowledge_sole_ownership(&mut self) -> Result<()> {
+        self.state.sole_owner_acknowledged = true;
+        self.save_sidecar()
+    }
+
     /// Records what discovery learned about this collection.
+    ///
+    /// Provisioning calls this, which is where the flavour becomes durable:
+    /// from here on, opening the collection is enough to know what it holds.
     pub fn set_remote(&mut self, href: &str, read_only: bool) -> Result<()> {
         self.state.href = Some(href.to_owned());
         self.state.read_only = read_only;
+        self.state.flavor = self.flavor;
         self.save_sidecar()
     }
 
@@ -221,6 +307,91 @@ impl VdirStore {
             href: href.to_owned(),
             etag,
         })
+    }
+
+    /// Resources both sides changed, still awaiting a decision.
+    ///
+    /// The application shows these; nothing here resolves itself with time.
+    /// Until one of the two resolvers below is called, the local file keeps the
+    /// local edit and the queued push stays parked.
+    #[must_use]
+    pub fn conflicts(&self) -> &[Conflict] {
+        &self.state.conflicts
+    }
+
+    /// Whether `href` is currently in conflict.
+    #[must_use]
+    pub fn conflict_for(&self, href: &str) -> Option<&Conflict> {
+        self.state.conflicts.iter().find(|c| c.href == href)
+    }
+
+    /// Take the server's version: the local edit is discarded.
+    ///
+    /// The remote bytes recorded at detection time are written to the file and
+    /// its etag is already current, so this completes without touching the
+    /// network. The queued push goes with the edit it was carrying.
+    pub fn resolve_conflict_take_remote(&mut self, href: &str) -> Result<bool> {
+        let Some(conflict) = self.conflict_for(href).cloned() else {
+            return Ok(false);
+        };
+
+        self.upsert(&RemoteEvent {
+            href: conflict.href.clone(),
+            etag: conflict.remote_etag.clone(),
+            ics: conflict.remote.clone(),
+        })?;
+
+        self.resolve(href)?;
+        self.clear_conflict(href)
+    }
+
+    /// Keep the local version: it is re-queued and will overwrite the server's.
+    ///
+    /// `merged` is for the third answer — neither copy as it stands, but a text
+    /// the user (or a property-level merge) produced from both. `None` keeps
+    /// the file exactly as it is.
+    ///
+    /// The re-queued push carries the etag recorded when the conflict was
+    /// detected, which is the server's current one, so the `If-Match` matches
+    /// and the write is accepted. That is the whole reason detection records
+    /// the etag rather than discarding it.
+    pub fn resolve_conflict_keep_local(
+        &mut self,
+        href: &str,
+        merged: Option<&str>,
+    ) -> Result<bool> {
+        let Some(conflict) = self.conflict_for(href).cloned() else {
+            return Ok(false);
+        };
+
+        if let Some(text) = merged {
+            let file = self.file_name_for(&conflict.href);
+            let target = self.meta.path.join(&file);
+            atomic::write(&target, text, None)
+                .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
+            self.state.entries.insert(
+                conflict.href.clone(),
+                SidecarEntry {
+                    file,
+                    etag: conflict.remote_etag.clone(),
+                },
+            );
+        }
+
+        // Re-queueing rather than un-parking: `enqueue` reads the etag we now
+        // hold, which is the server's, and clears the block in one step.
+        self.queue_put(href)?;
+        self.clear_conflict(href)
+    }
+
+    fn clear_conflict(&mut self, href: &str) -> Result<bool> {
+        let before = self.state.conflicts.len();
+        self.state.conflicts.retain(|c| c.href != href);
+        if self.state.conflicts.len() == before {
+            return Ok(false);
+        }
+        self.save_sidecar()?;
+        Ok(true)
     }
 
     fn state_path(&self) -> PathBuf {
@@ -369,9 +540,16 @@ impl CalDavStore for VdirStore {
         let file = self.file_name_for(&event.href);
         let target = self.meta.path.join(&file);
 
+        // Read before writing: what the file held a moment ago is what a queued
+        // push for this href would have sent, and the two being equal is the
+        // one case where that push has nothing left to do.
+        let previous = std::fs::read_to_string(&target).ok();
+
         // Unguarded: the server's copy is authoritative for a resource we are
-        // pulling. The guarded path exists for the opposite direction, where a
-        // local edit must not clobber something sync brought down.
+        // pulling. The caller is responsible for having established that there
+        // is no unsent local edit here — see `CalDavStore::unpushed_local` and
+        // the conflict path in `crate::sync`, which is what keeps this write
+        // from being the one that eats somebody's change.
         atomic::write(&target, &event.ics, None)
             .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
 
@@ -382,6 +560,18 @@ impl CalDavStore for VdirStore {
                 etag: event.etag.clone(),
             },
         );
+
+        // A queued push whose payload is what the server just sent us has
+        // nothing left to send. Without this, a push parked on a 412 whose
+        // change reached the server by another route (a second client, the
+        // same edit made twice) would stay parked forever and the UI would
+        // claim unsaved changes that no longer exist.
+        if previous.as_deref() == Some(event.ics.as_str()) {
+            self.state.pending.retain(
+                |entry| !matches!(&entry.op, PushOp::Put { href, .. } if href == &event.href),
+            );
+        }
+
         self.save_sidecar()
     }
 
@@ -400,6 +590,54 @@ impl CalDavStore for VdirStore {
 
     fn commit_ctag(&mut self, ctag: Option<&str>) -> Result<()> {
         self.state.ctag = ctag.map(ToOwned::to_owned);
+        self.save_sidecar()
+    }
+
+    /// The file's current bytes, when a PUT for this href is still queued.
+    ///
+    /// A queued **delete** answers `None` on purpose. Its conflict — we removed
+    /// the resource, the server edited it — resolves itself in practice, and
+    /// resolves the safe way: writeback drains before the pull, so an
+    /// online client sends the DELETE first and the server stops listing the
+    /// resource. An offline one lets the pull restore the file, and the DELETE
+    /// still goes out when the network returns. A resurrected event that
+    /// disappears again on the next sync is a visible annoyance; it is not the
+    /// silent loss this method exists to prevent.
+    fn unpushed_local(&self, href: &str) -> Result<Option<String>> {
+        let queued_put = self.state.pending.iter().any(|entry| {
+            matches!(&entry.op, PushOp::Put { href: h, .. } if h == href)
+        });
+        if !queued_put {
+            return Ok(None);
+        }
+        let Some(entry) = self.state.entries.get(href) else {
+            // Queued but never synced: the server cannot have changed a
+            // resource it has not given us, so there is nothing to diff.
+            return Ok(None);
+        };
+        Ok(std::fs::read_to_string(self.meta.path.join(&entry.file)).ok())
+    }
+
+    fn record_conflict(&mut self, conflict: &Conflict) -> Result<()> {
+        // The etag moves to the server's current value; the payload does not.
+        // Recording the etag is what stops the next cycle re-fetching the same
+        // divergence, and it is exactly the If-Match a resolution will need.
+        if let Some(entry) = self.state.entries.get_mut(&conflict.href) {
+            entry.etag = conflict.remote_etag.clone();
+        }
+
+        // The queued push must stop trying. Its bytes would overwrite the
+        // server's change, and with the etag now current it would *succeed* at
+        // doing so — silently losing the remote side instead of the local one.
+        for entry in &mut self.state.pending {
+            if entry.op.href() == conflict.href {
+                entry.blocked = true;
+                entry.last_error = Some("waiting on a conflict to be resolved".to_owned());
+            }
+        }
+
+        self.state.conflicts.retain(|c| c.href != conflict.href);
+        self.state.conflicts.push(conflict.clone());
         self.save_sidecar()
     }
 }
@@ -615,12 +853,15 @@ impl PushQueue for VdirStore {
             existing.attempts = 0;
             existing.next_attempt_ms = 0;
             existing.last_error = None;
+            // A fresh edit supersedes whatever the last one was held up by.
+            existing.blocked = false;
         } else {
             self.state.pending.push(PendingPush {
                 op,
                 attempts: 0,
                 next_attempt_ms: 0,
                 last_error: None,
+                blocked: false,
             });
         }
         self.save_sidecar()
@@ -644,6 +885,20 @@ impl PushQueue for VdirStore {
         {
             entry.attempts = entry.attempts.saturating_add(1);
             entry.next_attempt_ms = next_attempt_ms;
+            entry.last_error = Some(error.to_owned());
+            self.save_sidecar()?;
+        }
+        Ok(())
+    }
+
+    fn park(&mut self, href: &str, error: &str) -> Result<()> {
+        if let Some(entry) = self
+            .state
+            .pending
+            .iter_mut()
+            .find(|e| e.op.href() == href)
+        {
+            entry.blocked = true;
             entry.last_error = Some(error.to_owned());
             self.save_sidecar()?;
         }
@@ -846,5 +1101,317 @@ PHOTO;ENCODING=b:AAAA\r\nEND:VCARD\r\n";
             ics: "<!DOCTYPE html><html>sign in</html>".into(),
         });
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+    use cosmic_pim_core::model::Rgb;
+    use cosmic_pim_core::store::vdir;
+
+    const SERVER_V1: &str = "BEGIN:VCALENDAR\r\nX-V:1\r\nEND:VCALENDAR\r\n";
+    const LOCAL_EDIT: &str = "BEGIN:VCALENDAR\r\nX-V:1-mine\r\nEND:VCALENDAR\r\n";
+    const SERVER_V2: &str = "BEGIN:VCALENDAR\r\nX-V:2-theirs\r\nEND:VCALENDAR\r\n";
+
+    const HREF: &str = "/cal/a.ics";
+
+    /// A collection holding one synced event that the user has since edited
+    /// without the push getting through — the state every conflict starts from.
+    fn diverged() -> (tempfile::TempDir, VdirStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        let mut store = VdirStore::open(meta).unwrap();
+        store.set_remote("/cal/", false).unwrap();
+        store
+            .upsert(&RemoteEvent {
+                href: HREF.into(),
+                etag: "\"v1\"".into(),
+                ics: SERVER_V1.into(),
+            })
+            .unwrap();
+
+        std::fs::write(store.collection().path.join("a.ics"), LOCAL_EDIT).unwrap();
+        store.queue_put(HREF).unwrap();
+        (dir, store)
+    }
+
+    fn file(store: &VdirStore) -> String {
+        std::fs::read_to_string(store.collection().path.join("a.ics")).unwrap()
+    }
+
+    /// Applying what the pull would apply, once it has decided this is a
+    /// conflict. Mirrors the branch in `crate::sync`.
+    fn record(store: &mut VdirStore) {
+        let local = store.unpushed_local(HREF).unwrap().expect("an unsent edit");
+        store
+            .record_conflict(&Conflict {
+                href: HREF.into(),
+                local,
+                remote: SERVER_V2.into(),
+                remote_etag: "\"v2\"".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn an_unsent_edit_is_visible_to_the_pull_path() {
+        let (_dir, store) = diverged();
+        assert_eq!(store.unpushed_local(HREF).unwrap().as_deref(), Some(LOCAL_EDIT));
+    }
+
+    #[test]
+    fn a_resource_with_no_queued_push_has_nothing_unsent() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        let mut store = VdirStore::open(meta).unwrap();
+        store
+            .upsert(&RemoteEvent {
+                href: HREF.into(),
+                etag: "\"v1\"".into(),
+                ics: SERVER_V1.into(),
+            })
+            .unwrap();
+
+        assert_eq!(store.unpushed_local(HREF).unwrap(), None);
+    }
+
+    #[test]
+    fn a_queued_delete_is_not_treated_as_unsent_content() {
+        // Delete-versus-edit resolves itself through push-before-pull; see the
+        // note on `unpushed_local`. What must not happen is a conflict record
+        // holding the bytes of a file the user asked to remove.
+        let (_dir, mut store) = diverged();
+        store.resolve(HREF).unwrap();
+        store.queue_delete(HREF).unwrap();
+
+        assert_eq!(store.unpushed_local(HREF).unwrap(), None);
+    }
+
+    #[test]
+    fn recording_a_conflict_keeps_the_local_file_untouched() {
+        // The entire point: the pull must not write the server's copy over an
+        // edit that has not been sent yet.
+        let (_dir, mut store) = diverged();
+        record(&mut store);
+
+        assert_eq!(file(&store), LOCAL_EDIT, "the local edit was overwritten");
+        assert_eq!(store.conflicts().len(), 1);
+        assert_eq!(store.conflict_for(HREF).unwrap().remote, SERVER_V2);
+    }
+
+    #[test]
+    fn recording_a_conflict_adopts_the_servers_etag_and_parks_the_push() {
+        let (_dir, mut store) = diverged();
+        record(&mut store);
+
+        assert_eq!(
+            store.entry_for(HREF).unwrap().1,
+            "\"v2\"",
+            "the server's etag was not adopted, so the next cycle re-fetches the same divergence"
+        );
+        assert!(
+            store.pending()[0].blocked,
+            "the queued push was left live; with the etag now current it would \
+             have succeeded at overwriting the server's change"
+        );
+    }
+
+    #[test]
+    fn a_conflict_survives_a_reopen() {
+        let (dir, mut store) = diverged();
+        record(&mut store);
+
+        let meta = vdir::collections(dir.path()).remove(0);
+        let reopened = VdirStore::open(meta).unwrap();
+
+        let conflict = reopened.conflict_for(HREF).expect("conflict lost on restart");
+        assert_eq!(conflict.local, LOCAL_EDIT);
+        assert_eq!(conflict.remote, SERVER_V2);
+    }
+
+    #[test]
+    fn taking_the_remote_version_writes_it_and_drops_the_push() {
+        let (_dir, mut store) = diverged();
+        record(&mut store);
+
+        assert!(store.resolve_conflict_take_remote(HREF).unwrap());
+
+        assert_eq!(file(&store), SERVER_V2);
+        assert_eq!(store.entry_for(HREF).unwrap().1, "\"v2\"");
+        assert!(store.pending().is_empty(), "a push survived the edit it carried");
+        assert!(store.conflicts().is_empty());
+    }
+
+    #[test]
+    fn keeping_the_local_version_requeues_it_against_the_servers_etag() {
+        let (_dir, mut store) = diverged();
+        record(&mut store);
+
+        assert!(store.resolve_conflict_keep_local(HREF, None).unwrap());
+
+        assert_eq!(file(&store), LOCAL_EDIT, "the local copy was not kept");
+        assert!(store.conflicts().is_empty());
+
+        let entry = &store.pending()[0];
+        assert!(!entry.blocked, "the resolved push stayed parked");
+        let PushOp::Put { etag, .. } = &entry.op else {
+            panic!("expected a Put");
+        };
+        assert_eq!(
+            etag.as_deref(),
+            Some("\"v2\""),
+            "re-queued with the stale etag, so the resolution would 412 exactly as the original did"
+        );
+    }
+
+    #[test]
+    fn a_merged_resolution_is_what_gets_pushed() {
+        const MERGED: &str = "BEGIN:VCALENDAR\r\nX-V:merged\r\nEND:VCALENDAR\r\n";
+        let (_dir, mut store) = diverged();
+        record(&mut store);
+
+        assert!(store.resolve_conflict_keep_local(HREF, Some(MERGED)).unwrap());
+
+        assert_eq!(file(&store), MERGED);
+        assert_eq!(store.payload("a.ics").as_deref(), Some(MERGED));
+    }
+
+    #[test]
+    fn resolving_something_that_is_not_in_conflict_is_not_an_error() {
+        let (_dir, mut store) = diverged();
+        assert!(!store.resolve_conflict_take_remote(HREF).unwrap());
+        assert!(!store.resolve_conflict_keep_local(HREF, None).unwrap());
+    }
+
+    #[test]
+    fn a_push_the_server_already_has_stops_being_pending() {
+        // The parked-forever case: the same change reached the server by
+        // another route, so the pull brings back exactly what we were queued to
+        // send. Nothing is left to push, and the UI must stop saying otherwise.
+        let (_dir, mut store) = diverged();
+        store
+            .upsert(&RemoteEvent {
+                href: HREF.into(),
+                etag: "\"v9\"".into(),
+                ics: LOCAL_EDIT.into(),
+            })
+            .unwrap();
+
+        assert!(store.pending().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod flavor_tests {
+    use super::*;
+    use cosmic_pim_core::model::Rgb;
+    use cosmic_pim_core::store::vdir;
+
+    const VCARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ada\r\nUID:a@test\r\nEND:VCARD\r\n";
+
+    #[test]
+    fn an_address_book_stays_an_address_book_across_a_reopen() {
+        // Writeback and conflict resolution both open a collection by id with
+        // no idea what it holds. If the flavour did not survive, they would
+        // write `.ics` files into an address book and refuse every vCard as an
+        // implausible payload.
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "People", Rgb(1, 2, 3)).unwrap();
+        let mut store = VdirStore::open_carddav(meta).unwrap();
+        store.set_remote("/dav/contacts/", false).unwrap();
+
+        let meta = vdir::collections(dir.path()).remove(0);
+        let reopened = VdirStore::open(meta).unwrap();
+
+        assert_eq!(reopened.flavor(), Flavor::CardDav);
+    }
+
+    #[test]
+    fn a_reopened_address_book_stores_vcards_under_vcf() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "People", Rgb(1, 2, 3)).unwrap();
+        let mut store = VdirStore::open_carddav(meta).unwrap();
+        store.set_remote("/dav/contacts/", false).unwrap();
+
+        let meta = vdir::collections(dir.path()).remove(0);
+        let mut reopened = VdirStore::open(meta).unwrap();
+        reopened
+            .upsert(&RemoteEvent {
+                href: "/dav/contacts/ada.vcf".into(),
+                etag: "\"1\"".into(),
+                ics: VCARD.into(),
+            })
+            .unwrap();
+
+        assert!(reopened.collection().path.join("ada.vcf").exists());
+    }
+
+    #[test]
+    fn a_collection_with_no_recorded_flavour_is_a_calendar() {
+        // Sidecars written before the flavour existed, and any hand-made one.
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        std::fs::write(meta.path.join(STATE_FILE), r#"{"ctag":"x"}"#).unwrap();
+
+        assert_eq!(VdirStore::open(meta).unwrap().flavor(), Flavor::CalDav);
+    }
+}
+
+#[cfg(test)]
+mod sync_ownership_tests {
+    use super::*;
+    use cosmic_pim_core::model::Rgb;
+    use cosmic_pim_core::store::vdir;
+
+    fn collection() -> (tempfile::TempDir, CalendarMeta) {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        (dir, meta)
+    }
+
+    #[test]
+    fn a_collection_nothing_else_syncs_is_free_to_take() {
+        let (_dir, meta) = collection();
+        assert_eq!(foreign_sync_marker(&meta.path), None);
+        assert_eq!(VdirStore::open(meta).unwrap().foreign_sync_marker(), None);
+    }
+
+    #[test]
+    fn a_vdirsyncer_managed_collection_is_recognised() {
+        // Two engines on one collection is the divergence machine described on
+        // `foreign_sync_marker`; this is the evidence that stops it.
+        let (_dir, meta) = collection();
+        std::fs::write(meta.path.join(".vdirsyncer.collection.items"), "").unwrap();
+
+        assert_eq!(
+            VdirStore::open(meta).unwrap().foreign_sync_marker().as_deref(),
+            Some(".vdirsyncer.collection.items")
+        );
+    }
+
+    #[test]
+    fn our_own_sidecar_is_not_mistaken_for_a_rival() {
+        let (_dir, meta) = collection();
+        let mut store = VdirStore::open(meta.clone()).unwrap();
+        store.set_remote("/cal/", false).unwrap();
+
+        assert!(meta.path.join(STATE_FILE).exists(), "no sidecar was written");
+        assert_eq!(store.foreign_sync_marker(), None);
+    }
+
+    #[test]
+    fn an_acknowledged_collection_syncs_despite_the_marker() {
+        let (dir, meta) = collection();
+        std::fs::write(meta.path.join(".vdirsyncer.collection.items"), "").unwrap();
+
+        let mut store = VdirStore::open(meta).unwrap();
+        store.acknowledge_sole_ownership().unwrap();
+        assert_eq!(store.foreign_sync_marker(), None);
+
+        // And it stays acknowledged: asking again on every five-second poll
+        // teaches the user to dismiss the question without reading it.
+        let meta = vdir::collections(dir.path()).remove(0);
+        assert_eq!(VdirStore::open(meta).unwrap().foreign_sync_marker(), None);
     }
 }

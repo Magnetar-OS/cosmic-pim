@@ -12,6 +12,9 @@
 //! - [`vdir`] — [`CalDavStore`] over a `cosmic-pim-core` vdir, so synced events
 //!   land as ordinary `.ics` files that khal and vdirsyncer can also read.
 //! - [`sync`] — the cycle that ties them together.
+//! - [`push`] — the durable writeback queue, and the classification that
+//!   decides whether a failed push is retried, parked, or dropped.
+//! - [`patch`] — byte-preserving writeback into stored resources.
 //!
 //! # Why the trait exists
 //!
@@ -38,6 +41,6 @@ pub mod vdir;
 pub use dav::{CalDavEventEntry, CaldavClient, DiscoveredCalendar, Flavor, PropfindEventsResult};
 pub use error::{Error, Result};
 pub use plan::{SyncPlan, plan_sync};
-pub use store::{CalDavStore, CollectionState, RemoteEvent};
+pub use store::{CalDavStore, CollectionState, Conflict, RemoteEvent};
 pub use sync::{SyncOutcome, sync_collection};
 pub use vdir::VdirStore;

@@ -1017,7 +1017,10 @@ const PROPFIND_SCHEDULING: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 /// URL resolution, the redirect and credential policy, the multistatus
 /// scaffolding, the etag handling — is shared verbatim, which is why this is an
 /// enum rather than a second crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum Flavor {
     #[default]
     CalDav,

@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use cosmic_pim_caldav::push::PushQueue;
 use cosmic_pim_caldav::{CalDavStore, CaldavClient, VdirStore, sync_collection};
 use cosmic_pim_core::model::Rgb;
 use cosmic_pim_core::store::vdir;
@@ -389,4 +390,114 @@ fn a_synced_vtodo_is_readable_as_a_task_with_no_caldav_changes() {
     let events = vdir::read_collection(store.collection());
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].summary, "Event A");
+}
+
+/// The same event as `EVENT_A`, as another client left it on the server.
+const EVENT_A_THEIRS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\n\
+SUMMARY:Moved to Thursday\r\nATTENDEE;CN=Someone:mailto:s@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// …and as this device left it, unsent.
+const EVENT_A_MINE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\n\
+SUMMARY:Renamed by me\r\nATTENDEE;CN=Someone:mailto:s@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+#[test]
+fn a_pull_does_not_overwrite_an_edit_that_has_not_been_pushed_yet() {
+    // The failure this pins is the quietest one this crate can produce: the
+    // pull writes the server's bytes over the local file, the queued PUT then
+    // reads *that file* at drain time, uploads the server's own copy back, and
+    // reports success. Queue empty, no error logged, ctag committed — and the
+    // user's edit no longer exists anywhere.
+    let server = serve(vec![
+        Round {
+            ctag: "ctag-1",
+            entries: vec![("/cal/a.ics", "\"1\"")],
+            bodies: vec![("/cal/a.ics", EVENT_A)],
+        },
+        Round {
+            ctag: "ctag-2",
+            entries: vec![("/cal/a.ics", "\"2\"")],
+            bodies: vec![("/cal/a.ics", EVENT_A_THEIRS)],
+        },
+    ]);
+    let (_dir, mut store) = collection();
+    let client = CaldavClient::new(&server.url, "user", "pass");
+
+    // Round one: the event arrives.
+    sync_collection(&client, &server.url, &mut store).expect("first sync");
+    let href = format!("{}a.ics", server.url);
+    let file = store.collection().path.join("a.ics");
+
+    // The user edits it. The push has not gone out — the laptop is on a train.
+    std::fs::write(&file, EVENT_A_MINE).expect("local edit");
+    store.queue_put(&href).expect("queue");
+
+    // Round two: the server's copy changed too.
+    let outcome = sync_collection(&client, &server.url, &mut store).expect("second sync");
+
+    assert_eq!(outcome.conflicts, 1, "the divergence was not noticed");
+    assert_eq!(outcome.fetched, 0, "the server's copy was written anyway");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read back"),
+        EVENT_A_MINE,
+        "the unsent local edit was overwritten by the pull"
+    );
+
+    let conflict = store.conflict_for(&href).expect("no conflict recorded");
+    // Trimmed: the multiget parser strips trailing whitespace from a payload,
+    // so the server's bytes arrive without the final CRLF.
+    assert_eq!(conflict.remote.trim_end(), EVENT_A_THEIRS.trim_end());
+    assert_eq!(conflict.local, EVENT_A_MINE);
+    assert_eq!(
+        conflict.remote_etag, "\"2\"",
+        "without the server's etag the resolution cannot be accepted by it"
+    );
+}
+
+#[test]
+fn resolving_a_conflict_in_favour_of_the_server_leaves_a_clean_collection() {
+    let server = serve(vec![
+        Round {
+            ctag: "ctag-1",
+            entries: vec![("/cal/a.ics", "\"1\"")],
+            bodies: vec![("/cal/a.ics", EVENT_A)],
+        },
+        Round {
+            ctag: "ctag-2",
+            entries: vec![("/cal/a.ics", "\"2\"")],
+            bodies: vec![("/cal/a.ics", EVENT_A_THEIRS)],
+        },
+        // A third round with nothing new: proof the conflict did not leave the
+        // collection permanently re-fetching itself.
+        Round {
+            ctag: "ctag-2",
+            entries: vec![("/cal/a.ics", "\"2\"")],
+            bodies: vec![("/cal/a.ics", EVENT_A_THEIRS)],
+        },
+    ]);
+    let (_dir, mut store) = collection();
+    let client = CaldavClient::new(&server.url, "user", "pass");
+
+    sync_collection(&client, &server.url, &mut store).expect("first sync");
+    let href = format!("{}a.ics", server.url);
+    std::fs::write(store.collection().path.join("a.ics"), EVENT_A_MINE).expect("local edit");
+    store.queue_put(&href).expect("queue");
+    sync_collection(&client, &server.url, &mut store).expect("second sync");
+
+    assert!(store.resolve_conflict_take_remote(&href).expect("resolve"));
+
+    let events = vdir::read_collection(store.collection());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].summary, "Moved to Thursday");
+    assert!(store.conflicts().is_empty());
+    assert!(
+        store.pending().is_empty(),
+        "the push carrying the discarded edit is still queued"
+    );
+
+    let reports_before = server.report_count.load(Ordering::SeqCst);
+    let outcome = sync_collection(&client, &server.url, &mut store).expect("third sync");
+    assert!(outcome.unchanged, "the resolved collection re-listed itself");
+    assert_eq!(server.report_count.load(Ordering::SeqCst), reports_before);
 }

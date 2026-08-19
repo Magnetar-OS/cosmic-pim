@@ -32,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dav::CaldavClient;
-use crate::error::Result;
+use crate::error::{Disposition, Result};
 
 /// First retry delay. Doubles per attempt up to [`MAX_DELAY_MS`].
 const BASE_DELAY_MS: i64 = 30_000;
@@ -93,6 +93,15 @@ pub struct PendingPush {
     /// Why the last attempt failed, for the UI to show.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Held back until something outside the queue changes.
+    ///
+    /// Set when retrying could not possibly help *and* dropping the entry would
+    /// lose the edit: a stale `If-Match` that needs reconciliation first, or
+    /// credentials that need a human. A blocked entry keeps its payload and its
+    /// place — it is a pending change, not a failed one — but costs no further
+    /// requests until it is re-queued or its conflict is resolved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked: bool,
 }
 
 /// The queue operations a store must support for writeback to work.
@@ -118,6 +127,14 @@ pub trait PushQueue {
     /// Records a failure and reschedules.
     fn defer(&mut self, href: &str, error: &str, next_attempt_ms: i64) -> Result<()>;
 
+    /// Stops attempting an operation without discarding it.
+    ///
+    /// For failures where the next attempt is guaranteed to fail identically
+    /// until something else happens — see [`PendingPush::blocked`]. Dropping
+    /// the entry instead would lose the edit; retrying it instead would spend
+    /// the rest of the day proving the same point to the same server.
+    fn park(&mut self, href: &str, error: &str) -> Result<()>;
+
     /// The iCalendar text to PUT for a queued file, or `None` if it is gone.
     fn payload(&self, file: &str) -> Option<String>;
 
@@ -133,12 +150,29 @@ pub struct DrainOutcome {
     pub abandoned: usize,
     /// Entries not yet due under backoff.
     pub skipped: usize,
+    /// Entries whose `If-Match` is stale: the resource changed on the server.
+    /// Parked, and resolved by the pull that follows — see
+    /// [`crate::store::Conflict`].
+    pub needs_reconcile: usize,
+    /// Entries the user has to do something about: an expired password, a
+    /// collection we may not write, no quota left. Parked, and surfaced
+    /// through the sync report rather than retried.
+    pub needs_user: usize,
+    /// Entries dropped because nothing could ever make them succeed.
+    pub rejected: usize,
 }
 
 impl DrainOutcome {
     #[must_use]
     pub fn settled(&self) -> usize {
-        self.succeeded + self.abandoned
+        self.succeeded + self.abandoned + self.rejected
+    }
+
+    /// Whether anything here needs a person: bad credentials, lost write
+    /// access, a full account. The sync report carries this to the UI.
+    #[must_use]
+    pub fn needs_attention(&self) -> bool {
+        self.needs_user > 0 || self.rejected > 0
     }
 }
 
@@ -164,6 +198,12 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
     }
 
     for entry in queue.pending() {
+        if entry.blocked {
+            // Held for a reconcile or for the user. Attempting it would repeat
+            // a failure we have already classified as unrepeatable.
+            outcome.skipped += 1;
+            continue;
+        }
         if entry.next_attempt_ms > now_ms {
             outcome.skipped += 1;
             continue;
@@ -193,15 +233,59 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
                 }
                 outcome.succeeded += 1;
             }
-            Err(why) => {
-                let attempts = entry.attempts.saturating_add(1);
-                let next = now_ms.saturating_add(retry_delay_ms(attempts));
-                tracing::warn!(href, attempts, %why, "push failed; will retry");
-                if let Err(e) = queue.defer(&href, &why.to_string(), next) {
-                    tracing::warn!(href, %e, "could not record a push failure");
+            // What happens next is decided by *why* it failed, not by the
+            // fact that it did. Backing off a 412 would repeat a stale
+            // If-Match until the heat death of the collection; backing off a
+            // 401 hammers a server that is already refusing us. See
+            // [`Disposition`].
+            Err(why) => match why.disposition() {
+                Disposition::Retry => {
+                    let attempts = entry.attempts.saturating_add(1);
+                    let next = now_ms.saturating_add(retry_delay_ms(attempts));
+                    tracing::warn!(href, attempts, %why, "push failed; will retry");
+                    if let Err(e) = queue.defer(&href, &why.to_string(), next) {
+                        tracing::warn!(href, %e, "could not record a push failure");
+                    }
+                    outcome.deferred += 1;
                 }
-                outcome.deferred += 1;
-            }
+                Disposition::Reconcile => {
+                    // The resource moved under us. The pull that follows this
+                    // drain sees the new etag, finds our unsent bytes, and
+                    // records a conflict; that is what unblocks this entry.
+                    tracing::info!(
+                        href, %why,
+                        "push rejected as out of date; parking it for reconciliation"
+                    );
+                    if let Err(e) = queue.park(&href, &why.to_string()) {
+                        tracing::warn!(href, %e, "could not park a stale push");
+                    }
+                    outcome.needs_reconcile += 1;
+                }
+                Disposition::NeedsUser => {
+                    tracing::warn!(
+                        href, %why,
+                        "push refused in a way only the user can fix; parking it"
+                    );
+                    if let Err(e) = queue.park(&href, &why.to_string()) {
+                        tracing::warn!(href, %e, "could not park a refused push");
+                    }
+                    outcome.needs_user += 1;
+                }
+                Disposition::Fatal => {
+                    // Keeping it would mean a queue that never empties and a UI
+                    // permanently claiming unsaved changes. The local file is
+                    // untouched, so nothing is lost that the user cannot see;
+                    // the log line is the trace.
+                    tracing::error!(
+                        href, %why,
+                        "push rejected outright; dropping it from the queue"
+                    );
+                    if let Err(e) = queue.resolve(&href) {
+                        tracing::warn!(href, %e, "could not drop a rejected push");
+                    }
+                    outcome.rejected += 1;
+                }
+            },
         }
     }
 
@@ -231,12 +315,14 @@ mod tests {
                 existing.next_attempt_ms = 0;
                 existing.attempts = 0;
                 existing.last_error = None;
+                existing.blocked = false;
             } else {
                 self.entries.push(PendingPush {
                     op,
                     attempts: 0,
                     next_attempt_ms: 0,
                     last_error: None,
+                    blocked: false,
                 });
             }
             Ok(())
@@ -249,6 +335,13 @@ mod tests {
             if let Some(e) = self.entries.iter_mut().find(|e| e.op.href() == href) {
                 e.attempts += 1;
                 e.next_attempt_ms = next;
+                e.last_error = Some(error.to_owned());
+            }
+            Ok(())
+        }
+        fn park(&mut self, href: &str, error: &str) -> Result<()> {
+            if let Some(e) = self.entries.iter_mut().find(|e| e.op.href() == href) {
+                e.blocked = true;
                 e.last_error = Some(error.to_owned());
             }
             Ok(())
@@ -389,5 +482,134 @@ mod tests {
         // than abandoned for a missing file, which a delete never has.
         assert_eq!(outcome.abandoned, 0);
         assert_eq!(outcome.deferred, 1);
+    }
+
+    /// A server that answers every request with one status and nothing else.
+    ///
+    /// The classification is the thing under test, and it is derived from the
+    /// status alone, so a canned status is the whole fixture.
+    fn serving(status: u16) -> (String, std::thread::JoinHandle<()>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let handle = std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let response = tiny_http::Response::from_string("no")
+                    .with_status_code(tiny_http::StatusCode(status));
+                let _ = request.respond(response);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/"), handle)
+    }
+
+    /// Hrefs are stored absolute (discovery resolves them against the
+    /// collection's final URL), so a queue under test has to be built the same
+    /// way or the client never reaches the server at all.
+    fn queue_with_payload(base: &str) -> (MemoryQueue, String) {
+        let href = format!("{base}a.ics");
+        let mut queue = MemoryQueue::default();
+        queue.files.insert("a.ics".into(), "BEGIN:VCALENDAR".into());
+        queue.enqueue(put(&href)).unwrap();
+        (queue, href)
+    }
+
+    #[test]
+    fn a_stale_etag_parks_the_push_instead_of_backing_off() {
+        // The bug this pins: a 412 means our If-Match names an etag the server
+        // no longer has. Backing off re-sends the *same* If-Match, so the retry
+        // is guaranteed to 412 again — forever, at a widening interval, with
+        // the edit never reaching the server and nothing ever saying so.
+        let (url, _server) = serving(412);
+        let (mut queue, _href) = queue_with_payload(&url);
+        let client = CaldavClient::new(&url, "u", "p");
+
+        let outcome = drain(&client, &mut queue, 0);
+
+        assert_eq!(outcome.needs_reconcile, 1);
+        assert_eq!(outcome.deferred, 0, "a stale etag was put on the retry schedule");
+
+        let entry = &queue.pending()[0];
+        assert!(entry.blocked, "the doomed retry was left live");
+        assert_eq!(entry.attempts, 0, "a parked entry consumed a backoff step");
+    }
+
+    #[test]
+    fn a_parked_push_is_not_attempted_again() {
+        let (url, _server) = serving(412);
+        let (mut queue, _href) = queue_with_payload(&url);
+        let client = CaldavClient::new(&url, "u", "p");
+
+        drain(&client, &mut queue, 0);
+        let outcome = drain(&client, &mut queue, i64::MAX / 2);
+
+        assert_eq!(outcome.needs_reconcile, 0, "the parked entry was retried");
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(
+            queue.pending().len(),
+            1,
+            "parking must not discard the edit — only stop retrying it"
+        );
+    }
+
+    #[test]
+    fn credentials_and_permissions_park_and_surface_rather_than_retry() {
+        for status in [401, 403] {
+            let (url, _server) = serving(status);
+            let (mut queue, _href) = queue_with_payload(&url);
+            let client = CaldavClient::new(&url, "u", "p");
+
+            let outcome = drain(&client, &mut queue, 0);
+
+            assert_eq!(outcome.needs_user, 1, "HTTP {status} did not ask for a human");
+            assert_eq!(outcome.deferred, 0, "HTTP {status} kept hammering the server");
+            assert!(outcome.needs_attention());
+            assert!(queue.pending()[0].blocked);
+        }
+    }
+
+    #[test]
+    fn a_server_side_failure_still_backs_off_and_stays_live() {
+        let (url, _server) = serving(503);
+        let (mut queue, _href) = queue_with_payload(&url);
+        let client = CaldavClient::new(&url, "u", "p");
+
+        let outcome = drain(&client, &mut queue, 0);
+
+        assert_eq!(outcome.deferred, 1);
+        assert_eq!(outcome.needs_reconcile + outcome.needs_user + outcome.rejected, 0);
+
+        let entry = &queue.pending()[0];
+        assert!(!entry.blocked, "a transient failure parked a retryable push");
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(entry.next_attempt_ms, retry_delay_ms(1));
+    }
+
+    #[test]
+    fn a_request_the_server_rejects_outright_leaves_the_queue() {
+        // 400 says the request itself is wrong. Keeping it would mean a queue
+        // that never empties and a UI permanently claiming unsaved changes.
+        let (url, _server) = serving(400);
+        let (mut queue, _href) = queue_with_payload(&url);
+        let client = CaldavClient::new(&url, "u", "p");
+
+        let outcome = drain(&client, &mut queue, 0);
+
+        assert_eq!(outcome.rejected, 1);
+        assert!(queue.pending().is_empty());
+        assert_eq!(outcome.settled(), 1);
+    }
+
+    #[test]
+    fn a_fresh_edit_revives_a_parked_push() {
+        let (url, _server) = serving(412);
+        let (mut queue, href) = queue_with_payload(&url);
+        let client = CaldavClient::new(&url, "u", "p");
+        drain(&client, &mut queue, 0);
+        assert!(queue.pending()[0].blocked);
+
+        // Editing the event again is new information: whatever the last attempt
+        // was blocked on, the user has just expressed a fresh intention.
+        queue.enqueue(put(&href)).unwrap();
+
+        assert!(!queue.pending()[0].blocked, "a new edit stayed parked");
     }
 }

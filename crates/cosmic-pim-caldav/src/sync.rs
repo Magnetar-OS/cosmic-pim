@@ -17,11 +17,35 @@
 //! convinces the next run that it is already up to date, and whatever failed to
 //! apply is never retried. Any error short-circuits before the commit, so the
 //! next cycle sees the old ctag and redoes the work.
+//!
+//! "Everything above succeeded" includes the failures that are *not* errors.
+//! A cycle that skipped deletions because the mass-delete guard fired, or that
+//! asked for bodies the server did not return, has not applied the collection
+//! and must not claim the ctag: the ctag only changes when the server changes,
+//! so committing one over skipped work means the work waits for an unrelated
+//! future edit before it is retried. A conflict is the exception, and
+//! deliberately so — see step 5.
+//!
+//! # Step 5 and the edit that is not there yet
+//!
+//! An upsert overwrites the local file with the server's bytes. That is right
+//! for a resource we are only fetching and wrong for one the user has edited
+//! since the last sync, because the queued PUT reads its payload from that same
+//! file at drain time: overwrite first and the push uploads the server's own
+//! bytes back to it, reporting success, and the edit is gone without a single
+//! error being raised anywhere.
+//!
+//! So before writing, the cycle asks the store whether it is holding an unsent
+//! local change for that href. If it is, and it differs from what the server
+//! sent, neither copy wins: a [`crate::store::Conflict`] is recorded with both,
+//! the local file is left alone, and the application resolves it. The ctag is
+//! still committed in that case — the divergence is *recorded*, not pending, so
+//! there is nothing for the next cycle to redo.
 
 use crate::dav::CaldavClient;
 use crate::error::Result;
 use crate::plan::plan_sync;
-use crate::store::{CalDavStore, RemoteEvent};
+use crate::store::{CalDavStore, Conflict, RemoteEvent};
 
 /// What one cycle did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,6 +61,9 @@ pub struct SyncOutcome {
     /// Hrefs the server listed but did not return a body for. They keep their
     /// local copies and their old etags, so the next cycle retries them.
     pub missing_bodies: usize,
+    /// Resources changed on both sides, recorded rather than overwritten.
+    /// See [`crate::store::Conflict`].
+    pub conflicts: usize,
 }
 
 impl SyncOutcome {
@@ -44,6 +71,14 @@ impl SyncOutcome {
     #[must_use]
     pub fn changed(&self) -> bool {
         self.fetched > 0 || self.deleted > 0
+    }
+
+    /// Whether the cycle applied the collection in full.
+    ///
+    /// The ctag may only be committed when this holds — see the module docs.
+    #[must_use]
+    fn fully_applied(&self) -> bool {
+        self.missing_bodies == 0 && !self.guard_tripped
     }
 }
 
@@ -99,6 +134,26 @@ pub fn sync_collection(
             tracing::warn!(href, "multiget returned a body for an unlisted href; ignoring");
             continue;
         };
+        // Both sides changed: record it, write neither over the other.
+        if let Some(local) = store.unpushed_local(href)?
+            && local != *ics
+        {
+            tracing::warn!(
+                href,
+                "the server and this device both changed a resource; \
+                 keeping the local copy and recording a conflict"
+            );
+            store.record_conflict(&Conflict {
+                href: href.clone(),
+                local,
+                remote: ics.clone(),
+                remote_etag: (*etag).to_owned(),
+            })?;
+            applied.insert(href.as_str());
+            outcome.conflicts += 1;
+            continue;
+        }
+
         store.upsert(&RemoteEvent {
             href: href.clone(),
             etag: (*etag).to_owned(),
@@ -129,8 +184,17 @@ pub fn sync_collection(
         outcome.deleted += 1;
     }
 
-    // 6. commit.
-    store.commit_ctag(remote_ctag.as_deref())?;
+    // 6. commit — only over a cycle that applied everything it was asked to.
+    if outcome.fully_applied() {
+        store.commit_ctag(remote_ctag.as_deref())?;
+    } else {
+        tracing::info!(
+            calendar_url,
+            missing_bodies = outcome.missing_bodies,
+            guard_tripped = outcome.guard_tripped,
+            "cycle did not apply in full; leaving the ctag uncommitted so it is retried"
+        );
+    }
     Ok(outcome)
 }
 
@@ -174,6 +238,19 @@ mod tests {
             let Some(etag) = etags.get(href.as_str()) else {
                 continue;
             };
+            if let Some(local) = store.unpushed_local(href)?
+                && local != *ics
+            {
+                store.record_conflict(&Conflict {
+                    href: href.clone(),
+                    local,
+                    remote: ics.clone(),
+                    remote_etag: (*etag).to_owned(),
+                })?;
+                applied.insert(href.clone());
+                outcome.conflicts += 1;
+                continue;
+            }
             store.upsert(&RemoteEvent {
                 href: href.clone(),
                 etag: (*etag).to_owned(),
@@ -193,7 +270,9 @@ mod tests {
             outcome.deleted += 1;
         }
 
-        store.commit_ctag(remote_ctag)?;
+        if outcome.fully_applied() {
+            store.commit_ctag(remote_ctag)?;
+        }
         Ok(outcome)
     }
 
@@ -407,5 +486,138 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.fetched, 1);
+    }
+
+    const SERVER_EDIT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+        BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T090000Z\r\nSUMMARY:Theirs\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    const LOCAL_EDIT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+        BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T090000Z\r\nSUMMARY:Mine\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    /// One event held locally with an unsent edit on top of it.
+    fn store_with_unsent_edit() -> MemoryStore {
+        let mut store = MemoryStore::default();
+        store
+            .upsert(&RemoteEvent {
+                href: "/a.ics".into(),
+                etag: "\"1\"".into(),
+                ics: ICS.into(),
+            })
+            .unwrap();
+        store.unpushed.insert("/a.ics".into(), LOCAL_EDIT.into());
+        store
+    }
+
+    #[test]
+    fn a_server_change_over_an_unsent_local_edit_is_a_conflict_not_an_overwrite() {
+        // Without this branch the pull writes the server's bytes over the local
+        // file, the queued PUT then reads that file and uploads the server's
+        // own copy back to it, and the edit is gone with every indicator
+        // reporting success.
+        let mut store = store_with_unsent_edit();
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"2\"")], &[]),
+            &[("/a.ics".to_owned(), SERVER_EDIT.to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.conflicts, 1);
+        assert_eq!(outcome.fetched, 0, "the server's copy was written anyway");
+        assert_eq!(
+            store.events["/a.ics"].ics, ICS,
+            "the local copy was replaced despite the conflict"
+        );
+
+        let conflict = &store.conflicts[0];
+        assert_eq!(conflict.local, LOCAL_EDIT);
+        assert_eq!(conflict.remote, SERVER_EDIT);
+        assert_eq!(conflict.remote_etag, "\"2\"");
+    }
+
+    #[test]
+    fn a_conflict_still_commits_the_ctag() {
+        // A recorded conflict is not unfinished work: there is nothing for the
+        // next cycle to redo, and refusing the ctag would make every poll
+        // re-list the whole collection until a human resolved it.
+        let mut store = store_with_unsent_edit();
+
+        run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"2\"")], &[]),
+            &[("/a.ics".to_owned(), SERVER_EDIT.to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(store.ctag.as_deref(), Some("ctag-2"));
+    }
+
+    #[test]
+    fn the_server_making_the_same_edit_we_queued_is_not_a_conflict() {
+        let mut store = store_with_unsent_edit();
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"2\"")], &[]),
+            &[("/a.ics".to_owned(), LOCAL_EDIT.to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.conflicts, 0, "identical content was called a conflict");
+        assert_eq!(outcome.fetched, 1);
+    }
+
+    #[test]
+    fn a_cycle_that_did_not_get_every_body_leaves_the_ctag_alone() {
+        // The ctag only changes when the server changes. Committing one over a
+        // cycle that failed to apply part of the collection means the missing
+        // part waits for an unrelated future edit before anything retries it —
+        // which is exactly the "never arrives" case the ctag comment warns of.
+        let mut store = MemoryStore::default();
+        store.commit_ctag(Some("ctag-1")).unwrap();
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"1\""), ("/b.ics", "\"1\"")], &[]),
+            &[body("/a.ics")],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.missing_bodies, 1);
+        assert_eq!(
+            store.ctag.as_deref(),
+            Some("ctag-1"),
+            "the ctag advanced over an event that never arrived, so it is never retried"
+        );
+    }
+
+    #[test]
+    fn a_cycle_that_skipped_deletions_leaves_the_ctag_alone() {
+        let mut store = MemoryStore::default();
+        store
+            .upsert(&RemoteEvent {
+                href: "/a.ics".into(),
+                etag: "\"1\"".into(),
+                ics: ICS.into(),
+            })
+            .unwrap();
+        store.commit_ctag(Some("ctag-1")).unwrap();
+
+        // An empty listing while we hold events trips the mass-delete guard.
+        let outcome = run(&mut store, Some("ctag-2"), &listing(&[], &[]), &[]).unwrap();
+
+        assert!(outcome.guard_tripped);
+        assert_eq!(
+            store.ctag.as_deref(),
+            Some("ctag-1"),
+            "the ctag advanced over skipped deletions, so they are never reconsidered"
+        );
     }
 }
