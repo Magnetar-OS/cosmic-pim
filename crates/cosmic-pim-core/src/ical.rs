@@ -1053,6 +1053,39 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_timezone_name_resolves_to_the_right_instant() {
+        // Outlook and Exchange emit Windows zone names rather than IANA ones,
+        // so every invitation out of an Office tenant carries one. The failure
+        // shape is the trailing space again: no error, no warning, the event
+        // silently becomes floating and lands at the wrong hour.
+        //
+        // What is asserted is the *instant*, not the zone name. CLDR maps a
+        // Windows zone to one IANA zone per territory and to a default for the
+        // rest — `GTB Standard Time` is Athens, Bucharest, and Chisinau, with
+        // Bucharest as that default — and which of those a parser picks is
+        // arbitrary and not ours to pin. They keep the same rules, so the
+        // instant is the same, and the instant is what a calendar displays.
+        let event = one(&wrap(
+            "DTSTART;TZID=GTB Standard Time:20260804T090000\r\nSUMMARY:Invitation",
+        ));
+
+        let EventTime::Zoned(naive, tz) = event.start else {
+            panic!("a Windows TZID fell through to floating: {:?}", event.start);
+        };
+        assert_eq!(
+            naive.and_local_timezone(tz).unwrap().to_utc(),
+            NaiveDate::from_ymd_opt(2026, 8, 4)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono_tz::Europe::Athens)
+                .unwrap()
+                .to_utc(),
+            "a Windows TZID resolved to a zone with the wrong offset"
+        );
+    }
+
+    #[test]
     fn an_unresolvable_tzid_falls_back_to_utc_not_to_local() {
         let event = one(&wrap(
             "DTSTART;TZID=Nowhere/Fictional:20260804T090000\r\nSUMMARY:Meeting",
