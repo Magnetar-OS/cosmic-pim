@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
 | [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
-| **cosmic-pim** | — | This substrate | 438 tests |
+| **cosmic-pim** | — | This substrate | 477 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
@@ -26,7 +26,7 @@ Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 | `cosmic-pim-caldav` | CalDAV **and** CardDAV — protocol, reconciliation, durable writeback queue, and a store trait implemented over the vdir |
 | `cosmic-pim-accounts` | Accounts and credentials: the OS keychain, with an encrypted local fallback for hosts that have none |
 | `cosmic-pim-mail` | Mail — the message model over verbatim RFC 5322 bytes, a maildir store, JWZ threading, HTML-to-visible-text extraction, and IMAP with durable writeback |
-| `cosmic-pim-sync` | The layer that joins `core`, `caldav`, and `accounts` — provisioning, and one sync pass per account |
+| `cosmic-pim-sync` | The layer that joins `core`, `caldav`, and `accounts` — provisioning, one sync pass per account over calendars and address books, and the conflicts a pass could not resolve alone |
 
 Dependencies point downward only. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
 diagram, the invariants, and where new code belongs.
@@ -70,11 +70,22 @@ let book = ContactStore::open_default()?;
 let matches = book.search("lovelace");
 ```
 
-One sync pass over every enabled account, failing per collection rather than per
-run:
+One sync pass over every enabled account — calendars and address books
+together, failing per collection rather than per run:
 
 ```rust
-let reports = cosmic_pim_sync::sync_all(&mut accounts, &calendar_root);
+let reports = cosmic_pim_sync::sync_all(&mut accounts, &calendar_root, &contacts_root);
+```
+
+What a pass could not decide on its own — the server and this device changed the
+same event, and the local change had not been uploaded yet — is recorded with
+both versions intact rather than guessed at:
+
+```rust
+for (collection, conflict) in cosmic_pim_sync::conflicts(&calendar_root) {
+    // conflict.local and conflict.remote are both here; the user chooses.
+    cosmic_pim_sync::conflict::take_remote(&calendar_root, &collection, &conflict.href)?;
+}
 ```
 
 ## Interoperability

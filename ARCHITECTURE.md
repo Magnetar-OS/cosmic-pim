@@ -70,7 +70,8 @@ in one place and all three apps get it.
 | Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
 | IMAP | `mail::imap` | Session, cycle, and durable writeback. Not a DAV flavour. |
 | Accounts, passwords | `accounts` | OS keychain, encrypted fallback. Shared across all three apps. |
-| A sync pass | `sync` | Provision, push, pull, per-collection error isolation. |
+| A sync pass | `sync` | Provision, push, pull, per-collection error isolation. Calendars and address books in one pass. |
+| Conflicts | `sync::conflict` | Both sides changed one resource. Read them, resolve them. |
 
 ### Shared account store
 
@@ -123,6 +124,32 @@ sidecar with exponential backoff.
 **Push before pull.** The other order lets a pull overwrite a local edit with the
 server's older copy, after which the queued push re-uploads what was just
 clobbered. It presents as edits mysteriously reverting.
+
+**A pull never overwrites an unsent local edit.** Push-before-pull orders the
+two; it does not help when the push *failed* and the server changed the same
+resource anyway. Then the pull writes the server's bytes over the local file,
+the queued PUT reads that file at drain time, uploads the server's own copy back
+to it, and reports success — queue empty, ctag committed, no error raised
+anywhere, and the edit gone. So the cycle asks the store for unsent local bytes
+before writing, and when both sides changed it records a `Conflict` holding both
+versions instead of choosing one (`caldav::store::Conflict`). Resolution is the
+application's: keep local, take remote, or supply a merge. Nothing resolves
+itself with time, because the alternative to asking is guessing.
+
+**A failed write is classified, not just retried.** `Error::Status` carries the
+HTTP code and `Disposition` says what it means: retry (timeouts, 5xx, 429),
+reconcile (412 — our `If-Match` is stale, and every retry sends the same stale
+value), needs-user (401/403/507), or drop. A 412 treated as retryable reproduces
+the exact silent divergence the durable queue exists to prevent, only slower;
+a 401 treated as retryable is how an account gets rate-limited. The two that a
+retry cannot fix are *parked* rather than dropped — the edit survives without
+costing a request an hour.
+
+**The ctag is committed only over a cycle that applied in full.** A ctag changes
+only when the server does, so claiming one over skipped deletions or bodies the
+server never sent means that work waits for an unrelated future edit before
+anything retries it. Recorded conflicts are the exception: there is nothing left
+for the next cycle to redo.
 
 **Both fsyncs, not one.** `atomic::write` syncs the temp file *and then the
 parent directory* after the rename. The second one is the step everyone skips:
@@ -209,14 +236,24 @@ The interop promise is therefore narrower than "anything that speaks vdir":
 - **Writers that do not sync** — same.
 - **Sync engines** — exactly one per collection.
 
-An application asked to sync a collection carrying vdirsyncer status metadata
-should warn rather than proceed silently.
+This is enforced rather than documented. Provisioning looks for a
+`.vdirsyncer*` file in the collection directory and, finding one, binds the
+collection but refuses to sync it, reporting `ForeignSyncOwner` to the
+application. `VdirStore::acknowledge_sole_ownership` records a user who has been
+asked and wants it anyway; the answer is durable, because asking again on every
+five-second poll teaches people to dismiss the question unread.
+
+The check is deliberately shallow — one directory read, matching a name prefix.
+Parsing vdirsyncer's configuration to learn which collections it claims would be
+more thorough and much more fragile; a marker file needs no interpretation.
 
 ## Extension points
 
-**`CalDavStore`** (`caldav::store`) — four methods: read state, upsert, remove,
-commit ctag. Implemented over the vdir, and over memory for tests. Implement it
-to sync into something else.
+**`CalDavStore`** (`caldav::store`) — six methods: read state, upsert, remove,
+commit ctag, and the two that keep a pull from eating an unsent edit — report
+local bytes not yet accepted by the server, and record a conflict. Implemented
+over the vdir, and over memory for tests. Implement it to sync into something
+else.
 
 **`PushQueue`** (`caldav::push`) — the writeback queue, separate because the pull
 path has two real implementations and this has one, but the backoff logic still
@@ -224,7 +261,10 @@ needs testing without a disk.
 
 **`Flavor`** (`caldav::dav`) — CalDAV and CardDAV are the same protocol with four
 substitutions: home-set property, resourcetype marker, multiget report name,
-payload element. An enum, not a second crate.
+payload element. An enum, not a second crate. A collection records its own
+flavour in its sidecar at provisioning time, so opening one by id is enough to
+know whether it holds `.ics` or `.vcf` — writeback and conflict resolution need
+no other channel to be told.
 
 ## Where does this code go?
 
@@ -260,7 +300,7 @@ the moment the model existed, because the engine never parses what it stores.
 
 ## Testing
 
-Roughly 440 tests in the substrate, `cargo test --workspace`.
+Roughly 480 tests in the substrate, `cargo test --workspace`.
 
 The one worth knowing about is `caldav/tests/live_sync.rs`: a real HTTP server
 answering PROPFIND and REPORT with canned multistatus XML, driving the real
