@@ -185,6 +185,34 @@ impl Session {
         Ok(selected)
     }
 
+    /// Files a message into a mailbox, with flags.
+    ///
+    /// Used for the Sent copy. Most servers do **not** file SMTP-submitted mail
+    /// themselves — the message goes out and simply never appears in Sent —
+    /// so the client has to put it there. Gmail is the notable exception and
+    /// appending there produces a duplicate, which is why this is a call the
+    /// caller makes rather than something [`crate::smtp::send`] does on its own.
+    ///
+    /// `\Seen` is set, always: a message the user just wrote is not unread mail
+    /// for the user, and a Sent folder with a bold unread count is a bug report
+    /// waiting to happen.
+    pub fn append(&mut self, mailbox: &str, raw: &[u8], flags: crate::model::Flags) -> Result<()> {
+        use imap::types::Flag as F;
+        let mut imap_flags = vec![F::Seen];
+        if flags.flagged {
+            imap_flags.push(F::Flagged);
+        }
+        if flags.draft {
+            imap_flags.push(F::Draft);
+        }
+        self.inner
+            .append(mailbox, raw)
+            .flags(imap_flags)
+            .finish()
+            .map(|_| ())
+            .map_err(imap_error)
+    }
+
     pub fn logout(&mut self) -> Result<()> {
         self.inner.logout().map_err(imap_error)
     }

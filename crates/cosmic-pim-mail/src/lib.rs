@@ -24,6 +24,8 @@
 //! - [`text`] — HTML → what a human would actually see, and a count of what was
 //!   hidden.
 //! - [`auth`] — `Authentication-Results` (RFC 8601), per hop and mechanism.
+//! - [`compose`] — drafts, and how a reply or a forward is built from a message.
+//! - [`smtp`] — sending, and the one failure that must never be auto-retried.
 //! - [`threading`] — JWZ threading with deterministic thread ids.
 //! - [`folder`] — mailbox names, hierarchy, and RFC 6154 special use.
 //! - [`store`] — the [`MailStore`] trait: what a backing store must provide.
@@ -66,6 +68,7 @@
 //! must never be handled by pushing harder.
 
 pub mod auth;
+pub mod compose;
 pub mod error;
 pub mod folder;
 pub mod imap;
@@ -73,11 +76,14 @@ pub mod maildir;
 pub mod model;
 pub mod plan;
 pub mod push;
+pub mod smtp;
 pub mod store;
 pub mod text;
 pub mod threading;
 
 pub use error::{Error, Result};
+pub use compose::Draft;
+pub use smtp::{Outcome, SmtpEndpoint};
 pub use folder::{Folder, SpecialUse};
 pub use model::{Flags, Mailbox, Message};
 pub use plan::{MailboxPlan, plan_fetch, plan_reconcile};

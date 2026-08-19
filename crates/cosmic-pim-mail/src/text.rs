@@ -254,28 +254,36 @@ fn comment_has_prose(comment: &str) -> bool {
 }
 
 /// Whitespace normalization + zero-width scrub + the 16 KB cap.
-/// Within a line, runs of spaces collapse to one; block boundaries become a
-/// single newline (blank-line runs collapse too).
+///
+/// Within a line, runs of spaces collapse to one. Newlines collapse to **at
+/// most two**, which is the one deliberate departure from the donor: it
+/// normalised every run to a single newline, which is right when the output is
+/// being fed to a model and wrong when a person is going to read it. A blank
+/// line is how prose says "new paragraph", and a body that has lost all of them
+/// is a wall of text. Runs of three or more still collapse — that is the
+/// newsletter padding this is here to remove.
 fn finalize(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(MAX_TEXT_CHARS));
     let mut pending_space = false;
-    let mut pending_newline = false;
+    let mut pending_newlines = 0usize;
     for c in raw.chars() {
         if ZERO_WIDTH.contains(&c) {
             continue;
         }
         if c == '\n' {
-            pending_newline = true;
+            pending_newlines += 1;
             pending_space = false;
         } else if c.is_whitespace() {
             pending_space = true;
         } else {
-            if pending_newline && !out.is_empty() {
-                out.push('\n');
+            if pending_newlines > 0 && !out.is_empty() {
+                for _ in 0..pending_newlines.min(2) {
+                    out.push('\n');
+                }
             } else if pending_space && !out.is_empty() {
                 out.push(' ');
             }
-            pending_newline = false;
+            pending_newlines = 0;
             pending_space = false;
             out.push(c);
         }
@@ -467,7 +475,7 @@ mod tests {
     #[test]
     fn block_elements_become_newlines_and_entities_decode() {
         let e = extract("<p>Hello <b>world</b> &amp; friends</p><p>Second</p>");
-        assert_eq!(e.text, "Hello world & friends\nSecond");
+        assert_eq!(e.text, "Hello world & friends\n\nSecond");
         assert_eq!(e.hidden_elided, 0);
     }
 
@@ -521,6 +529,18 @@ mod tests {
         assert_eq!(prose.hidden_elided, 1);
         let mso = extract("<p>Hi</p><!--[if mso]><table><tr><td><![endif]-->");
         assert_eq!(mso.hidden_elided, 0, "conditional-comment markup is on every Outlook mail");
+    }
+
+    #[test]
+    fn paragraph_breaks_survive_but_padding_runs_do_not() {
+        // A reader shows this to a person. Collapsing every blank line turns
+        // prose into a wall; keeping all of them keeps a newsletter's fifty
+        // lines of spacer padding.
+        let e = extract_plain("First paragraph.\n\nSecond paragraph.\n\n\n\n\nThird.");
+        assert_eq!(e.text, "First paragraph.\n\nSecond paragraph.\n\nThird.");
+
+        let html = extract("<p>One</p><p>Two</p>");
+        assert_eq!(html.text, "One\n\nTwo", "block elements are paragraphs");
     }
 
     #[test]

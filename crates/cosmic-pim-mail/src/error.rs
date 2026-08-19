@@ -34,6 +34,13 @@ pub enum Error {
     #[error("the server rejected our credentials: {0}")]
     Auth(String),
 
+    /// The draft cannot be turned into a message.
+    #[error("{0}")]
+    Draft(String),
+
+    #[error("SMTP: {0}")]
+    Smtp(String),
+
     #[error("{path} is not a maildir (no cur/ directory)")]
     NotAMaildir { path: PathBuf },
 

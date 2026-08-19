@@ -76,6 +76,31 @@ pub struct MailEndpoint {
     /// email address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imap_username: Option<String>,
+
+    /// The submission server. Empty means "the same host as IMAP", which is
+    /// right for nearly every provider — `imap.` and `smtp.` on one domain, or
+    /// the same hostname for both.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub smtp_transport: Transport,
+
+    /// The address mail is sent *from*, and the name to put on it.
+    ///
+    /// Separate from the login because they are separate things: the login is
+    /// often a user id, and a provider with aliases lets one login send as
+    /// several addresses. Empty falls back to the IMAP username when that looks
+    /// like an address, which covers the common case without asking.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_name: String,
+}
+
+fn default_smtp_port() -> u16 {
+    465
 }
 
 fn default_imap_port() -> u16 {
@@ -83,7 +108,7 @@ fn default_imap_port() -> u16 {
 }
 
 impl MailEndpoint {
-    /// The conventional endpoint for a host: implicit TLS on 993.
+    /// The conventional endpoint for a host: implicit TLS on 993 and 465.
     #[must_use]
     pub fn tls(imap_host: impl Into<String>) -> Self {
         Self {
@@ -91,6 +116,21 @@ impl MailEndpoint {
             imap_port: default_imap_port(),
             imap_transport: Transport::Tls,
             imap_username: None,
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            smtp_transport: Transport::Tls,
+            from_address: String::new(),
+            from_name: String::new(),
+        }
+    }
+
+    /// The submission host: the one given, else the IMAP host.
+    #[must_use]
+    pub fn submission_host(&self) -> &str {
+        if self.smtp_host.trim().is_empty() {
+            &self.imap_host
+        } else {
+            &self.smtp_host
         }
     }
 }
@@ -147,6 +187,31 @@ impl Account {
             .as_ref()
             .and_then(|mail| mail.imap_username.as_deref())
             .unwrap_or(&self.username)
+    }
+
+    /// The address this account sends from, and the name to put on it.
+    ///
+    /// Falls back to the mail login when it looks like an address, which is the
+    /// overwhelmingly common case and saves asking a question whose answer is
+    /// already on screen. Returns `None` when there is nothing that could
+    /// plausibly be an address — a composer with no From is a composer that
+    /// cannot send, and saying so is better than sending as a user id.
+    #[must_use]
+    pub fn from_identity(&self) -> Option<(String, String)> {
+        let mail = self.mail.as_ref();
+        let address = mail
+            .map(|m| m.from_address.trim())
+            .filter(|a| !a.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                let login = self.mail_username();
+                login.contains('@').then(|| login.to_owned())
+            })?;
+        let name = mail
+            .map(|m| m.from_name.trim())
+            .filter(|n| !n.is_empty())
+            .map_or_else(|| self.display_name.clone(), ToOwned::to_owned);
+        Some((name, address))
     }
 
     /// The secret slot holding this account's password.
@@ -462,10 +527,8 @@ mod tests {
             let mut account = Account::new("Fastmail", "https://caldav.fastmail.com/", "u123");
             let id = account.id.clone();
             account.mail = Some(MailEndpoint {
-                imap_host: "imap.fastmail.com".into(),
-                imap_port: 993,
-                imap_transport: Transport::Tls,
                 imap_username: Some("me@fastmail.com".into()),
+                ..MailEndpoint::tls("imap.fastmail.com")
             });
             store.add(account, "app-password").expect("add");
             id
@@ -477,6 +540,17 @@ mod tests {
         let mail = account.mail.as_ref().expect("the endpoint survived");
         assert_eq!(mail.imap_host, "imap.fastmail.com");
         assert_eq!(account.mail_username(), "me@fastmail.com");
+        assert_eq!(
+            mail.submission_host(),
+            "imap.fastmail.com",
+            "an unset submission host must fall back rather than be empty"
+        );
+        assert_eq!(
+            account.from_identity(),
+            Some(("Fastmail".to_string(), "me@fastmail.com".to_string())),
+            "the login is already an address; asking for it again is a question \
+             whose answer is on screen"
+        );
         assert_eq!(
             store.password(&id).expect("read"),
             Some("app-password".to_string()),
@@ -490,6 +564,35 @@ mod tests {
         let account = Account::new("Nextcloud", "https://cloud.example/", "dominikos");
         assert!(account.mail.is_none());
         assert_eq!(account.mail_username(), "dominikos");
+        assert_eq!(
+            account.from_identity(),
+            None,
+            "a user id is not an address, and sending as one would be worse \
+             than saying the From is not set"
+        );
+    }
+
+    #[test]
+    fn an_explicit_from_identity_beats_the_login() {
+        // A provider with aliases: one login, several addresses it may send as.
+        let mut account = Account::new("Work", "https://dav.example/", "u-4213");
+        account.mail = Some(MailEndpoint {
+            from_address: "dominikos@example.com".into(),
+            from_name: "Dominikos Pritis".into(),
+            smtp_host: "smtp.example.com".into(),
+            ..MailEndpoint::tls("imap.example.com")
+        });
+        assert_eq!(
+            account.from_identity(),
+            Some((
+                "Dominikos Pritis".to_string(),
+                "dominikos@example.com".to_string()
+            ))
+        );
+        assert_eq!(
+            account.mail.as_ref().unwrap().submission_host(),
+            "smtp.example.com"
+        );
     }
 
     #[test]
