@@ -282,6 +282,89 @@ impl Index {
         Ok(threads)
     }
 
+    /// Messages matching a query, newest first.
+    ///
+    /// Returns messages rather than conversations, deliberately. A search result
+    /// is "the message I am looking for", and grouping it back into a thread
+    /// buries the hit among its siblings — which is why every mail client that
+    /// threads its inbox shows a flat list for search.
+    ///
+    /// `mailbox` narrows to one; `None` searches the account. Flag filters
+    /// (`is:unread`, `is:starred`) are **not** applied here: flags live in the
+    /// store, not the index, and applying them is the caller's job once it has
+    /// the flags for the mailboxes involved.
+    pub fn search(
+        &self,
+        account: &str,
+        mailbox: Option<&str>,
+        query: &crate::search::Query,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT mailbox, uid, thread_id, from_name, from_addr, subject, date_ms,
+                    snippet, attachments
+             FROM messages WHERE account = ?1",
+        );
+        // Bound parameters throughout — the terms are whatever somebody typed
+        // into a search box, and a LIKE pattern built by concatenation is how a
+        // search box becomes a SQL injection.
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(account.to_owned())];
+
+        if let Some(mailbox) = mailbox {
+            values.push(Box::new(mailbox.to_owned()));
+            sql.push_str(&format!(" AND mailbox = ?{}", values.len()));
+        }
+        for term in &query.terms {
+            values.push(Box::new(like(term)));
+            let n = values.len();
+            sql.push_str(&format!(
+                " AND (subject LIKE ?{n} ESCAPE '\\' OR from_name LIKE ?{n} ESCAPE '\\'
+                       OR from_addr LIKE ?{n} ESCAPE '\\' OR snippet LIKE ?{n} ESCAPE '\\')"
+            ));
+        }
+        for term in &query.from {
+            values.push(Box::new(like(term)));
+            let n = values.len();
+            sql.push_str(&format!(
+                " AND (from_name LIKE ?{n} ESCAPE '\\' OR from_addr LIKE ?{n} ESCAPE '\\')"
+            ));
+        }
+        for term in &query.subject {
+            values.push(Box::new(like(term)));
+            sql.push_str(&format!(" AND subject LIKE ?{} ESCAPE '\\'", values.len()));
+        }
+        if query.has_attachment {
+            sql.push_str(" AND attachments != 0");
+        }
+        values.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+        sql.push_str(&format!(" ORDER BY date_ms DESC LIMIT ?{}", values.len()));
+
+        let mut statement = self.conn.prepare(&sql).map_err(sqlite)?;
+        let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(AsRef::as_ref).collect();
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(bound), |row| {
+                Ok(Hit {
+                    mailbox: row.get(0)?,
+                    uid: row.get(1)?,
+                    thread_id: row.get(2)?,
+                    from_name: row.get(3)?,
+                    from_address: row.get(4)?,
+                    subject: row.get(5)?,
+                    date_ms: row.get(6)?,
+                    snippet: row.get(7)?,
+                    has_attachments: row.get::<_, i64>(8)? != 0,
+                })
+            })
+            .map_err(sqlite)?;
+
+        rows.collect::<std::result::Result<Vec<Hit>, _>>()
+            .map_err(sqlite)
+    }
+
     /// Forgets everything for one mailbox.
     ///
     /// Called on a renumbering: every UID indexed for it now names a different
@@ -384,6 +467,34 @@ impl Index {
             )
             .map_err(sqlite)?;
         Ok(())
+    }
+}
+
+/// One message a search matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    /// Which mailbox it is in — a search can cross folders, and "where is it"
+    /// is half of what the user wanted to know.
+    pub mailbox: String,
+    pub uid: u32,
+    pub thread_id: String,
+    pub from_name: String,
+    pub from_address: String,
+    pub subject: String,
+    pub date_ms: i64,
+    pub snippet: String,
+    pub has_attachments: bool,
+}
+
+impl Hit {
+    /// What a result row shows for the sender.
+    #[must_use]
+    pub fn from_display(&self) -> &str {
+        if self.from_name.is_empty() {
+            &self.from_address
+        } else {
+            &self.from_name
+        }
     }
 }
 
@@ -522,6 +633,24 @@ fn snippet(body: &str) -> String {
     } else {
         line.to_owned()
     }
+}
+
+/// A LIKE pattern matching `term` anywhere, with LIKE's own wildcards escaped.
+///
+/// Without the escape, searching for `50%` matches everything and searching for
+/// `report_final` matches `reportXfinal` — both silently, which is the worst
+/// way for a search box to be wrong.
+fn like(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len() + 2);
+    escaped.push('%');
+    for c in term.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped.push('%');
+    escaped
 }
 
 fn sqlite(error: rusqlite::Error) -> Error {
@@ -738,6 +867,154 @@ mod tests {
                 .unwrap()
                 .len(),
             3
+        );
+    }
+
+    fn searchable() -> MemoryStore {
+        store(vec![
+            message(1, "a@x", "", "Invoice 42 overdue", "Ada <ada@example.com>", "Please pay."),
+            message(2, "b@x", "", "Release plan", "Bob <bob@example.net>", "Draft attached."),
+            message(3, "c@x", "", "Lunch", "Ada <ada@example.com>", "One o'clock?"),
+        ])
+    }
+
+    fn search(index: &Index, query: &str) -> Vec<String> {
+        index
+            .search(ACCOUNT, None, &crate::search::parse(query), 50)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.subject)
+            .collect()
+    }
+
+    #[test]
+    fn a_search_matches_sender_subject_and_snippet() {
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+
+        assert_eq!(search(&index, "invoice"), ["Invoice 42 overdue"]);
+        assert_eq!(search(&index, "from:ada").len(), 2);
+        assert_eq!(search(&index, "subject:release"), ["Release plan"]);
+        assert_eq!(search(&index, "pay"), ["Invoice 42 overdue"], "the snippet");
+    }
+
+    #[test]
+    fn terms_narrow_rather_than_widen() {
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+
+        assert_eq!(search(&index, "from:ada invoice"), ["Invoice 42 overdue"]);
+        assert!(
+            search(&index, "from:ada release").is_empty(),
+            "two terms behaved as OR"
+        );
+    }
+
+    #[test]
+    fn results_come_back_newest_first() {
+        let mut store = MemoryStore::default();
+        for (uid, id, date) in [
+            (1, "old@x", "Mon, 3 Feb 2025 09:00:00 +0000"),
+            (2, "new@x", "Tue, 4 Feb 2025 09:00:00 +0000"),
+        ] {
+            store
+                .upsert(&RemoteMessage {
+                    uid,
+                    flags: Flags::default(),
+                    raw: format!(
+                        "Message-ID: <{id}>\r\nFrom: a@example.com\r\nSubject: report {uid}\r\n\
+                         Date: {date}\r\n\r\nbody\r\n"
+                    )
+                    .into_bytes(),
+                    internal_date_ms: 0,
+                })
+                .unwrap();
+        }
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+        assert_eq!(search(&index, "report"), ["report 2", "report 1"]);
+    }
+
+    #[test]
+    fn like_wildcards_in_a_search_box_are_literal() {
+        // Without escaping, searching for "50%" matches everything and
+        // "report_final" matches "reportXfinal" — silently, which is the worst
+        // way for a search box to be wrong.
+        let store = store(vec![
+            message(1, "a@x", "", "50% off", "a@example.com", "sale"),
+            message(2, "b@x", "", "Release plan", "b@example.com", "plan"),
+            message(3, "c@x", "", "report_final", "c@example.com", "done"),
+            message(4, "d@x", "", "reportXfinal", "d@example.com", "no"),
+        ]);
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+
+        assert_eq!(search(&index, "50%"), ["50% off"]);
+        assert_eq!(search(&index, "report_final"), ["report_final"]);
+    }
+
+    #[test]
+    fn a_quote_in_a_search_box_cannot_reach_the_query() {
+        // The terms are whatever somebody typed. This must return nothing and
+        // leave the table alone.
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+
+        assert!(search(&index, "'; DROP TABLE messages; --").is_empty());
+        assert_eq!(
+            index
+                .conversations(ACCOUNT, MAILBOX, &flags(&store))
+                .unwrap()
+                .len(),
+            3,
+            "the table did not survive"
+        );
+    }
+
+    #[test]
+    fn an_empty_query_returns_nothing_rather_than_the_mailbox() {
+        // A cleared search box must not load everything to show it twice.
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+        assert!(search(&index, "").is_empty());
+        assert!(search(&index, "   ").is_empty());
+    }
+
+    #[test]
+    fn a_search_says_which_mailbox_a_hit_is_in() {
+        // Half of what the user wanted to know.
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, "Archive", &store).unwrap();
+        let hits = index
+            .search(ACCOUNT, None, &crate::search::parse("invoice"), 50)
+            .unwrap();
+        assert_eq!(hits[0].mailbox, "Archive");
+
+        // And can be narrowed to one.
+        assert!(
+            index
+                .search(ACCOUNT, Some("INBOX"), &crate::search::parse("invoice"), 50)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_limit_is_honoured() {
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+        assert_eq!(
+            index
+                .search(ACCOUNT, None, &crate::search::parse("from:ada"), 1)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
