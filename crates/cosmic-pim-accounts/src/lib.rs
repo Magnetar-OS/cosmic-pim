@@ -30,6 +30,6 @@ pub mod account;
 pub mod error;
 pub mod secret;
 
-pub use account::{Account, AccountStore, AuthMethod};
+pub use account::{Account, AccountStore, AuthMethod, MailEndpoint, Transport};
 pub use error::{Error, Result};
 pub use secret::{Backend, SecretStore};

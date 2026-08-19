@@ -36,6 +36,65 @@ pub enum AuthMethod {
     OAuth,
 }
 
+/// How a mail connection is encrypted.
+///
+/// Spelled here as well as in `cosmic-pim-mail` deliberately. This crate sits
+/// *below* every protocol crate and must not depend on one — `caldav` knows
+/// nothing about accounts and `mail` knows nothing about accounts, which is
+/// what keeps all three independently testable. Three variants restated at the
+/// boundary is a smaller price than inverting that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    /// TLS from the first byte — port 993, and what every provider wants.
+    #[default]
+    Tls,
+    /// Plaintext upgraded with STARTTLS — port 143.
+    StartTls,
+    /// Unencrypted. Only ever reasonable for a server on `localhost`.
+    Plaintext,
+}
+
+/// Where this account's mail lives.
+///
+/// Optional because most accounts in the suite arrived through a calendar: a
+/// CalDAV URL says nothing about an IMAP host, and there is no reliable way to
+/// derive one. Slate fills in [`Account::url`], Envelope fills in this, and the
+/// password is the same password either way — which is the point of the shared
+/// account store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailEndpoint {
+    pub imap_host: String,
+    #[serde(default = "default_imap_port")]
+    pub imap_port: u16,
+    #[serde(default)]
+    pub imap_transport: Transport,
+    /// The IMAP login, when it differs from [`Account::username`].
+    ///
+    /// It does more often than you would expect: a CalDAV principal is
+    /// routinely a URL path segment or a user id while the mail login is the
+    /// email address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap_username: Option<String>,
+}
+
+fn default_imap_port() -> u16 {
+    993
+}
+
+impl MailEndpoint {
+    /// The conventional endpoint for a host: implicit TLS on 993.
+    #[must_use]
+    pub fn tls(imap_host: impl Into<String>) -> Self {
+        Self {
+            imap_host: imap_host.into(),
+            imap_port: default_imap_port(),
+            imap_transport: Transport::Tls,
+            imap_username: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     /// Stable identity. Also the secret slot key, so it must never be reused.
@@ -56,6 +115,9 @@ pub struct Account {
     /// "this is a new calendar", and creates a duplicate collection every time.
     #[serde(default)]
     pub collections: BTreeMap<String, String>,
+    /// Where this account's mail lives, once someone has said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail: Option<MailEndpoint>,
 }
 
 fn default_true() -> bool {
@@ -73,10 +135,27 @@ impl Account {
             auth: AuthMethod::Password,
             enabled: true,
             collections: BTreeMap::new(),
+            mail: None,
         }
     }
 
+    /// The IMAP login for this account: the mail-specific one if it was given,
+    /// otherwise the account's.
+    #[must_use]
+    pub fn mail_username(&self) -> &str {
+        self.mail
+            .as_ref()
+            .and_then(|mail| mail.imap_username.as_deref())
+            .unwrap_or(&self.username)
+    }
+
     /// The secret slot holding this account's password.
+    ///
+    /// One slot per account, not one per protocol. A user with a Fastmail
+    /// account has one Fastmail password, and Envelope reaching for a second
+    /// one because it speaks IMAP rather than CalDAV would be asking the same
+    /// question twice. The `caldav/` prefix is historical and names the slot,
+    /// not the protocol allowed to use it.
     #[must_use]
     pub fn secret_slot(&self) -> String {
         format!("caldav/{}/password", self.id)
@@ -353,6 +432,48 @@ mod tests {
             store.get(&id).unwrap().collections["/dav/calendars/user/work/"],
             "work"
         );
+    }
+
+    #[test]
+    fn a_mail_endpoint_round_trips_through_the_shared_config() {
+        // The suite's promise: an account added in Slate is the same account in
+        // Envelope, with one password and one file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("accounts.toml");
+        let id = {
+            let secrets = SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+            let mut store = AccountStore::open(&path, secrets).expect("open");
+            let mut account = Account::new("Fastmail", "https://caldav.fastmail.com/", "u123");
+            let id = account.id.clone();
+            account.mail = Some(MailEndpoint {
+                imap_host: "imap.fastmail.com".into(),
+                imap_port: 993,
+                imap_transport: Transport::Tls,
+                imap_username: Some("me@fastmail.com".into()),
+            });
+            store.add(account, "app-password").expect("add");
+            id
+        };
+
+        let secrets = SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+        let store = AccountStore::open(&path, secrets).expect("reopen");
+        let account = store.get(&id).expect("the account survived");
+        let mail = account.mail.as_ref().expect("the endpoint survived");
+        assert_eq!(mail.imap_host, "imap.fastmail.com");
+        assert_eq!(account.mail_username(), "me@fastmail.com");
+        assert_eq!(
+            store.password(&id).expect("read"),
+            Some("app-password".to_string()),
+            "mail must reach the same secret slot, not a second one"
+        );
+    }
+
+    #[test]
+    fn an_account_without_a_mail_endpoint_falls_back_to_its_own_username() {
+        // Every account Slate created looks like this.
+        let account = Account::new("Nextcloud", "https://cloud.example/", "dominikos");
+        assert!(account.mail.is_none());
+        assert_eq!(account.mail_username(), "dominikos");
     }
 
     #[test]
