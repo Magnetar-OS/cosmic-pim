@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cosmic-pim-core",
+    "crates/cosmic-pim-caldav",
+    "crates/cosmic-pim-accounts",
+    "crates/cosmic-pim-sync",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# MPL-2.0 throughout. The applications built on these crates are GPL-3.0-only
+# and link them without absorbing them — see LICENSING.md for why the split
+# exists and the one trap (Exhibit B) to avoid.
+license = "MPL-2.0"
+repository = "https://github.com/entro314-labs/cosmic-pim"
+rust-version = "1.97.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

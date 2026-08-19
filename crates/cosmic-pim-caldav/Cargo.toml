@@ -1,0 +1,54 @@
+[package]
+name = "cosmic-pim-caldav"
+version.workspace = true
+edition.workspace = true
+# MPL-2.0 — see ../../LICENSING.md. NOTE: this crate is derived from the
+# Meltemi repository, which currently carries no licence declaration at all.
+# Treat it as internal-only (do not publish, do not upstream) until that is
+# fixed; LICENSING.md spells out exactly what "fixed" means.
+license.workspace = true
+description = "CalDAV client and sync reconciler for the COSMIC PIM suite"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+cosmic-pim-core = { path = "../cosmic-pim-core" }
+
+# Synchronous HTTP. The whole protocol layer is blocking by design: a sync
+# cycle is a sequence of dependent round trips with nothing to interleave, so
+# an async runtime would buy nothing and cost a rewrite. Callers put the cycle
+# on a worker thread (`spawn_blocking`), which reqwest's blocking client is
+# safe from — it drives its own runtime on a dedicated thread.
+#
+# NOT ureq: ureq 3 enforces a hardcoded HTTP-method allowlist and rejects every
+# WebDAV verb before it reaches the socket. See the comment in CaldavClient::new.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+# Streaming pull parser. Multistatus responses are large and deeply nested, and
+# a DOM parser on a 5000-event listing is a needless allocation storm.
+quick-xml = "0.41"
+# The same iCalendar parser cosmic-pim-core uses — the writeback patcher needs
+# the document's own VTIMEZONE blocks to resolve a TZID when it reformats a
+# time. Pinned together with core's copy on purpose: two versions here would
+# mean the read path and the write path could disagree about a zone.
+calcard = "0.3.8"
+
+# Basic auth header encoding. App passwords are still how most self-hosted
+# CalDAV is reached, OAuth notwithstanding.
+base64 = "0.23"
+chrono = { version = "0.4.45", features = ["clock"] }
+chrono-tz = "0.10.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# A real HTTP server for the end-to-end sync test. The unit tests cover the XML
+# parsers and the reconciliation planner in isolation; this is what proves
+# `sync_collection` itself actually drives them in the right order.
+tiny_http = "0.12"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

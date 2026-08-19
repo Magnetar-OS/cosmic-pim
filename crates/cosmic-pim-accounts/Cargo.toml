@@ -1,0 +1,39 @@
+[package]
+name = "cosmic-pim-accounts"
+version.workspace = true
+edition.workspace = true
+# MPL-2.0 — see ../../LICENSING.md.
+license.workspace = true
+description = "Account metadata and credential storage for the COSMIC PIM suite"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+cosmic-pim-core = { path = "../cosmic-pim-core" }
+
+# The OS keychain. On Linux this is secret-service (GNOME Keyring / KWallet).
+keyring = "4.1.5"
+
+# The envelope fallback, for hosts where the keychain is unusable. XChaCha20's
+# 192-bit nonce is what makes random nonces safe here: with AES-GCM's 96 bits,
+# a long-lived key plus random nonces has a birthday-bound collision risk that
+# would leak plaintext.
+chacha20poly1305 = "0.11.0"
+zeroize = "1"
+rand = "0.10"
+base64 = "0.23"
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+uuid = { version = "1.24", features = ["v4"] }
+dirs = "6"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,55 @@
+[package]
+name = "cosmic-pim-core"
+version.workspace = true
+edition.workspace = true
+# MPL-2.0, deliberately NOT the app's GPL-3.0-only. This crate is the shared
+# substrate for every app in the suite (calendar, contacts, tasks, mail), and
+# file-level copyleft lets it be consumed by our own non-GPL products and by
+# third-party COSMIC apps without relicensing them, while still forcing fixes
+# to THESE files back out. See LICENSE and ../../LICENSING.md.
+license.workspace = true
+description = "Shared PIM substrate for COSMIC: vdir storage, SQLite index, filesystem watching"
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# --- time ---
+# chrono is the domain time type: both the iCalendar layer and `rrule` are
+# built on it.
+chrono = { version = "0.4.45", features = ["clock", "serde"] }
+chrono-tz = "0.10.4"
+# Only for `local_timezone()`: jiff reads /etc/localtime and TZ. It is already
+# in the workspace graph via libcosmic's calendar widget, so this is free.
+jiff = "0.2.35"
+
+# --- iCalendar / recurrence ---
+# calcard is the suite's single iCalendar/vCard parser. It replaced the
+# `icalendar` crate here so that the calendar, the CalDAV sync engine, and (in
+# time) the contacts app all agree byte-for-byte on how a file is interpreted:
+# two parsers with different TZID handling reading the SAME vdir is a genuine
+# bug source, not a style preference. It also parses vCard, which is what makes
+# a contacts app a new module rather than a new dependency.
+calcard = "0.3.8"
+rrule = "0.14"
+
+# --- storage ---
+# `bundled` compiles SQLite from source so we never depend on the host's
+# libsqlite3 version.
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+notify = "8.2"
+
+# --- misc ---
+uuid = { version = "1.24", features = ["v4"] }
+thiserror = "2"
+tracing = "0.1"
+dirs = "6"
+serde = { version = "1.0.229", features = ["derive"] }
+# The watcher hands debounced bursts to the UI over a tokio channel.
+tokio = { version = "1.53", features = ["sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.53", features = ["macros", "rt", "time"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
