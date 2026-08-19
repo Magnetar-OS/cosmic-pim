@@ -45,7 +45,6 @@
 //! [`crate::error::Error::UidValidityChanged`] is classified as needing a sync
 //! pass rather than a retry.
 
-use std::collections::BTreeMap;
 
 use imap::types::Fetch;
 
@@ -599,70 +598,6 @@ impl PushQueue for MemoryMailbox {
     }
 }
 
-/// Thread messages already in a store, newest conversation first.
-///
-/// Here rather than in [`crate::threading`] because it is the join between
-/// threading and storage, and threading itself must stay a pure function of
-/// header text.
-pub fn thread_mailbox(
-    store: &impl MailStore,
-    account_id: &str,
-    mailbox: &str,
-) -> Result<BTreeMap<String, Vec<u32>>> {
-    use crate::threading::{MemoryIndex, Threadable, resolve_thread};
-
-    let state = store.state()?;
-    // Oldest UID first so a parent is indexed before the replies that adopt it;
-    // going the other way would make adoption depend on arrival order.
-    let mut index = MemoryIndex::default();
-    let mut threads: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-
-    for uid in state.entries.keys().copied() {
-        let Some(raw) = store.raw(uid)? else { continue };
-        let Some(message) = crate::model::Message::parse(&raw) else {
-            continue;
-        };
-        let fallback = format!("{mailbox}/{uid}");
-        let resolution = resolve_thread(
-            &index,
-            account_id,
-            Threadable {
-                message_id: message.message_id.as_deref(),
-                references_header: &message.references,
-                in_reply_to_header: &message.in_reply_to,
-                subject: &message.subject,
-                subject_norm: &message.subject_norm,
-                uid_fallback: &fallback,
-            },
-        );
-        // Children that arrived before this parent move onto its thread.
-        for dead in &resolution.merged_from {
-            if let Some(orphans) = threads.remove(dead) {
-                threads
-                    .entry(resolution.thread_id.clone())
-                    .or_default()
-                    .extend(orphans);
-            }
-        }
-        let date_ms = message.date.map_or(0, |d| d.timestamp_millis());
-        index.insert(
-            message.message_id.as_deref().unwrap_or(&fallback),
-            &resolution.thread_id,
-            &message.subject_norm,
-            date_ms,
-        );
-        threads
-            .entry(resolution.thread_id)
-            .or_default()
-            .push(uid);
-    }
-
-    for uids in threads.values_mut() {
-        uids.sort_unstable();
-    }
-    Ok(threads)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -682,65 +617,4 @@ mod tests {
         assert!(!FETCH_ITEMS.contains("BODY["));
     }
 
-    #[test]
-    fn threading_a_store_groups_a_conversation_and_keeps_singletons_apart() {
-        let mut store = crate::store::MemoryStore::default();
-        let messages = [
-            (1, "root@x", "", "Release plan"),
-            (2, "reply@x", "<root@x>", "Re: Release plan"),
-            (3, "other@x", "", "Lunch"),
-        ];
-        for (uid, id, references, subject) in messages {
-            let raw = format!(
-                "Message-ID: <{id}>\r\nReferences: {references}\r\nSubject: {subject}\r\n\r\nbody\r\n"
-            );
-            store
-                .upsert(&RemoteMessage {
-                    uid,
-                    flags: Flags::default(),
-                    raw: raw.into_bytes(),
-                    internal_date_ms: i64::from(uid) * 1000,
-                })
-                .unwrap();
-        }
-
-        let threads = thread_mailbox(&store, "acct", "INBOX").unwrap();
-        assert_eq!(threads.len(), 2);
-        let conversation = threads
-            .values()
-            .find(|uids| uids.len() == 2)
-            .expect("the reply did not join its parent");
-        assert_eq!(conversation, &vec![1, 2]);
-    }
-
-    #[test]
-    fn a_reply_stored_before_its_parent_still_ends_up_in_one_thread() {
-        // Out-of-order arrival is the normal case on a first backfill.
-        let mut store = crate::store::MemoryStore::default();
-        // UID 1 is the reply; UID 2 is the parent it names.
-        for (uid, id, references, in_reply_to) in [
-            (1, "reply@x", "<parent@x>", "<parent@x>"),
-            (2, "parent@x", "<grand@x>", "<grand@x>"),
-        ] {
-            let raw = format!(
-                "Message-ID: <{id}>\r\nReferences: {references}\r\nIn-Reply-To: {in_reply_to}\r\nSubject: Re: X\r\n\r\nbody\r\n"
-            );
-            store
-                .upsert(&RemoteMessage {
-                    uid,
-                    flags: Flags::default(),
-                    raw: raw.into_bytes(),
-                    internal_date_ms: i64::from(uid) * 1000,
-                })
-                .unwrap();
-        }
-
-        let threads = thread_mailbox(&store, "acct", "INBOX").unwrap();
-        assert_eq!(
-            threads.len(),
-            1,
-            "the conversation stayed split after the parent arrived: {threads:?}"
-        );
-        assert_eq!(threads.values().next().unwrap(), &vec![1, 2]);
-    }
 }

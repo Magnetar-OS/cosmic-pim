@@ -31,6 +31,7 @@
 //! - [`store`] — the [`MailStore`] trait: what a backing store must provide.
 //! - [`maildir`] — [`MailStore`] over a maildir, so `mbsync`, `mu`, and
 //!   `notmuch` read the same files.
+//! - [`index`] — a rebuildable SQLite cache of what a conversation list shows.
 //! - [`plan`] — the reconciliation decision, as a pure function.
 //! - [`push`] — durable writeback for flag changes, moves, and deletions.
 //! - [`imap`] — the session, and the cycle that ties the rest together.
@@ -72,6 +73,7 @@ pub mod compose;
 pub mod error;
 pub mod folder;
 pub mod imap;
+pub mod index;
 pub mod maildir;
 pub mod model;
 pub mod plan;
@@ -85,6 +87,7 @@ pub use error::{Error, Result};
 pub use compose::Draft;
 pub use smtp::{Outcome, SmtpEndpoint};
 pub use folder::{Folder, SpecialUse};
+pub use index::{Conversation, Index, Summary};
 pub use model::{Flags, Mailbox, Message};
 pub use plan::{MailboxPlan, plan_fetch, plan_reconcile};
 pub use store::{Cursor, MailStore, MailboxState, MemoryStore, RemoteMessage};

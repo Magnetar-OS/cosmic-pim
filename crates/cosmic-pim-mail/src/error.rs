@@ -41,6 +41,11 @@ pub enum Error {
     #[error("SMTP: {0}")]
     Smtp(String),
 
+    /// The index is a cache; a failure here is recoverable by rebuilding it,
+    /// and is never a reason to lose a message.
+    #[error("index: {0}")]
+    Index(String),
+
     #[error("{path} is not a maildir (no cur/ directory)")]
     NotAMaildir { path: PathBuf },
 
