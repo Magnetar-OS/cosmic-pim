@@ -24,7 +24,10 @@
 //! parse-and-reserialise cycle — which is the same reason a stored message is
 //! never re-serialised, arrived at from the other direction.
 
-use lettre::message::{Mailbox as LettreMailbox, Message as LettreMessage, header};
+use lettre::message::{
+    Attachment as LettreAttachment, Mailbox as LettreMailbox, Message as LettreMessage, MultiPart,
+    SinglePart, header,
+};
 
 use crate::error::{Error, Result};
 use crate::model::{Mailbox, Message};
@@ -64,6 +67,65 @@ pub struct Draft {
     pub in_reply_to: Option<String>,
     /// The reference chain this reply extends, oldest first, without brackets.
     pub references: Vec<String>,
+    /// Files to send with it.
+    pub attachments: Vec<Attachment>,
+}
+
+/// One file to send, already read into memory.
+///
+/// Bytes rather than a path, deliberately. A path works right up until the file
+/// moves between the moment it was picked and the moment the message is sent —
+/// and a draft saved on Monday and sent on Thursday is exactly that gap. Reading
+/// once, at the point the user chooses the file, is also what makes a saved
+/// draft self-contained.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub mime_type: String,
+    /// Base64 in the serialised form, because a draft is JSON and raw bytes are
+    /// not. The cost is 33% on a file already sitting in a draft, which is
+    /// nothing next to keeping the draft self-contained.
+    #[serde(with = "base64_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+impl Attachment {
+    /// Reads a file, guessing its type from the extension.
+    pub fn from_path(path: &std::path::Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .map_err(|why| Error::Draft(format!("{} could not be read: {why}", path.display())))?;
+        let name = path
+            .file_name()
+            .map_or_else(|| "attachment".to_string(), |n| n.to_string_lossy().into_owned());
+        Ok(Self {
+            mime_type: crate::attachment::mime_for(&name).to_owned(),
+            name,
+            bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+mod base64_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl Draft {
@@ -117,6 +179,10 @@ impl Draft {
             to,
             cc,
             bcc: Vec::new(),
+            // Not carried. A reply is a new message, and re-attaching what
+            // somebody sent you is a decision, not a default — see `forward`
+            // for why the honest version of that is not this one.
+            attachments: Vec::new(),
         }
     }
 
@@ -211,10 +277,49 @@ impl Draft {
             );
         }
 
+        if self.attachments.is_empty() {
+            return builder
+                .header(header::ContentType::TEXT_PLAIN)
+                .body(self.body.clone())
+                .map_err(|why| Error::Draft(why.to_string()));
+        }
+
+        // `multipart/mixed`: the body first, then the files. Not
+        // `multipart/related` — that is for parts the body *refers to*, and a
+        // reader that has to guess which it was shows attachments twice or not
+        // at all.
+        let mut parts = MultiPart::mixed().singlepart(
+            SinglePart::builder()
+                .header(header::ContentType::TEXT_PLAIN)
+                .body(self.body.clone()),
+        );
+        for attachment in &self.attachments {
+            let content_type = header::ContentType::parse(&attachment.mime_type).unwrap_or_else(
+                |_| {
+                    // A type we cannot parse must not stop the send; RFC 2046's
+                    // default is the honest fallback.
+                    header::ContentType::parse("application/octet-stream")
+                        .unwrap_or(header::ContentType::TEXT_PLAIN)
+                },
+            );
+            parts = parts.singlepart(
+                LettreAttachment::new(attachment.name.clone())
+                    .body(attachment.bytes.clone(), content_type),
+            );
+        }
         builder
-            .header(header::ContentType::TEXT_PLAIN)
-            .body(self.body.clone())
+            .multipart(parts)
             .map_err(|why| Error::Draft(why.to_string()))
+    }
+
+    /// What the attachments add up to.
+    ///
+    /// Providers cap a message at 25 MB and count the base64 expansion, not the
+    /// files — so a caller warning on size has to reckon with roughly a third
+    /// more than this.
+    #[must_use]
+    pub fn attachment_bytes(&self) -> usize {
+        self.attachments.iter().map(Attachment::size).sum()
     }
 }
 
@@ -538,6 +643,102 @@ mod tests {
         let bytes = String::from_utf8(draft.build(false).unwrap().formatted()).unwrap();
         assert!(bytes.contains("In-Reply-To: <parent@x>"), "{bytes}");
         assert!(bytes.contains("References: <root@x> <parent@x>"), "{bytes}");
+    }
+
+    #[test]
+    fn an_attachment_reaches_the_message_as_a_mixed_part() {
+        let mut draft = Draft::new(me());
+        draft.to.push(Mailbox {
+            name: None,
+            address: "ada@example.com".into(),
+        });
+        draft.subject = "Here it is".into();
+        draft.body = "See attached.".into();
+        draft.attachments.push(crate::compose::Attachment {
+            name: "report.csv".into(),
+            mime_type: "text/csv".into(),
+            bytes: b"a,b\n1,2\n".to_vec(),
+        });
+
+        let wire = String::from_utf8(draft.build(false).unwrap().formatted()).unwrap();
+        assert!(wire.contains("multipart/mixed"), "{wire}");
+        assert!(wire.contains("text/csv"), "{wire}");
+        assert!(
+            wire.contains("report.csv"),
+            "the filename did not reach the recipient: {wire}"
+        );
+        assert!(wire.contains("See attached."), "the body was lost: {wire}");
+
+        // And it comes back out as an attachment a reader can list.
+        let parsed = Message::parse(wire.as_bytes()).unwrap();
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].name, "report.csv");
+        assert_eq!(
+            crate::attachment::bytes_of(wire.as_bytes(), 0).unwrap(),
+            b"a,b\n1,2\n"
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_attachments_stays_a_simple_text_message() {
+        // No gratuitous multipart wrapper: plenty of readers render a
+        // single-part text message better, and there is nothing to mix.
+        let mut draft = Draft::new(me());
+        draft.to.push(Mailbox {
+            name: None,
+            address: "ada@example.com".into(),
+        });
+        draft.body = "Just text.".into();
+        let wire = String::from_utf8(draft.build(false).unwrap().formatted()).unwrap();
+        assert!(!wire.contains("multipart"), "{wire}");
+    }
+
+    #[test]
+    fn an_unparseable_content_type_does_not_stop_the_send() {
+        let mut draft = Draft::new(me());
+        draft.to.push(Mailbox {
+            name: None,
+            address: "ada@example.com".into(),
+        });
+        draft.attachments.push(crate::compose::Attachment {
+            name: "thing".into(),
+            mime_type: "not a mime type at all".into(),
+            bytes: b"bytes".to_vec(),
+        });
+        let built = draft.build(false).expect("a bad type must not block the mail");
+        let wire = String::from_utf8(built.formatted()).unwrap();
+        assert!(wire.contains("application/octet-stream"), "{wire}");
+    }
+
+    #[test]
+    fn attachments_survive_a_draft_being_serialised() {
+        // A draft is JSON, and bytes are not. Base64 costs a third and keeps
+        // the draft self-contained, which is the whole point of holding bytes
+        // rather than a path.
+        let mut draft = Draft::new(me());
+        draft.attachments.push(crate::compose::Attachment {
+            name: "photo.png".into(),
+            mime_type: "image/png".into(),
+            bytes: vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        });
+        let json = serde_json::to_string(&draft).unwrap();
+        let back: Draft = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attachments[0].bytes, draft.attachments[0].bytes);
+        assert_eq!(back.attachment_bytes(), 8);
+    }
+
+    #[test]
+    fn a_reply_does_not_carry_the_original_attachments() {
+        // Re-attaching what somebody sent you is a decision, not a default.
+        let raw = concat!(
+            "From: a@example.com\r\nSubject: x\r\nMIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n",
+            "--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n",
+            "--b\r\nContent-Disposition: attachment; filename=\"big.zip\"\r\n\r\nZZ\r\n--b--\r\n"
+        );
+        let original = Message::parse(raw.as_bytes()).unwrap();
+        assert_eq!(original.attachments.len(), 1);
+        assert!(Draft::reply(&original, me(), false).attachments.is_empty());
     }
 
     #[test]

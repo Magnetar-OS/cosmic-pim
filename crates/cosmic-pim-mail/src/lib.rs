@@ -24,6 +24,7 @@
 //! - [`text`] — HTML → what a human would actually see, and a count of what was
 //!   hidden.
 //! - [`auth`] — `Authentication-Results` (RFC 8601), per hop and mechanism.
+//! - [`attachment`] — getting attachments out of a message, and safely onto a disk.
 //! - [`compose`] — drafts, and how a reply or a forward is built from a message.
 //! - [`drafts`] — unsent messages, kept on this device.
 //! - [`smtp`] — sending, and the one failure that must never be auto-retried.
@@ -70,6 +71,7 @@
 //! we hold now names a different message, or nothing. It is never retryable and
 //! must never be handled by pushing harder.
 
+pub mod attachment;
 pub mod auth;
 pub mod compose;
 pub mod drafts;
