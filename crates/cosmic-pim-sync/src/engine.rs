@@ -19,10 +19,10 @@ use std::path::Path;
 
 use cosmic_pim_accounts::{Account, AccountStore};
 use cosmic_pim_caldav::push::{DrainOutcome, drain};
-use cosmic_pim_caldav::{CaldavClient, SyncOutcome, VdirStore, sync_collection};
+use cosmic_pim_caldav::{CaldavClient, Flavor, SyncOutcome, sync_collection};
 
 use crate::error::{Error, Result};
-use crate::provision::{Provisioned, provision_account};
+use crate::provision::{Provisioned, open_store, provision_account};
 
 /// What happened to one collection.
 #[derive(Debug)]
@@ -30,6 +30,8 @@ pub struct CollectionReport {
     pub collection_id: String,
     pub display_name: String,
     pub href: String,
+    /// Calendar or address book.
+    pub flavor: Flavor,
     /// What the local writeback queue did before the pull ran.
     pub pushed: DrainOutcome,
     pub outcome: Result<SyncOutcome>,
@@ -46,6 +48,24 @@ impl CollectionReport {
     pub fn has_unpushed_changes(&self) -> bool {
         self.pushed.deferred > 0 || self.pushed.skipped > 0
     }
+
+    /// Resources the server changed while we were holding an unsent change to
+    /// the same ones. Read the records with [`crate::conflicts`].
+    #[must_use]
+    pub fn conflicts(&self) -> usize {
+        match &self.outcome {
+            Ok(outcome) => outcome.conflicts,
+            Err(_) => 0,
+        }
+    }
+
+    /// Whether this collection needs a person rather than another sync: a
+    /// password to re-enter, write access it does not have, a full account, or
+    /// a conflict to decide.
+    #[must_use]
+    pub fn needs_attention(&self) -> bool {
+        self.pushed.needs_attention() || self.conflicts() > 0
+    }
 }
 
 /// What happened to one account.
@@ -53,9 +73,19 @@ impl CollectionReport {
 pub struct AccountReport {
     pub account_id: String,
     pub display_name: String,
+    /// Every collection of both kinds, calendars first.
+    ///
     /// `Err` means the account failed before any collection was reached —
     /// no password, discovery refused, the host is down.
     pub collections: Result<Vec<CollectionReport>>,
+    /// Why address books were not reached, when they were not.
+    ///
+    /// Separate from `collections` because "this server offers no CardDAV" is
+    /// the ordinary case for a calendar-only account and must not present as a
+    /// failed sync — while a CardDAV server that *is* there and refused us has
+    /// to be visible rather than silently skipped. There is no collection to
+    /// hang such an error on, so it hangs here.
+    pub contacts_unavailable: Option<String>,
 }
 
 impl AccountReport {
@@ -83,6 +113,11 @@ impl AccountReport {
                     .sum();
                 let pushed: usize = reports.iter().map(|r| r.pushed.succeeded).sum();
                 let failed = reports.iter().filter(|r| r.outcome.is_err()).count();
+                let conflicts: usize = reports.iter().map(CollectionReport::conflicts).sum();
+                let blocked: usize = reports
+                    .iter()
+                    .map(|r| r.pushed.needs_user + r.pushed.needs_reconcile)
+                    .sum();
 
                 let mut parts = Vec::new();
                 if fetched > 0 {
@@ -97,6 +132,14 @@ impl AccountReport {
                 if failed > 0 {
                     parts.push(format!("{failed} failed"));
                 }
+                // These are the two the user can act on, so they say so rather
+                // than hiding inside a count of things that "did not sync".
+                if conflicts > 0 {
+                    parts.push(format!("{conflicts} to resolve"));
+                }
+                if blocked > 0 {
+                    parts.push(format!("{blocked} held"));
+                }
                 if parts.is_empty() {
                     parts.push("up to date".to_owned());
                 }
@@ -107,7 +150,15 @@ impl AccountReport {
 }
 
 /// Syncs every enabled account, recording new collection bindings as it goes.
-pub fn sync_all(store: &mut AccountStore, root: &Path) -> Vec<AccountReport> {
+///
+/// Two roots because the suite keeps two: `$XDG_DATA_HOME/calendars` and
+/// `$XDG_DATA_HOME/contacts`. One account can offer both, and a server offering
+/// neither is not an error.
+pub fn sync_all(
+    store: &mut AccountStore,
+    calendar_root: &Path,
+    contacts_root: &Path,
+) -> Vec<AccountReport> {
     // Clone the account list up front: `bind_collection` needs `&mut store`
     // while we are iterating, and the alternative is threading indices through
     // the whole call chain for no benefit.
@@ -115,33 +166,62 @@ pub fn sync_all(store: &mut AccountStore, root: &Path) -> Vec<AccountReport> {
 
     accounts
         .iter()
-        .map(|account| sync_one(store, account, root))
+        .map(|account| sync_one(store, account, calendar_root, contacts_root))
         .collect()
 }
 
-fn sync_one(store: &mut AccountStore, account: &Account, root: &Path) -> AccountReport {
-    let report = |collections| AccountReport {
+fn sync_one(
+    store: &mut AccountStore,
+    account: &Account,
+    calendar_root: &Path,
+    contacts_root: &Path,
+) -> AccountReport {
+    let report = |collections, contacts_unavailable| AccountReport {
         account_id: account.id.clone(),
         display_name: account.display_name.clone(),
         collections,
+        contacts_unavailable,
     };
 
     let password = match store.password(&account.id) {
         Ok(Some(password)) => password,
-        Ok(None) => return report(Err(Error::MissingPassword(account.display_name.clone()))),
-        Err(why) => return report(Err(why.into())),
+        Ok(None) => {
+            return report(
+                Err(Error::MissingPassword(account.display_name.clone())),
+                None,
+            );
+        }
+        Err(why) => return report(Err(why.into()), None),
     };
 
     let mut client = CaldavClient::new(&account.url, &account.username, &password);
 
-    let provisioned = match provision_account(&mut client, account, root) {
+    let calendars = match provision_account(&mut client, account, calendar_root) {
         Ok(provisioned) => provisioned,
-        Err(why) => return report(Err(why)),
+        Err(why) => return report(Err(why), None),
     };
+
+    // Address books are discovered with a second client because CardDAV has
+    // its own principal and home-set. Failing to find any is not an account
+    // failure: plenty of servers offer calendars and no contacts at all, and
+    // treating that as a broken account would light up every calendar-only
+    // setup with a permanent error.
+    let mut carddav = CaldavClient::carddav(&account.url, &account.username, &password);
+    let (address_books, contacts_unavailable) =
+        match provision_account(&mut carddav, account, contacts_root) {
+            Ok(provisioned) => (provisioned, None),
+            Err(why) => {
+                tracing::info!(
+                    account = account.display_name, %why,
+                    "no address books reached for this account; syncing calendars only"
+                );
+                (Vec::new(), Some(why.to_string()))
+            }
+        };
 
     // Persist bindings before syncing. If sync then fails, the next run still
     // recognises these collections instead of creating duplicates beside them.
-    for entry in provisioned.iter().filter(|p| p.created) {
+    for entry in calendars.iter().chain(&address_books).filter(|p| p.created) {
         if let Err(why) = store.bind_collection(&account.id, &entry.href, &entry.collection_id) {
             tracing::warn!(
                 account = account.display_name, href = entry.href, %why,
@@ -150,16 +230,35 @@ fn sync_one(store: &mut AccountStore, account: &Account, root: &Path) -> Account
         }
     }
 
-    report(Ok(provisioned
-        .into_iter()
-        .map(|entry| sync_provisioned(&client, &entry, root))
-        .collect()))
+    let reports = calendars
+        .iter()
+        .map(|entry| sync_provisioned(&client, entry, calendar_root))
+        .chain(
+            address_books
+                .iter()
+                .map(|entry| sync_provisioned(&carddav, entry, contacts_root)),
+        )
+        .collect();
+
+    report(Ok(reports), contacts_unavailable)
 }
 
 fn sync_provisioned(client: &CaldavClient, entry: &Provisioned, root: &Path) -> CollectionReport {
     let mut pushed = DrainOutcome::default();
 
     let outcome = (|| {
+        // Nothing about a contested collection improves by trying: the marker
+        // is in the directory, the other engine is running on its own
+        // schedule, and one round of both pushing is enough to start the
+        // oscillation. The error carries the reason to the UI, which is where
+        // the decision belongs.
+        if let Some(marker) = &entry.contested {
+            return Err(Error::ForeignSyncOwner {
+                collection: entry.display_name.clone(),
+                marker: marker.clone(),
+            });
+        }
+
         let meta = crate::provision::open_collection(root, &entry.collection_id).ok_or_else(|| {
             Error::CalDav(cosmic_pim_caldav::Error::internal(format!(
                 "collection “{}” vanished between provisioning and sync",
@@ -167,7 +266,7 @@ fn sync_provisioned(client: &CaldavClient, entry: &Provisioned, root: &Path) -> 
             )))
         })?;
 
-        let mut store = VdirStore::open(meta)?;
+        let mut store = open_store(entry.flavor, meta)?;
 
         // Push before pulling. Draining afterwards would mean the pull
         // overwrites a local edit with the server's older copy, and the queued
@@ -182,6 +281,7 @@ fn sync_provisioned(client: &CaldavClient, entry: &Provisioned, root: &Path) -> 
         collection_id: entry.collection_id.clone(),
         display_name: entry.display_name.clone(),
         href: entry.href.clone(),
+        flavor: entry.flavor,
         pushed,
         outcome,
     }
@@ -200,7 +300,8 @@ fn chrono_now_ms() -> i64 {
 pub fn sync_account(
     store: &mut AccountStore,
     account_id: &str,
-    root: &Path,
+    calendar_root: &Path,
+    contacts_root: &Path,
 ) -> Result<AccountReport> {
     let account = store
         .get(account_id)
@@ -208,5 +309,5 @@ pub fn sync_account(
             cosmic_pim_accounts::Error::UnknownAccount(account_id.to_owned())
         })?
         .clone();
-    Ok(sync_one(store, &account, root))
+    Ok(sync_one(store, &account, calendar_root, contacts_root))
 }

@@ -14,16 +14,21 @@
 //! each of them independently testable and separately reusable — a contacts app
 //! will want the same three-way join with CardDAV substituted for CalDAV.
 //!
-//! - [`provision`] — binds a discovered calendar to a vdir collection, exactly
-//!   once, across restarts.
+//! - [`provision`] — binds a discovered calendar or address book to a vdir
+//!   collection, exactly once, across restarts.
 //! - [`engine`] — one pass over every enabled account, failing per-collection
 //!   rather than per-run.
+//! - [`writeback`] — turns a local save or delete into a queued push.
+//! - [`conflict`] — what a pass could not decide on its own: both sides
+//!   changed the same resource, and a person has to choose.
 
+pub mod conflict;
 pub mod engine;
 pub mod error;
 pub mod provision;
 pub mod writeback;
 
+pub use conflict::all as conflicts;
 pub use engine::{AccountReport, CollectionReport, sync_account, sync_all};
 pub use error::{Error, Result};
 pub use provision::{Provisioned, provision_account};

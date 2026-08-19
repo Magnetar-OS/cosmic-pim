@@ -22,11 +22,20 @@
 //!
 //! The binding is also written into the collection's own sidecar, so a
 //! collection remains self-describing even if `accounts.toml` is lost.
+//!
+//! # Calendars and address books are the same problem
+//!
+//! CardDAV discovery differs from CalDAV's by a home-set property name and a
+//! resourcetype marker, both of which live behind [`Flavor`] inside the
+//! client. So this module does not branch on the kind of collection at all: it
+//! asks the client what it is, opens the matching store, and provisions into
+//! whichever root it was given. An address book is a calendar with a different
+//! file extension as far as anything here is concerned.
 
 use std::path::Path;
 
 use cosmic_pim_accounts::Account;
-use cosmic_pim_caldav::{CaldavClient, VdirStore};
+use cosmic_pim_caldav::{CaldavClient, Flavor, VdirStore};
 use cosmic_pim_core::model::{CalendarMeta, DEFAULT_CALENDAR_COLOR, Rgb};
 use cosmic_pim_core::store::vdir;
 
@@ -44,13 +53,27 @@ pub struct Provisioned {
     pub created: bool,
     /// The server says we may only read this one.
     pub read_only: bool,
+    /// Another sync engine's marker file found in the collection, if any.
+    ///
+    /// The collection is still provisioned and still bound — it is a real
+    /// calendar and the user can see it — but syncing it is refused until they
+    /// say otherwise, because two engines on one collection diverge silently.
+    /// See [`cosmic_pim_caldav::vdir::foreign_sync_marker`].
+    pub contested: Option<String>,
+    /// Calendar or address book — decides which store opens it, and which
+    /// root it lives under.
+    pub flavor: Flavor,
 }
 
-/// Discovers the account's calendars and ensures each has a vdir collection.
+/// Discovers the account's collections and ensures each has a vdir directory.
 ///
-/// Returns one entry per calendar the server offers. The caller is responsible
-/// for persisting the bindings — see [`crate::engine::sync_account`], which
-/// does it through `AccountStore::bind_collection`.
+/// Which kind of collection is decided by the client: a `CaldavClient::new`
+/// finds calendars under the calendar root, a [`CaldavClient::carddav`] finds
+/// address books under the contacts root. Pass the matching root.
+///
+/// Returns one entry per collection the server offers. The caller is
+/// responsible for persisting the bindings — see [`crate::engine::sync_account`],
+/// which does it through `AccountStore::bind_collection`.
 pub fn provision_account(
     client: &mut CaldavClient,
     account: &Account,
@@ -70,7 +93,7 @@ pub fn provision_account(
             .clone()
             .map(|n| n.trim().to_owned())
             .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| name_from_href(&calendar.href));
+            .unwrap_or_else(|| name_from_href(&calendar.href, client.flavor()));
 
         // `None` means the server sent no privilege set at all, which older
         // servers commonly do; treat that as editable rather than locking the
@@ -98,8 +121,16 @@ pub fn provision_account(
 
         // Record the server coordinates in the collection itself, so it stays
         // self-describing if accounts.toml is lost or hand-edited.
-        let mut store = VdirStore::open(meta.clone())?;
+        let mut store = open_store(client.flavor(), meta.clone())?;
         store.set_remote(&calendar.href, read_only)?;
+
+        let contested = store.foreign_sync_marker();
+        if let Some(marker) = &contested {
+            tracing::warn!(
+                collection = meta.id, marker,
+                "another sync engine already owns this collection; not syncing it"
+            );
+        }
 
         out.push(Provisioned {
             href: calendar.href,
@@ -107,10 +138,21 @@ pub fn provision_account(
             collection_id: meta.id,
             created,
             read_only,
+            contested,
+            flavor: client.flavor(),
         });
     }
 
     Ok(out)
+}
+
+/// Opens a collection's sync state with the right file extension and payload
+/// check for its kind.
+pub(crate) fn open_store(flavor: Flavor, meta: CalendarMeta) -> Result<VdirStore> {
+    match flavor {
+        Flavor::CalDav => Ok(VdirStore::open(meta)?),
+        Flavor::CardDav => Ok(VdirStore::open_carddav(meta)?),
+    }
 }
 
 /// A readable name for a calendar whose server did not supply one.
@@ -118,11 +160,15 @@ pub fn provision_account(
 /// Servers that omit `displayname` are usually the same ones with opaque
 /// UUID hrefs, so this is often ugly — but an ugly name the user can rename is
 /// better than an empty one, and much better than refusing the calendar.
-fn name_from_href(href: &str) -> String {
+fn name_from_href(href: &str, flavor: Flavor) -> String {
+    let fallback = match flavor {
+        Flavor::CalDav => "Calendar",
+        Flavor::CardDav => "Contacts",
+    };
     href.rsplit('/')
         .find(|segment| !segment.is_empty())
         .filter(|segment| !segment.is_empty())
-        .unwrap_or("Calendar")
+        .unwrap_or(fallback)
         .to_owned()
 }
 
@@ -139,13 +185,18 @@ mod tests {
 
     #[test]
     fn a_name_is_derived_from_the_last_href_segment() {
-        assert_eq!(name_from_href("/dav/calendars/user/work/"), "work");
-        assert_eq!(name_from_href("/dav/calendars/user/work"), "work");
+        assert_eq!(name_from_href("/dav/calendars/user/work/", Flavor::CalDav), "work");
+        assert_eq!(name_from_href("/dav/calendars/user/work", Flavor::CalDav), "work");
     }
 
     #[test]
     fn an_unusable_href_still_yields_a_name() {
-        assert_eq!(name_from_href("/"), "Calendar");
-        assert_eq!(name_from_href(""), "Calendar");
+        assert_eq!(name_from_href("/", Flavor::CalDav), "Calendar");
+        assert_eq!(name_from_href("", Flavor::CalDav), "Calendar");
+    }
+
+    #[test]
+    fn an_unnamed_address_book_is_not_called_calendar() {
+        assert_eq!(name_from_href("/", Flavor::CardDav), "Contacts");
     }
 }
