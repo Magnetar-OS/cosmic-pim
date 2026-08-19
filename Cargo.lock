@@ -523,6 +523,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "cosmic-pim-core",
+ "dirs",
  "ego-tree",
  "imap",
  "imap-proto",

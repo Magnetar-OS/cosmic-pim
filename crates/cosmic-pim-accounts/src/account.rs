@@ -307,6 +307,22 @@ impl AccountStore {
         self.save()
     }
 
+    /// Records where this account's mail lives, or clears it.
+    ///
+    /// A separate call from [`Self::add`] because the two facts arrive from
+    /// different applications at different times: Slate creates the account
+    /// with a CalDAV URL, and Envelope fills this in later. Neither should have
+    /// to know the other's fields to write its own.
+    pub fn set_mail_endpoint(&mut self, id: &str, mail: Option<MailEndpoint>) -> Result<()> {
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?;
+        account.mail = mail;
+        self.save()
+    }
+
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<()> {
         let account = self
             .accounts

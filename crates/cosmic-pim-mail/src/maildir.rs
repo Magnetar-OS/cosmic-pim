@@ -95,6 +95,32 @@ struct Sidecar {
     pending: Vec<PendingPush>,
 }
 
+/// Where mail lives by default: `$XDG_DATA_HOME/mail`.
+///
+/// Beside `calendars` and `contacts`, and named the same way for the same
+/// reason: a user looking for their data should find all of it in one obvious
+/// place. `COSMIC_PIM_MAIL_DIR` overrides it, which is how the tests point at a
+/// tempdir.
+#[must_use]
+pub fn default_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("COSMIC_PIM_MAIL_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("mail")
+}
+
+/// The maildir mirroring one mailbox of one account.
+///
+/// Accounts are separated by id rather than by address: an address can be
+/// re-pointed at a different server, and two accounts can legitimately share
+/// one. The id never moves.
+#[must_use]
+pub fn mailbox_path(root: &Path, account_id: &str, folder: &crate::folder::Folder) -> PathBuf {
+    root.join(account_id).join(folder.local_name())
+}
+
 /// A maildir holding one IMAP mailbox.
 #[derive(Debug)]
 pub struct MaildirStore {

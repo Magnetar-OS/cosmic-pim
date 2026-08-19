@@ -1332,11 +1332,13 @@ impl CaldavClient {
         if (200..300).contains(&resp.status) {
             Ok((resp.final_url, resp.body))
         } else {
-            Err(Error::protocol(format!(
-                "caldav: PROPFIND {url} returned {}: {}",
+            Err(Error::status(
                 resp.status,
-                resp.body.chars().take(300).collect::<String>()
-            )))
+                format!(
+                    "caldav: PROPFIND {url}: {}",
+                    resp.body.chars().take(300).collect::<String>()
+                ),
+            ))
         }
     }
 
@@ -1361,11 +1363,13 @@ impl CaldavClient {
         if (200..300).contains(&resp.status) {
             Ok(resp.body)
         } else {
-            Err(Error::protocol(format!(
-                "caldav: REPORT {url} returned {}: {}",
+            Err(Error::status(
                 resp.status,
-                resp.body.chars().take(300).collect::<String>()
-            )))
+                format!(
+                    "caldav: REPORT {url}: {}",
+                    resp.body.chars().take(300).collect::<String>()
+                ),
+            ))
         }
     }
 
@@ -1588,11 +1592,13 @@ impl CaldavClient {
         if (200..300).contains(&resp.status) {
             Ok(resp.etag)
         } else {
-            Err(Error::protocol(format!(
-                "caldav: PUT {event_url} returned {}: {}",
+            Err(Error::status(
                 resp.status,
-                resp.body.chars().take(300).collect::<String>()
-            )))
+                format!(
+                    "caldav: PUT {event_url}: {}",
+                    resp.body.chars().take(300).collect::<String>()
+                ),
+            ))
         }
     }
 
@@ -1609,11 +1615,13 @@ impl CaldavClient {
         if (200..300).contains(&resp.status) || resp.status == 404 {
             Ok(())
         } else {
-            Err(Error::protocol(format!(
-                "caldav: DELETE {event_url} returned {}: {}",
+            Err(Error::status(
                 resp.status,
-                resp.body.chars().take(300).collect::<String>()
-            )))
+                format!(
+                    "caldav: DELETE {event_url}: {}",
+                    resp.body.chars().take(300).collect::<String>()
+                ),
+            ))
         }
     }
 

@@ -12,8 +12,8 @@ on so that a sync bug is fixed once rather than three times.
 |---|---|---|---|
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
-| [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Scaffold — the mail engine is not in the substrate yet |
-| **cosmic-pim** | — | This substrate | 290 tests |
+| [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
+| **cosmic-pim** | — | This substrate | 438 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
@@ -25,7 +25,8 @@ Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 | `cosmic-pim-core` | The model (events, tasks, contacts), the one iCalendar/vCard parser the suite shares, vdir storage, a SQLite index for calendar range queries, filesystem watching, and a crash-safe writer |
 | `cosmic-pim-caldav` | CalDAV **and** CardDAV — protocol, reconciliation, durable writeback queue, and a store trait implemented over the vdir |
 | `cosmic-pim-accounts` | Accounts and credentials: the OS keychain, with an encrypted local fallback for hosts that have none |
-| `cosmic-pim-sync` | The layer that joins the other three — provisioning, and one sync pass per account |
+| `cosmic-pim-mail` | Mail — the message model over verbatim RFC 5322 bytes, a maildir store, JWZ threading, HTML-to-visible-text extraction, and IMAP with durable writeback |
+| `cosmic-pim-sync` | The layer that joins `core`, `caldav`, and `accounts` — provisioning, and one sync pass per account |
 
 Dependencies point downward only. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
 diagram, the invariants, and where new code belongs.

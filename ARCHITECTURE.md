@@ -10,7 +10,7 @@ true.
 ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
 │    Slate    │  │   Circle    │  │  Envelope   │   applications (GPL-3.0-only)
 │  calendar   │  │  contacts   │  │    mail     │   one repo each
-│   + tasks   │  │             │  │  (scaffold) │
+│   + tasks   │  │             │  │             │
 └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
        │                │                │
        └────────────────┼────────────────┘
@@ -24,17 +24,26 @@ true.
         │  ┌────▼─────┐  ┌─────▼──────┐  │
         │  │  caldav  │  │  accounts  │  │  protocol      credentials
         │  └────┬─────┘  └─────┬──────┘  │
-        │       │              │         │
-        │  ┌────▼──────────────▼──────┐  │
-        │  │      cosmic-pim-core     │  │  model, iCalendar/vCard, vdir,
-        │  └──────────────────────────┘  │  SQLite index, atomic writes
+        │       │    ┌─────────┤         │
+        │       │    │  mail   │         │  IMAP, maildir, threading
+        │       │    └────┬────┘         │
+        │  ┌────▼─────────▼──────────┐   │
+        │  │      cosmic-pim-core    │   │  model, iCalendar/vCard, vdir,
+        │  └─────────────────────────┘   │  SQLite index, atomic writes
         └────────────────────────────────┘
 ```
 
 Dependencies point downward only. `core` knows nothing about servers; `caldav`
-knows nothing about accounts; `accounts` never opens a socket. `sync` is the
-only crate that knows about all three, which is what keeps the others
+and `mail` know nothing about accounts; `accounts` never opens a socket. `sync`
+is the only crate that knows about the others, which is what keeps them
 independently testable and separately reusable.
+
+`mail` sits **beside** `caldav`, not on it. CalDAV and CardDAV are one protocol
+with four substitutions, which is why they share an engine behind a `Flavor`
+enum. IMAP is not a third flavour of anything — it is a stateful session
+protocol with its own consistency model (UIDVALIDITY, MODSEQ) — so adding it as
+a fifth field on `Flavor` would mean every DAV code path carrying something it
+has to ignore. What the two share is everything below them.
 
 ## Why the substrate is its own repository
 
@@ -57,6 +66,9 @@ in one place and all three apps get it.
 | Files on disk | `core::store` | vdir: a directory per collection, one file per item. |
 | Durable writes | `core::atomic` | Temp file → fsync it → rename → **fsync the parent directory**; optimistic concurrency. |
 | CalDAV / CardDAV | `caldav` | One engine, two flavours. |
+| RFC 5322 messages | `mail::model` | Extract-only. Nothing ever writes a message back through the parser. |
+| Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
+| IMAP | `mail::imap` | Session, cycle, and durable writeback. Not a DAV flavour. |
 | Accounts, passwords | `accounts` | OS keychain, encrypted fallback. Shared across all three apps. |
 | A sync pass | `sync` | Provision, push, pull, per-collection error isolation. |
 
@@ -76,10 +88,13 @@ An account added in Slate's settings already appears in Envelope.
 | Calendars and tasks | `$XDG_DATA_HOME/calendars` | `COSMIC_PIM_CALENDAR_DIR` |
 | Address books | `$XDG_DATA_HOME/contacts` | `COSMIC_PIM_CONTACTS_DIR` |
 | Accounts | `$XDG_CONFIG_HOME/cosmic-pim` | `COSMIC_PIM_CONFIG_DIR` |
+| Mail | `$XDG_DATA_HOME/mail` | `COSMIC_PIM_MAIL_DIR` |
 | Event index (cache) | `$XDG_CACHE_HOME/cosmic-pim` | — |
 
 The vdir paths match what `vdirsyncer` writes, deliberately. Anything that
-speaks vdir — `khal`, `khard`, Thunderbird — reads the same files.
+speaks vdir — `khal`, `khard`, Thunderbird — reads the same files. Mail is one
+maildir per mailbox under `<account-id>/`, on the same principle: `mbsync`,
+`notmuch`, `mu`, and `mutt` read them without being told anything.
 
 ## Invariants worth knowing before changing anything
 
@@ -121,6 +136,62 @@ local reader must interpret the *same file* identically. They did not: the
 previous implementation matched timezones byte-exactly, so a server sending
 `TZID=Europe/Athens ` (trailing space — real servers do this) fell through to
 floating and shifted the event by the local offset.
+
+## The same invariants, over mail
+
+Mail is a different wire format, not a different set of rules. Every invariant
+above has an exact counterpart, and each is pinned by a test in
+`cosmic-pim-mail`.
+
+**Files are the truth; the index is disposable.** A maildir per mailbox, not a
+SQLite message table — a message store in a database would be the first place
+the suite broke its own rule, and "walk away with your data" would go with it.
+The UID and the flags live in the filename (`,U=42:2,S`, as `offlineimap` and
+`mbsync` spell it), so a directory walk rebuilds everything.
+
+**Sync state lives in a sidecar.** UIDVALIDITY, the UID cursor, and MODSEQ are
+tokens the server minted and nothing on disk could reconstruct, so they sit in
+`.imap-state.json` beside `cur/` — the same relationship `.caldav-state.json`
+has to a vdir collection, for the same reason.
+
+**Message bytes are verbatim.** `mail::model::Message` covers what the reader
+shows, which is a fraction of what RFC 5322 carries. Storing the model rather
+than the bytes would discard MIME structure and every unmodelled header — and it
+would invalidate the DKIM signature, which is the one piece of cryptographic
+evidence the message carries and whose entire value is that it survived the trip.
+Nothing re-serialises a message; a flag change is a **rename**, not a rewrite.
+
+**Writeback is queued and durable.** A `\Seen` that fails and is forgotten
+diverges permanently for exactly the reason a dropped PUT does: the server's
+state never changed, so the next pull finds nothing to reconcile. Failed pushes
+persist in the sidecar with exponential backoff, classified as retryable,
+needs-reconcile, or needs-user — retrying an `[AUTHENTICATIONFAILED]` two hundred
+times an hour will not discover a new password.
+
+**Push before pull.** Identical reasoning, and the presenting symptom is "my read
+marks keep reverting" rather than "my edits keep reverting".
+
+**UIDVALIDITY is the 412.** A stale etag means "re-read before you write". A
+changed UIDVALIDITY means the same thing about a whole mailbox: UID 41 now names
+a different message, or none. It is never retryable, and it is handled by
+discarding the mailbox and refetching — reconciling would compare flags between
+messages that have nothing to do with each other and write the result to disk.
+
+**Never `BODY[]`.** The fetch is `BODY.PEEK[]`. `BODY[]` sets `\Seen` as a side
+effect of reading, so a client that syncs with it marks the user's entire mailbox
+read — on the server, on every device, with no undo. This one is asserted against
+the bytes on the wire in `tests/live_sync.rs`, because it is invisible anywhere
+else.
+
+**One parser, not two.** `mail::text` is the only thing that turns a message body
+into text, for the reader and for anything that indexes it. Envelope renders text
+rather than HTML, which is why there is no sanitiser to disagree with a renderer
+and why a tracking pixel has nothing to fire from.
+
+Two things from the calendar side deliberately do **not** carry over. Step 4 of
+"adding another application" below — add a `Flavor` — does not apply: IMAP is not
+a WebDAV flavour. And `caldav::patch` has no mail counterpart, because a message
+is never edited in place; the equivalent operation is a rename.
 
 ## One sync engine per collection
 
@@ -176,7 +247,10 @@ underneath already existed.
 1. Model the data in `core::model` if it is not already there.
 2. Add a text layer in `core` if the format is new.
 3. Add reading and writing to `core::store`.
-4. If it syncs over WebDAV, add a `Flavor` — do not fork the engine.
+4. If it syncs over WebDAV, add a `Flavor` — do not fork the engine. If it
+   speaks something else, it is a crate beside `caldav`, the way `mail` is;
+   the test is whether it shares the four substitutions, not whether it is a
+   protocol.
 5. The app itself is then a front end: a `Cargo.toml` depending on the
    substrate, an `app.rs`, and views.
 
@@ -186,7 +260,7 @@ the moment the model existed, because the engine never parses what it stores.
 
 ## Testing
 
-Roughly 290 tests in the substrate, `cargo test --workspace`.
+Roughly 440 tests in the substrate, `cargo test --workspace`.
 
 The one worth knowing about is `caldav/tests/live_sync.rs`: a real HTTP server
 answering PROPFIND and REPORT with canned multistatus XML, driving the real
@@ -195,3 +269,8 @@ isolation; that test is what proves they are wired together in the right order.
 It is also what caught the transport being unusable — `ureq` 3 enforces a
 hardcoded HTTP-method allowlist and rejects every WebDAV verb before it reaches
 the socket. Hence `reqwest`. Do not "simplify" back to `ureq`.
+
+`mail/tests/live_sync.rs` is its counterpart: a scripted IMAP server on a real
+socket, driving the real client into a real maildir. It exists for the same
+reason, and it carries the two assertions that can only be made about the wire —
+that the fetch uses `BODY.PEEK[]`, and that the STORE goes out before the FETCH.
