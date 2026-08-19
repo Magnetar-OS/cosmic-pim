@@ -69,6 +69,8 @@ in one place and all three apps get it.
 | RFC 5322 messages | `mail::model` | Extract-only. Nothing ever writes a message back through the parser. |
 | Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
 | IMAP | `mail::imap` | Session, cycle, and durable writeback. Not a DAV flavour. |
+| SMTP | `mail::smtp` | Sending, and the one failure that must never be auto-retried. |
+| Conversation lists | `mail::index` | A rebuildable SQLite cache, same standing as the calendar's. |
 | Accounts, passwords | `accounts` | OS keychain, encrypted fallback. Shared across all three apps. |
 | A sync pass | `sync` | Provision, push, pull, per-collection error isolation. Calendars and address books in one pass. |
 | Conflicts | `sync::conflict` | Both sides changed one resource. Read them, resolve them. |
@@ -90,7 +92,8 @@ An account added in Slate's settings already appears in Envelope.
 | Address books | `$XDG_DATA_HOME/contacts` | `COSMIC_PIM_CONTACTS_DIR` |
 | Accounts | `$XDG_CONFIG_HOME/cosmic-pim` | `COSMIC_PIM_CONFIG_DIR` |
 | Mail | `$XDG_DATA_HOME/mail` | `COSMIC_PIM_MAIL_DIR` |
-| Event index (cache) | `$XDG_CACHE_HOME/cosmic-pim` | — |
+| Event index (cache) | `$XDG_CACHE_HOME/cosmic-pim/index.sqlite` | — |
+| Conversation index (cache) | `$XDG_CACHE_HOME/cosmic-pim/mail.sqlite` | `COSMIC_PIM_MAIL_INDEX` |
 
 The vdir paths match what `vdirsyncer` writes, deliberately. Anything that
 speaks vdir — `khal`, `khard`, Thunderbird — reads the same files. Mail is one

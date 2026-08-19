@@ -530,6 +530,7 @@ dependencies = [
  "lettre",
  "mail-parser",
  "native-tls",
+ "rusqlite",
  "scraper",
  "serde",
  "serde_json",
