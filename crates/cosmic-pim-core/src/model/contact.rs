@@ -30,6 +30,14 @@ pub struct Typed {
     pub types: Vec<String>,
     /// `PREF` — lower is more preferred. `None` when unset.
     pub pref: Option<u8>,
+    /// The vCard group this came from, if any (`item1` in `item1.EMAIL`).
+    ///
+    /// Provenance, not decoration. A grouped line usually has a sibling
+    /// carrying its custom label (`item1.X-ABLabel:Summer house`), and the two
+    /// are one logical thing. The writer uses this to edit such an entry *in
+    /// place* rather than rewriting it as an ungrouped line, which would orphan
+    /// the label. A UI can use it to show that the entry has a custom label.
+    pub group: Option<String>,
 }
 
 impl Typed {
@@ -39,7 +47,15 @@ impl Typed {
             value: value.into(),
             types: Vec::new(),
             pref: None,
+            group: None,
         }
+    }
+
+    /// Whether this entry came from a grouped vCard line, and so must be
+    /// edited in place rather than rewritten.
+    #[must_use]
+    pub fn is_grouped(&self) -> bool {
+        self.group.is_some()
     }
 
     /// A human label for the value: its first type, or nothing.
@@ -320,11 +336,13 @@ mod tests {
                 value: "second@example.com".into(),
                 types: vec!["work".into()],
                 pref: Some(10),
+                group: None,
             },
             Typed {
                 value: "first@example.com".into(),
                 types: vec!["home".into()],
                 pref: Some(1),
+                group: None,
             },
         ];
         assert_eq!(

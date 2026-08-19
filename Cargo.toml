@@ -4,6 +4,7 @@ members = [
     "crates/cosmic-pim-core",
     "crates/cosmic-pim-caldav",
     "crates/cosmic-pim-accounts",
+    "crates/cosmic-pim-mail",
     "crates/cosmic-pim-sync",
 ]
 

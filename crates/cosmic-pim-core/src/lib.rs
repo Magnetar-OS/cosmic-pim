@@ -22,6 +22,7 @@
 pub mod atomic;
 pub mod ical;
 pub mod model;
+pub mod patch;
 pub mod store;
 pub mod vcard;
 

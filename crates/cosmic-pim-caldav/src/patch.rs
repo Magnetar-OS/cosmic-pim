@@ -42,23 +42,15 @@ use calcard::Parser;
 use calcard::icalendar::timezone::TzResolver;
 use chrono::Utc;
 use cosmic_pim_core::ical::escape_text;
+// The content-line primitives live in core so that iCalendar and vCard share
+// one tested implementation — see `cosmic_pim_core::patch`.
+use cosmic_pim_core::patch::{component_delimiter, find_unquoted_colon, logical_lines};
 
 /// Wall-clock milliseconds, for DTSTAMP.
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-fn find_unquoted_colon(s: &str) -> Option<usize> {
-    let mut in_quotes = false;
-    for (i, b) in s.bytes().enumerate() {
-        match b {
-            b'"' => in_quotes = !in_quotes,
-            b':' if !in_quotes => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
 
 /// Whether an UNFOLDED content line is an ATTENDEE property whose
 /// cal-address names `me_lower` (lowercased, mailto:-stripped). The
@@ -195,7 +187,8 @@ pub fn patch_attendee_partstat(ical: &str, me_email: &str, partstat: &str) -> Op
 
     let mut out = String::with_capacity(ical.len() + 32);
     let mut patched = false;
-    for (raw, unfolded) in logical_lines(ical) {
+    for line in logical_lines(ical) {
+        let (raw, unfolded) = (line.raw(), line.unfolded());
         emit_rsvp_logical_line(
             raw,
             &unfolded,
@@ -209,53 +202,6 @@ pub fn patch_attendee_partstat(ical: &str, me_email: &str, partstat: &str) -> Op
     patched.then_some(out)
 }
 
-/// Split an iCal document into logical content lines (RFC 5545 §3.1): each
-/// item is `(raw, unfolded)` where `raw` is the byte-exact source slice -
-/// interior fold sequences and the trailing terminator included - and
-/// `unfolded` is the continuation-free content the caller can match against.
-/// Byte preservation is the point: re-emitting every `raw` reproduces the
-/// document exactly, so patchers touch ONLY the lines they mean to.
-fn logical_lines(ical: &str) -> Vec<(&str, String)> {
-    let bytes = ical.as_bytes();
-    let mut out: Vec<(&str, String)> = Vec::new();
-    let mut raw_start = 0usize;
-    let mut unfolded = String::new();
-    let mut have_logical = false;
-
-    let mut pos = 0usize;
-    while pos < ical.len() {
-        let (content_end, next_pos) = match ical[pos..].find('\n') {
-            Some(i) => {
-                let nl = pos + i;
-                let ce = if nl > pos && bytes[nl - 1] == b'\r' {
-                    nl - 1
-                } else {
-                    nl
-                };
-                (ce, nl + 1)
-            }
-            None => (ical.len(), ical.len()),
-        };
-        let content = &ical[pos..content_end];
-        if have_logical && (content.starts_with(' ') || content.starts_with('\t')) {
-            // Continuation: strip the single leading fold character.
-            unfolded.push_str(&content[1..]);
-        } else {
-            if have_logical {
-                out.push((&ical[raw_start..pos], std::mem::take(&mut unfolded)));
-            }
-            raw_start = pos;
-            unfolded.clear();
-            unfolded.push_str(content);
-            have_logical = true;
-        }
-        pos = next_pos;
-    }
-    if have_logical {
-        out.push((&ical[raw_start..], unfolded));
-    }
-    out
-}
 
 /* ------------------------------------------------------------------ */
 /* Local-edit writeback patch (F-CAL-3)                               */
@@ -294,16 +240,6 @@ fn line_property_name(unfolded: &str) -> String {
     unfolded[..end].trim().to_ascii_uppercase()
 }
 
-/// `BEGIN:`/`END:` recognition → `(is_begin, uppercased component name)`.
-fn component_delimiter(unfolded: &str) -> Option<(bool, String)> {
-    if unfolded.len() >= 6 && unfolded[..6].eq_ignore_ascii_case("BEGIN:") {
-        return Some((true, unfolded[6..].trim().to_ascii_uppercase()));
-    }
-    if unfolded.len() >= 4 && unfolded[..4].eq_ignore_ascii_case("END:") {
-        return Some((false, unfolded[4..].trim().to_ascii_uppercase()));
-    }
-    None
-}
 
 /// Classify an original DTSTART/DTEND line's serialization form from its
 /// parameters (unquoted-`;` segmentation, quoted values respected - the same
@@ -537,7 +473,8 @@ pub fn patch_event_ics(ical: &str, target_rid: &str, patch: &LocalEventPatch) ->
     let mut orig_dtend: Option<String> = None;
     let mut orig_sequence: i64 = 0;
 
-    for (raw, unfolded) in logical_lines(ical) {
+    for line in logical_lines(ical) {
+        let (raw, unfolded) = (line.raw(), line.unfolded());
         if let Some((is_begin, name)) = component_delimiter(&unfolded) {
             if is_begin {
                 if name == "VEVENT" && !in_vevent {
@@ -598,8 +535,8 @@ pub fn patch_event_ics(ical: &str, target_rid: &str, patch: &LocalEventPatch) ->
                         .parse()
                         .unwrap_or(0);
                 }
-                "DTSTART" => orig_dtstart = Some(unfolded),
-                "DTEND" => orig_dtend = Some(unfolded),
+                "DTSTART" => orig_dtstart = Some(unfolded.to_owned()),
+                "DTEND" => orig_dtend = Some(unfolded.to_owned()),
                 _ => out.push_str(raw),
             }
             continue;

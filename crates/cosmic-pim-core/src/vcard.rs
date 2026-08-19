@@ -159,6 +159,7 @@ fn typed_list(card: &VCard, prop: &VCardProperty) -> Vec<Typed> {
                 value: value.to_owned(),
                 types: types_of(entry),
                 pref: pref_of(entry),
+                group: entry.group.clone(),
             })
         })
         .collect()
@@ -238,6 +239,183 @@ fn birthday(card: &VCard) -> Option<NaiveDate> {
 }
 
 /* ------------------------------------------------------------------ */
+/* Patching an existing card                                          */
+
+/// Rewrites `original` so it carries `contact`'s modelled fields, leaving
+/// everything else byte-for-byte.
+///
+/// **This is the function to save a synced contact with.** [`to_vcard`] builds
+/// a card from scratch and therefore drops PHOTO, GEO, IMPP, `X-` properties,
+/// and anything else this crate does not model — fine for a card this app
+/// created, silent data loss for one that came from a server.
+///
+/// Grouped lines (`item1.EMAIL` and its `item1.X-ABLabel`) are preserved
+/// untouched, so Apple-style custom labels survive. That also means an edit to
+/// `contact.emails` does not reach them; see [`crate::patch`] for why, and for
+/// how to address one deliberately.
+///
+/// Returns `None` if `original` contains no VCARD.
+#[must_use]
+pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
+    use crate::patch::{Edit, patch_component};
+    use std::collections::BTreeMap;
+
+    let mut edits: BTreeMap<String, Edit> = BTreeMap::new();
+
+    let set = |edits: &mut BTreeMap<String, Edit>, name: &str, lines: Vec<String>| {
+        edits.insert(name.to_owned(), Edit::set(lines));
+    };
+
+    /// Splits a typed list into the ungrouped lines to write and the grouped
+    /// values to edit in place.
+    ///
+    /// Without this split, an entry parsed from `item1.EMAIL` would be written
+    /// back as a plain `EMAIL` line *in addition to* the untouched grouped one
+    /// — the contact would gain a duplicate address on every save.
+    fn split_typed(name: &str, values: &[Typed]) -> Edit {
+        let mut edit = Edit::set(
+            values
+                .iter()
+                .filter(|v| !v.is_grouped())
+                .map(|v| typed_line(name, v))
+                .collect(),
+        );
+        for value in values.iter().filter(|v| v.is_grouped()) {
+            if let Some(group) = &value.group {
+                edit = edit.with_group(group.clone(), escape_text(&value.value));
+            }
+        }
+        edit
+    }
+
+    // FN is REQUIRED (RFC 6350 §6.2.1), so it is set rather than removable.
+    edits.insert(
+        "FN".to_owned(),
+        Edit::set(vec![format!("FN:{}", escape_text(&contact.label()))]),
+    );
+
+    if contact.name.is_empty() {
+        edits.insert("N".to_owned(), Edit::remove());
+    } else {
+        set(
+            &mut edits,
+            "N",
+            vec![format!(
+                "N:{};{};{};{};{}",
+                escape_text(&contact.name.family),
+                escape_text(&contact.name.given),
+                escape_text(&contact.name.additional),
+                escape_text(&contact.name.prefix),
+                escape_text(&contact.name.suffix),
+            )],
+        );
+    }
+
+    set(
+        &mut edits,
+        "NICKNAME",
+        contact
+            .nicknames
+            .iter()
+            .map(|n| format!("NICKNAME:{}", escape_text(n)))
+            .collect(),
+    );
+    edits.insert("EMAIL".to_owned(), split_typed("EMAIL", &contact.emails));
+    edits.insert("TEL".to_owned(), split_typed("TEL", &contact.phones));
+    edits.insert("URL".to_owned(), split_typed("URL", &contact.urls));
+    set(
+        &mut edits,
+        "ADR",
+        contact.addresses.iter().map(address_line).collect(),
+    );
+
+    set(
+        &mut edits,
+        "ORG",
+        contact
+            .organisation
+            .iter()
+            .map(|o| format!("ORG:{}", escape_text(o)))
+            .collect(),
+    );
+    set(
+        &mut edits,
+        "TITLE",
+        contact
+            .title
+            .iter()
+            .map(|t| format!("TITLE:{}", escape_text(t)))
+            .collect(),
+    );
+    set(
+        &mut edits,
+        "NOTE",
+        contact
+            .note
+            .iter()
+            .map(|n| format!("NOTE:{}", escape_text(n)))
+            .collect(),
+    );
+    set(
+        &mut edits,
+        "BDAY",
+        contact
+            .birthday
+            .iter()
+            .map(|b| format!("BDAY:{}", b.format("%Y%m%d")))
+            .collect(),
+    );
+
+    set(
+        &mut edits,
+        "CATEGORIES",
+        if contact.categories.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "CATEGORIES:{}",
+                contact
+                    .categories
+                    .iter()
+                    .map(|c| escape_text(c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )]
+        },
+    );
+
+    // REV records when we last touched the card; servers and other clients use
+    // it to break ties.
+    edits.insert(
+        "REV".to_owned(),
+        Edit::set(vec![format!(
+            "REV:{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        )]),
+    );
+
+    patch_component(original, "VCARD", &edits)
+}
+
+fn address_line(address: &Address) -> String {
+    let params = if address.types.is_empty() {
+        String::new()
+    } else {
+        format!(";TYPE={}", address.types.join(","))
+    };
+    format!(
+        "ADR{params}:{};{};{};{};{};{};{}",
+        escape_text(&address.po_box),
+        escape_text(&address.extended),
+        escape_text(&address.street),
+        escape_text(&address.locality),
+        escape_text(&address.region),
+        escape_text(&address.postal_code),
+        escape_text(&address.country),
+    )
+}
+
+/* ------------------------------------------------------------------ */
 /* Serialisation                                                      */
 
 /// Serialises a contact as a vCard 4.0 document.
@@ -283,24 +461,7 @@ pub fn to_vcard(contact: &Contact) -> String {
     }
 
     for address in &contact.addresses {
-        let params = if address.types.is_empty() {
-            String::new()
-        } else {
-            format!(";TYPE={}", address.types.join(","))
-        };
-        fold_line(
-            &format!(
-                "ADR{params}:{};{};{};{};{};{};{}",
-                escape_text(&address.po_box),
-                escape_text(&address.extended),
-                escape_text(&address.street),
-                escape_text(&address.locality),
-                escape_text(&address.region),
-                escape_text(&address.postal_code),
-                escape_text(&address.country),
-            ),
-            &mut out,
-        );
+        fold_line(&address_line(address), &mut out);
     }
 
     if let Some(org) = &contact.organisation {
@@ -494,6 +655,7 @@ mod tests {
             value: "ada@example.com".into(),
             types: vec!["work".into()],
             pref: Some(1),
+            group: None,
         }];
         c.phones = vec![Typed::new("+15551234")];
         c.organisation = Some("Analytical Engines".into());
@@ -553,5 +715,143 @@ mod tests {
             assert!(line.len() <= 75, "line exceeds the fold limit: {line:?}");
         }
         assert_eq!(one(&text).display_name, c.display_name);
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    const SYNCED: &str = "BEGIN:VCARD\r\n\
+VERSION:4.0\r\n\
+UID:ada@server\r\n\
+FN:Ada Lovelace\r\n\
+N:Lovelace;Ada;;;\r\n\
+EMAIL;TYPE=work:ada@work.example\r\n\
+item1.EMAIL;type=INTERNET:ada@home.example\r\n\
+item1.X-ABLabel:Summer house\r\n\
+TEL;TYPE=cell:+15550100\r\n\
+PHOTO;ENCODING=b:AAAABBBBCCCC\r\n\
+X-ABShowAs:COMPANY\r\n\
+GEO:geo:51.5,-0.1\r\n\
+REV:20200101T000000Z\r\n\
+END:VCARD\r\n";
+
+    fn parsed() -> Contact {
+        let mut all = parse_vcards(SYNCED, "default", "ada.vcf");
+        all.remove(0)
+    }
+
+    #[test]
+    fn patching_preserves_everything_the_model_does_not_carry() {
+        // The whole point. `to_vcard` would drop all four of these.
+        let mut contact = parsed();
+        contact.display_name = "Ada Byron".into();
+
+        let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
+
+        assert!(out.contains("PHOTO;ENCODING=b:AAAABBBBCCCC\r\n"), "{out}");
+        assert!(out.contains("X-ABShowAs:COMPANY\r\n"));
+        assert!(out.contains("GEO:geo:51.5,-0.1\r\n"));
+        assert!(out.contains("UID:ada@server\r\n"));
+        assert!(out.contains("FN:Ada Byron\r\n"));
+    }
+
+    #[test]
+    fn to_vcard_would_have_lost_them_which_is_why_patch_exists() {
+        let contact = parsed();
+        let rebuilt = to_vcard(&contact);
+        assert!(!rebuilt.contains("PHOTO"), "the premise of this module changed");
+        assert!(!rebuilt.contains("X-ABShowAs"));
+        assert!(!rebuilt.contains("GEO:"));
+    }
+
+    #[test]
+    fn an_apple_grouped_email_and_its_label_survive_an_email_edit() {
+        let mut contact = parsed();
+        // The modelled list holds both, but only the ungrouped one is rewritten.
+        contact.emails = vec![Typed {
+            value: "new@work.example".into(),
+            types: vec!["work".into()],
+            pref: None,
+            group: None,
+        }];
+
+        let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
+
+        assert!(out.contains("EMAIL;TYPE=work:new@work.example\r\n"));
+        assert!(
+            out.contains("item1.EMAIL;type=INTERNET:ada@home.example\r\n"),
+            "the grouped address was clobbered: {out}"
+        );
+        assert!(
+            out.contains("item1.X-ABLabel:Summer house\r\n"),
+            "the custom label was orphaned: {out}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_field_removes_the_property() {
+        let mut contact = parsed();
+        contact.phones.clear();
+
+        let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
+        assert!(!out.contains("TEL;TYPE=cell"), "{out}");
+    }
+
+    #[test]
+    fn adding_a_field_the_card_lacked_inserts_it() {
+        let mut contact = parsed();
+        contact.note = Some("Met at the exhibition".into());
+
+        let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
+        assert!(out.contains("NOTE:Met at the exhibition\r\n"), "{out}");
+        // …inside the card, not after it.
+        assert!(out.find("NOTE:").unwrap() < out.find("END:VCARD").unwrap());
+    }
+
+    #[test]
+    fn rev_is_refreshed_on_every_patch() {
+        let contact = parsed();
+        let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
+        assert!(!out.contains("REV:20200101T000000Z"), "REV was not refreshed");
+        assert!(out.contains("REV:"));
+    }
+
+    #[test]
+    fn a_patched_card_still_parses_to_the_same_contact() {
+        let mut contact = parsed();
+        contact.display_name = "Ada Byron".into();
+        contact.organisation = Some("Analytical Engines".into());
+
+        let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
+        let back = parse_vcards(&out, "default", "ada.vcf").remove(0);
+
+        assert_eq!(back.display_name, "Ada Byron");
+        assert_eq!(back.organisation.as_deref(), Some("Analytical Engines"));
+        assert!(back.has_photo, "the photo was lost through a round trip");
+        // Both emails come back — the grouped one was never touched.
+        assert_eq!(back.emails.len(), 2);
+    }
+
+    #[test]
+    fn patching_is_idempotent_apart_from_rev() {
+        let contact = parsed();
+        let once = patch_vcard(&contact.raw.clone(), &contact).expect("first");
+        let twice = patch_vcard(&once, &contact).expect("second");
+
+        let strip_rev = |s: &str| {
+            s.lines()
+                .filter(|l| !l.starts_with("REV:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip_rev(&once), strip_rev(&twice));
+    }
+
+    #[test]
+    fn a_document_with_no_vcard_is_none() {
+        let contact = parsed();
+        assert!(patch_vcard("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", &contact).is_none());
     }
 }
