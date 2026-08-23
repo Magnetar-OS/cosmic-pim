@@ -26,6 +26,7 @@
 //! - [`auth`] — `Authentication-Results` (RFC 8601), per hop and mechanism.
 //! - [`attachment`] — getting attachments out of a message, and safely onto a disk.
 //! - [`compose`] — drafts, and how a reply or a forward is built from a message.
+//! - [`discovery`] — working out where an address's mail lives, from the address.
 //! - [`drafts`] — unsent messages, kept on this device.
 //! - [`smtp`] — sending, and the one failure that must never be auto-retried.
 //! - [`threading`] — JWZ threading with deterministic thread ids.
@@ -34,6 +35,7 @@
 //! - [`maildir`] — [`MailStore`] over a maildir, so `mbsync`, `mu`, and
 //!   `notmuch` read the same files.
 //! - [`index`] — a rebuildable SQLite cache of what a conversation list shows.
+//! - [`outbox`] — messages that have been sent but have not left yet.
 //! - [`plan`] — the reconciliation decision, as a pure function.
 //! - [`search`] — the query language, as a pure parser.
 //! - [`push`] — durable writeback for flag changes, moves, and deletions.
@@ -74,6 +76,7 @@
 pub mod attachment;
 pub mod auth;
 pub mod compose;
+pub mod discovery;
 pub mod drafts;
 pub mod error;
 pub mod folder;
@@ -81,6 +84,7 @@ pub mod imap;
 pub mod index;
 pub mod maildir;
 pub mod model;
+pub mod outbox;
 pub mod plan;
 pub mod push;
 pub mod search;
@@ -91,7 +95,9 @@ pub mod threading;
 
 pub use error::{Error, Result};
 pub use compose::Draft;
+pub use discovery::Discovered;
 pub use drafts::Drafts;
+pub use outbox::Outbox;
 pub use smtp::{Outcome, SmtpEndpoint};
 pub use folder::{Folder, SpecialUse};
 pub use index::{Conversation, Hit, Index, Summary};

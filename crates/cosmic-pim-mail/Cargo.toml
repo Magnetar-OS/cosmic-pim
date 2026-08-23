@@ -41,6 +41,14 @@ lettre = { version = "0.11", default-features = false, features = [
   "native-tls",
 ] }
 
+# Account discovery fetches Mozilla autoconfig documents over HTTPS. Blocking,
+# like the rest of this crate, and native-tls to match `imap` and `lettre` —
+# three TLS stacks in one binary is a packaging problem nobody wants.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+# Streaming pull parser for those documents, the same one cosmic-pim-caldav
+# uses for multistatus XML.
+quick-xml = "0.41"
+
 # HTML → what a human would actually see. A real html5ever tree, not a
 # tag-stripper: hostile mail is precisely where parser-differential tricks live.
 scraper = { version = "0.27.0", default-features = false, features = ["errors"] }

@@ -233,8 +233,10 @@ pub fn decode_modified_utf7(s: &str) -> String {
             .filter(|bytes| bytes.len() % 2 == 0)
             .map(|bytes| {
                 let units: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_be_bytes(*pair))
                     .collect();
                 String::from_utf16_lossy(&units)
             });

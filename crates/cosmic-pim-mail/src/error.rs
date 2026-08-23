@@ -41,6 +41,9 @@ pub enum Error {
     #[error("SMTP: {0}")]
     Smtp(String),
 
+    #[error("{0}")]
+    Discovery(String),
+
     /// The index is a cache; a failure here is recoverable by rebuilding it,
     /// and is never a reason to lose a message.
     #[error("index: {0}")]
