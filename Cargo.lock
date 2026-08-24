@@ -563,6 +563,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tiny_http",
  "tracing",
 ]
 

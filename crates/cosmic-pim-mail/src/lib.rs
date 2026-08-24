@@ -82,6 +82,7 @@ pub mod error;
 pub mod folder;
 pub mod imap;
 pub mod index;
+pub mod jmap;
 pub mod maildir;
 pub mod model;
 pub mod outbox;

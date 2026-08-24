@@ -37,6 +37,10 @@ pub enum Error {
     #[error("SMTP: {0}")]
     Smtp(String),
 
+    /// A JMAP request failed, or the server answered with something unusable.
+    #[error("JMAP: {0}")]
+    Jmap(String),
+
     /// POP3 said no, or said something unusable.
     ///
     /// Its own variant rather than folded into [`Error::Imap`]: the two have
