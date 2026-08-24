@@ -361,7 +361,13 @@ pub fn sync_account(
         .get(account_id)
         .ok_or_else(|| cosmic_pim_accounts::Error::UnknownAccount(account_id.to_owned()))?
         .clone();
-    Ok(sync_one(store, registry, &account, calendar_root, contacts_root))
+    Ok(sync_one(
+        store,
+        registry,
+        &account,
+        calendar_root,
+        contacts_root,
+    ))
 }
 
 #[cfg(test)]
@@ -390,9 +396,14 @@ mod tests {
         let id = account.id.clone();
         store.add(account, "unused").unwrap();
 
-        let report =
-            sync_account(&mut store, &Registry::load_from(dir.path()), &id, dir.path(), dir.path())
-                .unwrap();
+        let report = sync_account(
+            &mut store,
+            &Registry::load_from(dir.path()),
+            &id,
+            dir.path(),
+            dir.path(),
+        )
+        .unwrap();
 
         let Err(Error::Auth(why)) = report.collections else {
             panic!("an OAuth account without a grant was attempted anyway");
@@ -411,9 +422,14 @@ mod tests {
         let id = account.id.clone();
         store.add(account, "s3cret").unwrap();
 
-        let report =
-            sync_account(&mut store, &Registry::load_from(dir.path()), &id, dir.path(), dir.path())
-                .unwrap();
+        let report = sync_account(
+            &mut store,
+            &Registry::load_from(dir.path()),
+            &id,
+            dir.path(),
+            dir.path(),
+        )
+        .unwrap();
 
         assert!(
             !matches!(report.collections, Err(Error::Auth(_))),

@@ -25,14 +25,14 @@
 
 pub mod conflict;
 pub mod engine;
-pub mod mail;
 pub mod error;
+pub mod mail;
 pub mod provision;
 pub mod writeback;
 
 pub use conflict::all as conflicts;
 pub use engine::{AccountReport, CollectionReport, sync_account, sync_all};
-pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};
 pub use error::{Error, Result};
+pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};
 pub use provision::{Provisioned, provision_account};
 pub use writeback::{queue_delete, queue_save};

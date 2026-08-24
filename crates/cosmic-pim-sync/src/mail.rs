@@ -19,10 +19,10 @@
 use std::path::Path;
 
 use cosmic_pim_accounts::{Account, MailEndpoint, MailProtocol, Secret};
+use cosmic_pim_mail::imap::SyncOutcome;
 use cosmic_pim_mail::imap::{Endpoint, Security, Session, SyncOptions};
 use cosmic_pim_mail::maildir::{MaildirStore, mailbox_path};
 use cosmic_pim_mail::{Credentials, Folder, SmtpEndpoint};
-use cosmic_pim_mail::imap::SyncOutcome;
 
 use crate::error::{Error, Result};
 
@@ -31,6 +31,14 @@ use crate::error::{Error, Result};
 pub struct MailboxReport {
     pub wire_name: String,
     pub display_name: String,
+    /// The full folder, where the protocol produced one.
+    ///
+    /// `Some` for IMAP, whose LIST carries the hierarchy delimiter and the
+    /// server's own RFC 6154 special-use declaration — which is how a Trash
+    /// named "Papierkorb" is still known to be the Trash. `None` for the
+    /// label-shaped protocols, where the names above are all there is and a
+    /// UI reconstructs what it needs from them.
+    pub folder: Option<Folder>,
     pub outcome: Result<SyncOutcome>,
 }
 
@@ -130,7 +138,9 @@ pub fn sync_account_mail(
     // Which protocol is a stored property of the endpoint, not a probe. See
     // `MailEndpoint::protocol`.
     match mail.protocol {
-        MailProtocol::Imap => sync_over_imap(account, mail, credentials, mail_root, options, now_ms),
+        MailProtocol::Imap => {
+            sync_over_imap(account, mail, credentials, mail_root, options, now_ms)
+        }
         MailProtocol::Jmap => sync_over_jmap(account, mail, credentials, mail_root, now_ms),
         MailProtocol::Pop3 => sync_over_pop3(account, mail, credentials, mail_root, now_ms),
         MailProtocol::Gmail => sync_over_gmail(account, credentials, mail_root, now_ms),
@@ -148,8 +158,8 @@ fn sync_over_imap(
 ) -> Result<MailReport> {
     let mut report = MailReport::default();
 
-    let mut session = Session::connect(&imap_endpoint(account, mail), credentials)
-        .map_err(Error::Mail)?;
+    let mut session =
+        Session::connect(&imap_endpoint(account, mail), credentials).map_err(Error::Mail)?;
 
     // The outbox before the pull. Sends are the user's own words waiting to
     // leave; a pass that fetches first leaves them queued for another cycle.
@@ -177,6 +187,7 @@ fn sync_over_imap(
         report.mailboxes.push(MailboxReport {
             wire_name: folder.wire_name.clone(),
             display_name: folder.display_name.clone(),
+            folder: Some(folder),
             outcome,
         });
     }
@@ -276,6 +287,7 @@ fn sync_over_gmail(
         report.mailboxes.push(MailboxReport {
             wire_name: folder.wire_name,
             display_name: folder.display_name,
+            folder: None,
             outcome,
         });
     }
@@ -317,9 +329,8 @@ fn sync_over_graph(
             let path = mailbox_path(mail_root, &account.id, &folder);
             let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
             let mut state = graph::state(&path);
-            let outcome =
-                graph::sync_folder(&session, &remote.id, &mut store, &mut state, now_ms)
-                    .map_err(Error::Mail)?;
+            let outcome = graph::sync_folder(&session, &remote.id, &mut store, &mut state, now_ms)
+                .map_err(Error::Mail)?;
             state.save(&path).map_err(Error::Mail)?;
             Ok(SyncOutcome {
                 fetched: outcome.fetched,
@@ -333,6 +344,7 @@ fn sync_over_graph(
         report.mailboxes.push(MailboxReport {
             wire_name: remote.id,
             display_name: folder.display_name,
+            folder: None,
             outcome,
         });
     }
@@ -447,6 +459,7 @@ fn sync_over_jmap(
         report.mailboxes.push(MailboxReport {
             wire_name: mailbox.id,
             display_name: mailbox.name,
+            folder: None,
             outcome,
         });
     }
@@ -534,6 +547,7 @@ fn sync_over_pop3(
         mailboxes: vec![MailboxReport {
             wire_name: folder.wire_name,
             display_name: folder.display_name,
+            folder: None,
             outcome,
         }],
         ..Default::default()
