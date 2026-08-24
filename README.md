@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
 | [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
-| **cosmic-pim** | — | This substrate | 477 tests |
+| **cosmic-pim** | — | This substrate | 677 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
@@ -24,12 +24,63 @@ Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 |---|---|
 | `cosmic-pim-core` | The model (events, tasks, contacts), the one iCalendar/vCard parser the suite shares, vdir storage, a SQLite index for calendar range queries, filesystem watching, and a crash-safe writer |
 | `cosmic-pim-caldav` | CalDAV **and** CardDAV — protocol, reconciliation, durable writeback queue, and a store trait implemented over the vdir |
-| `cosmic-pim-accounts` | Accounts and credentials: the OS keychain, with an encrypted local fallback for hosts that have none |
-| `cosmic-pim-mail` | Mail — the message model over verbatim RFC 5322 bytes, a maildir store, JWZ threading, HTML-to-visible-text extraction, and IMAP with durable writeback |
+| `cosmic-pim-accounts` | Accounts and credentials: the OS keychain with an encrypted local fallback, and the provider manifests that say where a named service lives |
+| `cosmic-pim-auth` | OAuth 2.0 sign-in and token renewal — the only crate here that talks to a provider's login endpoint |
+| `cosmic-pim-mail` | Mail — the message model over verbatim RFC 5322 bytes, a maildir store, JWZ threading, HTML-to-visible-text extraction, and IMAP, JMAP and POP3 with durable writeback |
 | `cosmic-pim-sync` | The layer that joins `core`, `caldav`, and `accounts` — provisioning, one sync pass per account over calendars and address books, and the conflicts a pass could not resolve alone |
 
 Dependencies point downward only. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
 diagram, the invariants, and where new code belongs.
+
+## Accounts
+
+Signing in works two ways, and an application does not have to care which.
+
+Most servers — Fastmail, Nextcloud, Migadu, a university, a Synology box —
+take a URL and an app password. Google and Microsoft withdrew password
+authentication and take OAuth, so the suite runs the authorization-code flow
+itself: PKCE, a loopback redirect, and a refresh token renewed when it expires.
+
+```rust
+use cosmic_pim_accounts::{AccountStore, Registry};
+
+let registry = Registry::load();
+let provider = registry.get("fastmail").expect("built in");
+
+// Everything the manifest knows — CalDAV, CardDAV, mail — filled in.
+let account = provider.account_for("ada@fastmail.com");
+accounts.add(account, &app_password)?;
+```
+
+An OAuth provider is the same shape with the flow in between:
+
+```rust
+let oauth = provider.oauth.as_ref().expect("this provider uses OAuth");
+let pending = cosmic_pim_auth::begin(oauth)?;
+open_in_the_users_browser(pending.authorize_url());
+
+let credential = pending.exchange(&pending.wait()?, oauth)?;
+accounts.add_oauth(provider.account_for(&address), &provider.id, &credential)?;
+```
+
+From there nothing distinguishes the two. `cosmic_pim_auth::resolve` hands back
+the secret of the moment — a password, or an access token it renewed and
+re-stored on the way — and the CalDAV client sends `Basic` or `Bearer`, the
+IMAP session `LOGIN` or `AUTHENTICATE XOAUTH2`, without knowing which.
+
+**Providers are data.** Google, Microsoft, Fastmail and iCloud ship compiled
+in; a manifest dropped in `$XDG_CONFIG_HOME/cosmic-pim/providers/` adds one or
+overrides a field of one. **No OAuth client id is shipped** — one identifies
+the application asking, and there is none this project could publish that would
+be right for a downstream package — so Google and Microsoft need a two-line
+manifest before they can be used:
+
+```toml
+# $XDG_CONFIG_HOME/cosmic-pim/providers/google.toml
+id = "google"
+[oauth]
+client_id = "…apps.googleusercontent.com"
+```
 
 ## Using these
 
@@ -74,7 +125,20 @@ One sync pass over every enabled account — calendars and address books
 together, failing per collection rather than per run:
 
 ```rust
-let reports = cosmic_pim_sync::sync_all(&mut accounts, &calendar_root, &contacts_root);
+let reports = cosmic_pim_sync::sync_all(&mut accounts, &registry, &calendar_root, &contacts_root);
+```
+
+Mail, in whichever protocol the account uses — IMAP, JMAP, or POP3:
+
+```rust
+let secret = cosmic_pim_auth::resolve(&mut accounts, &registry, &account.id)?;
+let report = cosmic_pim_sync::sync_account_mail(
+    &account,
+    &cosmic_pim_sync::credentials_for(&secret),
+    &mail_root,
+    Default::default(),
+    now_ms,
+)?;
 ```
 
 What a pass could not decide on its own — the server and this device changed the

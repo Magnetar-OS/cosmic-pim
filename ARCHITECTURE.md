@@ -22,10 +22,13 @@ true.
         │  └────┬──────────────┬──────┘  │
         │       │              │         │
         │  ┌────▼─────┐  ┌─────▼──────┐  │
-        │  │  caldav  │  │  accounts  │  │  protocol      credentials
+        │  │  caldav  │  │    auth    │  │  protocol      OAuth 2.0 flow
         │  └────┬─────┘  └─────┬──────┘  │
+        │       │        ┌─────▼──────┐  │
+        │       │        │  accounts  │  │  credentials, providers
+        │       │        └─────┬──────┘  │
         │       │    ┌─────────┤         │
-        │       │    │  mail   │         │  IMAP, maildir, threading
+        │       │    │  mail   │         │  IMAP/JMAP/POP3, maildir
         │       │    └────┬────┘         │
         │  ┌────▼─────────▼──────────┐   │
         │  │      cosmic-pim-core    │   │  model, iCalendar/vCard, vdir,
@@ -37,6 +40,15 @@ Dependencies point downward only. `core` knows nothing about servers; `caldav`
 and `mail` know nothing about accounts; `accounts` never opens a socket. `sync`
 is the only crate that knows about the others, which is what keeps them
 independently testable and separately reusable.
+
+`auth` sits **above** `accounts` for that last reason. Running an OAuth flow
+means an HTTP client and a listening socket, and putting those in the crate
+that holds passwords would link both into every application that only wanted to
+read an account name. So `accounts` owns the credential and the provider
+manifests, which are storage and data; `auth` performs the exchange that
+produces one. The seam is `cosmic_pim_auth::resolve`, which hands back the
+secret to use *now* — renewing an expired token and re-storing it on the way —
+so that no protocol client ever learns what a refresh token is.
 
 `mail` sits **beside** `caldav`, not on it. CalDAV and CardDAV are one protocol
 with four substitutions, which is why they share an engine behind a `Flavor`
@@ -67,8 +79,12 @@ in one place and all three apps get it.
 | Durable writes | `core::atomic` | Temp file → fsync it → rename → **fsync the parent directory**; optimistic concurrency. |
 | CalDAV / CardDAV | `caldav` | One engine, two flavours. |
 | RFC 5322 messages | `mail::model` | Extract-only. Nothing ever writes a message back through the parser. |
+| Signing in | `auth` | OAuth 2.0 with PKCE, a loopback redirect, and renewal. One flow for every provider. |
+| Where a service lives | `accounts::provider` | Manifests, not a match arm. A new provider is a file. |
 | Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
 | IMAP | `mail::imap` | Session, cycle, and durable writeback. Not a DAV flavour. |
+| JMAP | `mail::jmap` | RFC 8620/8621. Metadata by API, bytes by blob download — see below. |
+| POP3 | `mail::pop3` | RFC 1939, for accounts that offer nothing else. |
 | SMTP | `mail::smtp` | Sending, and the one failure that must never be auto-retried. |
 | Conversation lists | `mail::index` | A rebuildable SQLite cache, same standing as the calendar's. |
 | Accounts, passwords | `accounts` | OS keychain, encrypted fallback. Shared across all three apps. |
@@ -218,6 +234,35 @@ into text, for the reader and for anything that indexes it. Envelope renders tex
 rather than HTML, which is why there is no sanitiser to disagree with a renderer
 and why a tracking pixel has nothing to fire from.
 
+**The token is resolved once, above every protocol.** An access token expires
+in about an hour, and there are five clients that need one: CalDAV, CardDAV,
+IMAP, SMTP, JMAP. Teaching each of them to renew would put the account store,
+the provider registry and an HTTP client inside every one, and would be wrong
+in five places independently. So they take an already-valid secret and nothing
+else. The renewal happens in `cosmic_pim_auth::resolve`, which **stores the new
+grant before returning it** — not an optimisation: a provider that rotates
+refresh tokens invalidates the stored one the first time a renewal uses it, so
+a pass that renewed without persisting would leave an account that can never be
+renewed again.
+
+**JMAP metadata comes from the API; JMAP bytes do not.** `Email/get` will hand
+over headers as fields and the body as structured parts, and storing that would
+break verbatim storage in the one protocol where it is easiest to break: a
+reassembled message has a different MIME structure and an invalid DKIM
+signature, and nothing notices until it is forwarded. So `Email/get` is asked
+for metadata plus `blobId` only, and the message itself comes from the download
+endpoint as the original octets. One extra request per message, and it is not
+optional.
+
+**POP3 is not a small IMAP, and is not pretended to be.** One mailbox, no
+folders, no server-side flags, nothing visible to a second device. Flags are
+local facts; the writeback queue is not involved because there is nowhere to
+write back to. Identity comes from `UIDL`, and a server without it is refused
+rather than guessed at — there would be no way to tell a downloaded message
+from a new one. Message *numbers* are never persisted: they are positions in
+one session, and a stored one deletes whatever has drifted into that position
+since.
+
 Two things from the calendar side deliberately do **not** carry over. Step 4 of
 "adding another application" below — add a `Flavor` — does not apply: IMAP is not
 a WebDAV flavour. And `caldav::patch` has no mail counterpart, because a message
@@ -262,6 +307,13 @@ else.
 path has two real implementations and this has one, but the backoff logic still
 needs testing without a disk.
 
+**Provider manifests** (`accounts::provider`) — a TOML file naming a provider's
+OAuth endpoints and its CalDAV, CardDAV and mail addresses. Built-ins are
+compiled in; a file in `$XDG_CONFIG_HOME/cosmic-pim/providers/` adds one or
+overrides a field of one. Adding a provider is not a code change, and no OAuth
+client id is shipped — one identifies the application asking, and there is none
+this project could publish that would be correct for a downstream package.
+
 **`Flavor`** (`caldav::dav`) — CalDAV and CardDAV are the same protocol with four
 substitutions: home-set property, resourcetype marker, multiget report name,
 payload element. An enum, not a second crate. A collection records its own
@@ -278,6 +330,8 @@ no other channel to be told.
 | touches files in a collection | `core::store` |
 | speaks HTTP to a server | `caldav` |
 | holds a password or an account | `accounts` |
+| says where a named provider's services live | `accounts::provider` |
+| talks to a provider's *login* endpoint | `auth` |
 | joins an account to a collection | `sync` |
 | renders, or reads a keyboard | the application |
 
@@ -303,7 +357,7 @@ the moment the model existed, because the engine never parses what it stores.
 
 ## Testing
 
-Roughly 480 tests in the substrate, `cargo test --workspace`.
+Roughly 680 tests in the substrate, `cargo test --workspace`.
 
 The one worth knowing about is `caldav/tests/live_sync.rs`: a real HTTP server
 answering PROPFIND and REPORT with canned multistatus XML, driving the real
@@ -312,6 +366,13 @@ isolation; that test is what proves they are wired together in the right order.
 It is also what caught the transport being unusable — `ureq` 3 enforces a
 hardcoded HTTP-method allowlist and rejects every WebDAV verb before it reaches
 the socket. Hence `reqwest`. Do not "simplify" back to `ureq`.
+
+The mail crate has three of them, one per protocol, and they are the reason
+adding a protocol has not meant re-learning the same lessons: `live_sync.rs`
+scripts an IMAP server, `live_pop3.rs` a POP3 one — asserting dot-unstuffing
+through to the bytes on disk, and that `RETR` precedes `DELE` — and
+`live_jmap.rs` a JMAP one, asserting that the message stored is the one the
+download endpoint served rather than anything reassembled from `Email/get`.
 
 `mail/tests/live_sync.rs` is its counterpart: a scripted IMAP server on a real
 socket, driving the real client into a real maildir. It exists for the same

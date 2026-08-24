@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use cosmic_pim_accounts::{Account, MailEndpoint, MailProtocol};
+use cosmic_pim_accounts::{Account, MailEndpoint, MailProtocol, Secret};
 use cosmic_pim_mail::imap::{Endpoint, Security, Session, SyncOptions};
 use cosmic_pim_mail::maildir::{MaildirStore, mailbox_path};
 use cosmic_pim_mail::{Credentials, Folder, SmtpEndpoint};
@@ -60,6 +60,21 @@ impl MailReport {
     #[must_use]
     pub fn failed(&self) -> usize {
         self.mailboxes.iter().filter(|m| m.outcome.is_err()).count()
+    }
+}
+
+/// A resolved account secret, in the shape the mail protocols take.
+///
+/// A free function rather than a `From` impl because both types are foreign to
+/// this crate and the orphan rule forbids one. That is the right outcome
+/// anyway: `mail` deliberately knows nothing about the account store, and
+/// `accounts` knows nothing about protocols, so the crate that knows both is
+/// the only honest home for the conversion.
+#[must_use]
+pub fn credentials_for(secret: &Secret) -> Credentials {
+    match secret {
+        Secret::Password(password) => Credentials::Password(password.clone()),
+        Secret::AccessToken(token) => Credentials::OAuth2(token.clone()),
     }
 }
 
@@ -444,6 +459,15 @@ mod tests {
             imap_endpoint(&account, account.mail.as_ref().unwrap()).username,
             "ada@example.com"
         );
+    }
+
+    #[test]
+    fn a_resolved_secret_picks_the_mechanism_the_session_will_use() {
+        assert_eq!(
+            credentials_for(&Secret::AccessToken("ya29".into())),
+            Credentials::OAuth2("ya29".into())
+        );
+        assert!(!credentials_for(&Secret::Password("pw".into())).is_oauth2());
     }
 
     #[test]

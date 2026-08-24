@@ -31,7 +31,7 @@ pub mod writeback;
 
 pub use conflict::all as conflicts;
 pub use engine::{AccountReport, CollectionReport, sync_account, sync_all};
-pub use mail::{MailReport, MailboxReport, sync_account_mail};
+pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};
 pub use error::{Error, Result};
 pub use provision::{Provisioned, provision_account};
 pub use writeback::{queue_delete, queue_save};
