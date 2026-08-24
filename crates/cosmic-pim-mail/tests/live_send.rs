@@ -19,7 +19,6 @@ fn password() -> cosmic_pim_mail::Credentials {
     cosmic_pim_mail::Credentials::Password("hunter2".into())
 }
 
-
 use cosmic_pim_mail::compose::Draft;
 use cosmic_pim_mail::imap::Security;
 use cosmic_pim_mail::model::{Mailbox, Message};

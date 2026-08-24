@@ -266,7 +266,9 @@ impl Session {
     fn refuse(status: u16, what: &str, body: &str) -> Error {
         let detail = body.chars().take(200).collect::<String>();
         if status == 401 || status == 403 {
-            Error::Auth(format!("graph {what} was refused (HTTP {status}): {detail}"))
+            Error::Auth(format!(
+                "graph {what} was refused (HTTP {status}): {detail}"
+            ))
         } else {
             Error::Graph(format!("graph {what} returned HTTP {status}: {detail}"))
         }
@@ -822,7 +824,10 @@ mod tests {
         // Exchange emits RFC 3339 mostly, and the other two sometimes.
         let expected = 1_785_834_000_000;
         assert_eq!(parse_datetime_ms("2026-08-04T09:00:00Z"), Some(expected));
-        assert_eq!(parse_datetime_ms("2026-08-04T09:00:00.0000000"), Some(expected));
+        assert_eq!(
+            parse_datetime_ms("2026-08-04T09:00:00.0000000"),
+            Some(expected)
+        );
         assert_eq!(parse_datetime_ms("2026-08-04T09:00:00"), Some(expected));
         assert_eq!(parse_datetime_ms("not a date"), None);
     }

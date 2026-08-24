@@ -161,7 +161,13 @@ mod tests {
 
     #[test]
     fn credentials_do_not_print_themselves() {
-        assert_eq!(Credentials::Password("hunter2".into()).to_string(), "<password>");
-        assert_eq!(Credentials::OAuth2("ya29.x".into()).to_string(), "<access token>");
+        assert_eq!(
+            Credentials::Password("hunter2".into()).to_string(),
+            "<password>"
+        );
+        assert_eq!(
+            Credentials::OAuth2("ya29.x".into()).to_string(),
+            "<access token>"
+        );
     }
 }

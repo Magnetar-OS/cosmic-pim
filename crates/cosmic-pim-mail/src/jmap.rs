@@ -450,9 +450,7 @@ impl Session {
                 );
                 return Ok(None);
             }
-            return Err(Error::Jmap(format!(
-                "Email/changes was refused: {kind}"
-            )));
+            return Err(Error::Jmap(format!("Email/changes was refused: {kind}")));
         }
 
         let args = responses
@@ -737,8 +735,7 @@ impl Session {
             .map(ToOwned::to_owned)
             .ok_or_else(|| {
                 Error::Jmap(
-                    "the server acknowledged neither success nor failure for the import"
-                        .to_owned(),
+                    "the server acknowledged neither success nor failure for the import".to_owned(),
                 )
             })
     }
@@ -791,13 +788,14 @@ impl<'a> JmapWriteback<'a> {
     /// maildir have diverged — recoverable, but only by a full read, so it is
     /// reported as needing reconciliation rather than retried forever.
     fn id_for(&self, uid: u32) -> Result<String> {
-        self.state.id_of(uid).map(ToOwned::to_owned).ok_or_else(|| {
-            Error::UidValidityChanged {
+        self.state
+            .id_of(uid)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Error::UidValidityChanged {
                 mailbox: self.mailbox_id.to_owned(),
                 had: uid,
                 now: 0,
-            }
-        })
+            })
     }
 }
 
@@ -809,8 +807,7 @@ impl crate::push::Writeback for JmapWriteback<'_> {
 
     fn move_message(&mut self, uid: u32, destination: &str) -> Result<()> {
         let id = self.id_for(uid)?;
-        self.session
-            .move_email(&id, self.mailbox_id, destination)?;
+        self.session.move_email(&id, self.mailbox_id, destination)?;
         // It is no longer this mailbox's message. Keeping the mapping would
         // have the next incremental pass see an id it still believes it holds.
         self.state.forget(&id);
@@ -833,12 +830,7 @@ impl crate::push::Writeback for JmapWriteback<'_> {
 /// message deleted and expunging later does not exist. Nothing is lost by that,
 /// but a client that maps `$deleted` onto anything is inventing it.
 fn flags_of(keywords: &Value) -> Flags {
-    let has = |name: &str| {
-        keywords
-            .get(name)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    };
+    let has = |name: &str| keywords.get(name).and_then(Value::as_bool).unwrap_or(false);
     Flags {
         seen: has("$seen"),
         answered: has("$answered"),
@@ -1254,8 +1246,14 @@ mod tests {
 
         let keywords = keywords_of(flags);
         assert_eq!(keywords.get("$seen").and_then(Value::as_bool), Some(true));
-        assert_eq!(keywords.get("$answered").and_then(Value::as_bool), Some(true));
-        assert!(keywords.get("$flagged").is_none(), "a false keyword was sent as present");
+        assert_eq!(
+            keywords.get("$answered").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            keywords.get("$flagged").is_none(),
+            "a false keyword was sent as present"
+        );
         assert_eq!(flags_of(&keywords), flags);
     }
 

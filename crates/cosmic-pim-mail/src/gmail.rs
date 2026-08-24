@@ -310,7 +310,9 @@ impl Session {
     fn refuse(status: u16, what: &str, body: &str) -> Error {
         let detail = body.chars().take(200).collect::<String>();
         if status == 401 || status == 403 {
-            Error::Auth(format!("gmail {what} was refused (HTTP {status}): {detail}"))
+            Error::Auth(format!(
+                "gmail {what} was refused (HTTP {status}): {detail}"
+            ))
         } else {
             Error::Gmail(format!("gmail {what} returned HTTP {status}: {detail}"))
         }
@@ -520,8 +522,7 @@ impl Session {
             Ok(message) => message.formatted(),
             Err(why) => return Outcome::NotSent(why),
         };
-        let encoded =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&message);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&message);
 
         let url = format!("{}/messages/send", self.base);
         let response = self
@@ -1119,7 +1120,10 @@ mod tests {
             flagged: false,
             ..starred
         };
-        assert_eq!(label_delta(starred, unstarred), (Vec::new(), vec!["STARRED"]));
+        assert_eq!(
+            label_delta(starred, unstarred),
+            (Vec::new(), vec!["STARRED"])
+        );
     }
 
     #[test]
@@ -1219,7 +1223,10 @@ mod tests {
 
         assert_eq!(message.folder(), "archive");
         assert_eq!(message.internal_date_ms, 1_785_834_000_000);
-        assert!(message.flags().seen, "a message with no UNREAD label is read");
+        assert!(
+            message.flags().seen,
+            "a message with no UNREAD label is read"
+        );
     }
 
     #[test]

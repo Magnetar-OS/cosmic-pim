@@ -196,14 +196,7 @@ fn serve(messages: Vec<Message>) -> Server {
             let params = parse_query(query);
             let mut state = held.lock().expect("state");
 
-            let (status, payload) = route(
-                &method,
-                path,
-                &params,
-                &body,
-                &mut state,
-                &recorded,
-            );
+            let (status, payload) = route(&method, path, &params, &body, &mut state, &recorded);
             drop(state);
 
             let response = tiny_http::Response::from_string(payload)
@@ -392,8 +385,7 @@ fn maildir() -> (tempfile::TempDir, MaildirStore) {
 }
 
 fn session(server: &Server) -> Session {
-    Session::connect_to(&server.url, &Credentials::OAuth2("ya29.token".into()))
-        .expect("session")
+    Session::connect_to(&server.url, &Credentials::OAuth2("ya29.token".into())).expect("session")
 }
 
 fn sync(
@@ -464,10 +456,16 @@ fn an_archive_performed_elsewhere_empties_the_inbox_maildir() {
     server.forget_calls();
     let outcome = sync(&server, "inbox", &mut store, &mut state);
 
-    assert!(!outcome.bootstrapped, "an incremental pass re-listed the mailbox");
+    assert!(
+        !outcome.bootstrapped,
+        "an incremental pass re-listed the mailbox"
+    );
     assert_eq!(outcome.removed, 1);
     assert!(store.state().expect("state").entries.is_empty());
-    assert!(state.uid_of("M1").is_none(), "the id mapping outlived the message");
+    assert!(
+        state.uid_of("M1").is_none(),
+        "the id mapping outlived the message"
+    );
 }
 
 #[test]
@@ -553,7 +551,10 @@ fn an_expired_cursor_re_bootstraps_rather_than_freezing_or_emptying() {
 
     let outcome = sync(&server, "inbox", &mut store, &mut state);
 
-    assert!(outcome.bootstrapped, "the expired cursor did not trigger a re-read");
+    assert!(
+        outcome.bootstrapped,
+        "the expired cursor did not trigger a re-read"
+    );
     assert_eq!(
         store.state().expect("state").entries.len(),
         2,
@@ -581,7 +582,10 @@ fn a_purged_message_is_removed_surgically() {
 
     assert_eq!(outcome.removed, 1);
     assert_eq!(store.state().expect("state").entries.len(), 1);
-    assert!(state.uid_of("M1").is_some(), "the wrong message was removed");
+    assert!(
+        state.uid_of("M1").is_some(),
+        "the wrong message was removed"
+    );
 }
 
 #[test]

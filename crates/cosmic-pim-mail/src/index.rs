@@ -49,7 +49,7 @@ use crate::model::{Flags, Message};
 use crate::store::MailStore;
 
 /// Bumped whenever the schema changes; a mismatch wipes and rebuilds.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS messages (
@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_thread  ON messages (account, mailbox, thread_id, date_ms);
 CREATE INDEX IF NOT EXISTS messages_msgid   ON messages (account, message_id);
 CREATE INDEX IF NOT EXISTS messages_subject ON messages (account, subject_norm, date_ms);
+
+-- Full text, over the same lifecycle as the rows above. FTS5 rather than a
+-- second index engine: this is the donor's own first tier (its tantivy layer
+-- ranked above ~20k messages, on top of FTS), it lives in the file that is
+-- already the disposable cache, and rusqlite's bundled SQLite compiles it in
+-- unconditionally. The identifying columns are UNINDEXED — they are join
+-- keys, not text anybody searches for.
+CREATE VIRTUAL TABLE IF NOT EXISTS bodies USING fts5(
+    account UNINDEXED,
+    mailbox UNINDEXED,
+    uid UNINDEXED,
+    sender,
+    subject,
+    body
+);
 ";
 
 /// Where the cache lives: `$XDG_CACHE_HOME/cosmic-pim/mail.sqlite`.
@@ -165,7 +180,7 @@ impl Index {
             // Dropped rather than migrated. There is nothing here that cannot
             // be rebuilt from the maildirs, so a migration would be code
             // written to preserve something worthless.
-            conn.execute_batch("DROP TABLE IF EXISTS messages;")
+            conn.execute_batch("DROP TABLE IF EXISTS messages; DROP TABLE IF EXISTS bodies;")
                 .map_err(sqlite)?;
         }
         conn.execute_batch(SCHEMA).map_err(sqlite)?;
@@ -198,12 +213,16 @@ impl Index {
         if !gone.is_empty() {
             let transaction = self.conn.transaction().map_err(sqlite)?;
             {
-                let mut statement = transaction
+                let mut rows = transaction
                     .prepare("DELETE FROM messages WHERE account=?1 AND mailbox=?2 AND uid=?3")
                     .map_err(sqlite)?;
+                let mut text = transaction
+                    .prepare("DELETE FROM bodies WHERE account=?1 AND mailbox=?2 AND uid=?3")
+                    .map_err(sqlite)?;
                 for uid in gone {
-                    statement
-                        .execute(params![account, mailbox, uid])
+                    rows.execute(params![account, mailbox, uid])
+                        .map_err(sqlite)?;
+                    text.execute(params![account, mailbox, uid])
                         .map_err(sqlite)?;
                 }
             }
@@ -305,49 +324,82 @@ impl Index {
             return Ok(Vec::new());
         }
 
+        // Free-text terms go through FTS5 — sender, subject, *and body*, with
+        // bm25 deciding the order. The structured filters (`from:`,
+        // `subject:`) stay SQL over the messages table, joined on the
+        // identifying columns: they are constraints, not relevance.
         let mut sql = String::from(
-            "SELECT mailbox, uid, thread_id, from_name, from_addr, subject, date_ms,
-                    snippet, attachments
-             FROM messages WHERE account = ?1",
+            "SELECT m.mailbox, m.uid, m.thread_id, m.from_name, m.from_addr, m.subject,
+                    m.date_ms, m.snippet, m.attachments",
         );
-        // Bound parameters throughout — the terms are whatever somebody typed
-        // into a search box, and a LIKE pattern built by concatenation is how a
-        // search box becomes a SQL injection.
-        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(account.to_owned())];
+        if !query.terms.is_empty() {
+            sql.push_str(" , snippet(bodies, -1, '', '', '…', 12) AS context");
+        }
+        sql.push_str(" FROM messages m");
+
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if query.terms.is_empty() {
+            sql.push_str(" WHERE m.account = ?1");
+            values.push(Box::new(account.to_owned()));
+        } else {
+            // One MATCH, all terms AND-joined. Each term is spelled as a
+            // quoted prefix phrase, because the input is whatever somebody
+            // typed into a search box and FTS5's own query syntax — NEAR, -,
+            // ^, unbalanced quotes — must read it as text, not as operators.
+            values.push(Box::new(fts_query(&query.terms)));
+            sql.push_str(
+                " JOIN bodies b ON b.account = m.account AND b.mailbox = m.mailbox
+                       AND b.uid = m.uid
+                  WHERE bodies MATCH ?1 AND m.account = ?2",
+            );
+            values.push(Box::new(account.to_owned()));
+        }
 
         if let Some(mailbox) = mailbox {
             values.push(Box::new(mailbox.to_owned()));
-            sql.push_str(&format!(" AND mailbox = ?{}", values.len()));
-        }
-        for term in &query.terms {
-            values.push(Box::new(like(term)));
-            let n = values.len();
-            sql.push_str(&format!(
-                " AND (subject LIKE ?{n} ESCAPE '\\' OR from_name LIKE ?{n} ESCAPE '\\'
-                       OR from_addr LIKE ?{n} ESCAPE '\\' OR snippet LIKE ?{n} ESCAPE '\\')"
-            ));
+            sql.push_str(&format!(" AND m.mailbox = ?{}", values.len()));
         }
         for term in &query.from {
             values.push(Box::new(like(term)));
             let n = values.len();
             sql.push_str(&format!(
-                " AND (from_name LIKE ?{n} ESCAPE '\\' OR from_addr LIKE ?{n} ESCAPE '\\')"
+                " AND (m.from_name LIKE ?{n} ESCAPE '\\' OR m.from_addr LIKE ?{n} ESCAPE '\\')"
             ));
         }
         for term in &query.subject {
             values.push(Box::new(like(term)));
-            sql.push_str(&format!(" AND subject LIKE ?{} ESCAPE '\\'", values.len()));
+            sql.push_str(&format!(
+                " AND m.subject LIKE ?{} ESCAPE '\\'",
+                values.len()
+            ));
         }
         if query.has_attachment {
-            sql.push_str(" AND attachments != 0");
+            sql.push_str(" AND m.attachments != 0");
+        }
+
+        // Relevance when there was text to be relevant to; recency otherwise.
+        // bm25 is a cost in FTS5 — smaller is better — so it sorts ascending.
+        if query.terms.is_empty() {
+            sql.push_str(" ORDER BY m.date_ms DESC");
+        } else {
+            sql.push_str(" ORDER BY bm25(bodies) ASC, m.date_ms DESC");
         }
         values.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
-        sql.push_str(&format!(" ORDER BY date_ms DESC LIMIT ?{}", values.len()));
+        sql.push_str(&format!(" LIMIT ?{}", values.len()));
 
+        let with_context = !query.terms.is_empty();
         let mut statement = self.conn.prepare(&sql).map_err(sqlite)?;
         let bound: Vec<&dyn rusqlite::ToSql> = values.iter().map(AsRef::as_ref).collect();
         let rows = statement
             .query_map(rusqlite::params_from_iter(bound), |row| {
+                // The matching passage beats the first line: a hit on page
+                // three of a message is useless if the row previews page one.
+                let context: String = if with_context {
+                    row.get::<_, String>(9).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let stored: String = row.get(7)?;
                 Ok(Hit {
                     mailbox: row.get(0)?,
                     uid: row.get(1)?,
@@ -356,7 +408,11 @@ impl Index {
                     from_address: row.get(4)?,
                     subject: row.get(5)?,
                     date_ms: row.get(6)?,
-                    snippet: row.get(7)?,
+                    snippet: if context.trim().is_empty() {
+                        stored
+                    } else {
+                        context
+                    },
                     has_attachments: row.get::<_, i64>(8)? != 0,
                 })
             })
@@ -374,6 +430,12 @@ impl Index {
         self.conn
             .execute(
                 "DELETE FROM messages WHERE account=?1 AND mailbox=?2",
+                params![account, mailbox],
+            )
+            .map_err(sqlite)?;
+        self.conn
+            .execute(
+                "DELETE FROM bodies WHERE account=?1 AND mailbox=?2",
                 params![account, mailbox],
             )
             .map_err(sqlite)?;
@@ -464,6 +526,27 @@ impl Index {
                     message.date.map_or(0, |date| date.timestamp_millis()),
                     snippet(&message.body.text),
                     i64::from(message.attachments.iter().any(|a| !a.inline)),
+                ],
+            )
+            .map_err(sqlite)?;
+        // The whole visible text, not the snippet: this row is what body
+        // search reads. Already capped at 16 KB by extraction, so an index
+        // over a large mailbox grows linearly in messages, not in newsletters.
+        self.conn
+            .execute(
+                "INSERT INTO bodies (account, mailbox, uid, sender, subject, body)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    account,
+                    mailbox,
+                    uid,
+                    format!(
+                        "{} {}",
+                        sender.and_then(|s| s.name.as_deref()).unwrap_or(""),
+                        sender.map_or("", |s| s.address.as_str())
+                    ),
+                    message.subject,
+                    message.body.text,
                 ],
             )
             .map_err(sqlite)?;
@@ -652,6 +735,20 @@ fn like(term: &str) -> String {
     }
     escaped.push('%');
     escaped
+}
+
+/// Every term as a quoted prefix phrase, AND-joined: `"release plan"* "ada"*`.
+///
+/// Quoting is what keeps FTS5's own operators — `NEAR`, `-`, `^`, a stray
+/// unbalanced `"` — from being read out of a search box; internal quotes are
+/// doubled per SQL string rules. The trailing `*` makes a half-typed word
+/// match, which is what typing into a live search box needs.
+fn fts_query(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"*", term.replace('\"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn sqlite(error: rusqlite::Error) -> Error {
@@ -995,6 +1092,99 @@ mod tests {
         let mut index = Index::in_memory().unwrap();
         index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
         assert_eq!(search(&index, "report"), ["report 2", "report 1"]);
+    }
+
+    #[test]
+    fn a_search_reaches_the_body_not_just_the_first_line() {
+        // The new capability: the word is on "page three" of the message,
+        // nowhere near the snippet the list shows.
+        let mut store = MemoryStore::default();
+        let body = format!(
+            "Opening pleasantries.\n\n{}\n\nThe kohlrabi budget is attached.\n",
+            "Filler paragraph.\n".repeat(30)
+        );
+        store
+            .upsert(&RemoteMessage {
+                uid: 1,
+                flags: Flags::default(),
+                raw: format!(
+                    "Message-ID: <deep@x>\r\nFrom: a@example.com\r\nSubject: Quarterly\r\n\r\n{body}"
+                )
+                .into_bytes(),
+                internal_date_ms: 1000,
+            })
+            .unwrap();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+
+        let hits = index
+            .search(ACCOUNT, None, &crate::search::parse("kohlrabi"), 50)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "a body-only word was not found");
+        assert!(
+            hits[0].snippet.contains("kohlrabi"),
+            "the row previews the first line instead of the matching passage: {:?}",
+            hits[0].snippet
+        );
+    }
+
+    #[test]
+    fn a_half_typed_word_already_matches() {
+        // Every keystroke in a live search box is a query.
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+        assert_eq!(search(&index, "invo"), ["Invoice 42 overdue"]);
+    }
+
+    #[test]
+    fn fts_operators_in_a_search_box_are_text_not_syntax() {
+        // NEAR, minus, caret, an unbalanced quote: all typed by people, none
+        // of them may reach FTS5 as operators. The contract is "no error and
+        // no surprise matches", exercised against a live table.
+        let store = searchable();
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+
+        for hostile in [
+            "NEAR(a b)",
+            "-release",
+            "^release",
+            "\"unbalanced",
+            "a AND b OR c",
+        ] {
+            let query = crate::search::parse(hostile);
+            index
+                .search(ACCOUNT, None, &query, 50)
+                .unwrap_or_else(|why| panic!("{hostile:?} broke the query: {why}"));
+        }
+        // The minus is stripped by the tokenizer, so "-release" matches
+        // "Release plan" — and that match is itself the proof the minus was
+        // not read as an exclusion operator, which would have removed exactly
+        // this row.
+        assert_eq!(search(&index, "-release"), ["Release plan"]);
+    }
+
+    #[test]
+    fn a_deleted_message_leaves_body_search_too() {
+        let mut store = store(vec![message(
+            1,
+            "a@x",
+            "",
+            "s",
+            "a@example.com",
+            "unmistakable",
+        )]);
+        let mut index = Index::in_memory().unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+        assert_eq!(search(&index, "unmistakable").len(), 1);
+
+        store.remove(1).unwrap();
+        index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
+        assert!(
+            search(&index, "unmistakable").is_empty(),
+            "a deleted message still turns up in search"
+        );
     }
 
     #[test]

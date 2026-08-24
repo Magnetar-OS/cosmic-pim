@@ -272,7 +272,10 @@ impl Session {
                 continue;
             };
             let Ok(number) = number.parse::<u32>() else {
-                tracing::warn!(line, "skipping a UIDL entry with a non-numeric message number");
+                tracing::warn!(
+                    line,
+                    "skipping a UIDL entry with a non-numeric message number"
+                );
                 continue;
             };
             out.push((number, uid.to_owned()));

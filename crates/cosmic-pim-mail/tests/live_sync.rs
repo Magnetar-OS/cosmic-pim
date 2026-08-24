@@ -635,11 +635,15 @@ fn a_watch_returns_when_the_server_reports_news() {
 
     let commands = server.commands();
     assert!(
-        commands.iter().any(|c| c.to_ascii_uppercase().contains("IDLE")),
+        commands
+            .iter()
+            .any(|c| c.to_ascii_uppercase().contains("IDLE")),
         "no IDLE was ever issued: {commands:?}"
     );
     assert!(
-        commands.iter().any(|c| c.trim().eq_ignore_ascii_case("DONE")),
+        commands
+            .iter()
+            .any(|c| c.trim().eq_ignore_ascii_case("DONE")),
         "the watch never terminated the IDLE cleanly: {commands:?}"
     );
 }

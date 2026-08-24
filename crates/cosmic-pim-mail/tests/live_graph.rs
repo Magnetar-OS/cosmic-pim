@@ -221,7 +221,11 @@ fn route(
     if path == "/me/sendMail" && method == "POST" {
         note("sendMail".to_owned());
         if state.refuse_send {
-            return (400, json!({ "error": { "code": "invalidRequest" } }).to_string(), false);
+            return (
+                400,
+                json!({ "error": { "code": "invalidRequest" } }).to_string(),
+                false,
+            );
         }
         // The engine posts standard base64 of the MIME as text/plain.
         use base64::Engine as _;
@@ -248,7 +252,11 @@ fn route(
         if let Some(id) = rest.strip_suffix("/move") {
             note(format!("move {id}"));
             let _ = body;
-            return (200, json!({ "id": format!("{id}-moved") }).to_string(), false);
+            return (
+                200,
+                json!({ "id": format!("{id}-moved") }).to_string(),
+                false,
+            );
         }
         // PATCH or DELETE on the message itself.
         let id = rest.to_owned();
@@ -357,7 +365,11 @@ fn route(
         );
     }
 
-    (404, json!({ "error": { "code": "notFound" } }).to_string(), false)
+    (
+        404,
+        json!({ "error": { "code": "notFound" } }).to_string(),
+        false,
+    )
 }
 
 fn render(message: &Message) -> Value {
@@ -418,7 +430,10 @@ fn the_delta_link_makes_the_next_pass_incremental() {
     server.forget_calls();
     let outcome = sync(&server, &mut store, &mut state);
 
-    assert!(!outcome.bootstrapped, "the folder was read from scratch again");
+    assert!(
+        !outcome.bootstrapped,
+        "the folder was read from scratch again"
+    );
     assert_eq!(outcome.fetched, 0);
     assert!(
         server.calls().iter().any(|call| call.starts_with("delta ")),
@@ -477,7 +492,10 @@ fn a_changed_tombstone_does_not_delete_the_message() {
     server.changed_tombstone("m1");
     let outcome = sync(&server, &mut store, &mut state);
 
-    assert_eq!(outcome.removed, 0, "a `changed` tombstone deleted the message");
+    assert_eq!(
+        outcome.removed, 0,
+        "a `changed` tombstone deleted the message"
+    );
     assert_eq!(store.state().expect("state").entries.len(), 1);
     assert!(state.uid_of("m1").is_some());
 }
@@ -497,7 +515,10 @@ fn a_deleted_tombstone_does_delete_it() {
 
     assert_eq!(outcome.removed, 1);
     assert_eq!(store.state().expect("state").entries.len(), 1);
-    assert!(state.uid_of("m1").is_some(), "the wrong message was removed");
+    assert!(
+        state.uid_of("m1").is_some(),
+        "the wrong message was removed"
+    );
 }
 
 #[test]
@@ -516,7 +537,10 @@ fn an_expired_delta_link_re_reads_the_folder_rather_than_emptying_it() {
 
     let outcome = sync(&server, &mut store, &mut state);
 
-    assert!(outcome.bootstrapped, "the expired cursor did not trigger a re-read");
+    assert!(
+        outcome.bootstrapped,
+        "the expired cursor did not trigger a re-read"
+    );
     assert_eq!(
         store.state().expect("state").entries.len(),
         2,
@@ -615,7 +639,11 @@ fn a_folder_listing_keeps_the_users_own_language() {
     let folders = session(&server).folders().expect("folders");
 
     assert_eq!(folders.len(), 1);
-    assert_eq!(folders[0].slug(), "inbox", "the well-known name was not used");
+    assert_eq!(
+        folders[0].slug(),
+        "inbox",
+        "the well-known name was not used"
+    );
     assert_eq!(
         folders[0].display_name, "Posteingang",
         "the display name was replaced by a slug"
@@ -681,7 +709,10 @@ fn a_queued_send_leaves_through_send_mail_with_its_bcc_intact() {
         text.contains("hidden@example.com"),
         "the Bcc recipient was stripped from the submission: {text}"
     );
-    assert_eq!(submitted[0], outcome.sent[0].1, "the wire copy differs from the accepted one");
+    assert_eq!(
+        submitted[0], outcome.sent[0].1,
+        "the wire copy differs from the accepted one"
+    );
 }
 
 #[test]

@@ -201,7 +201,10 @@ impl RemoteIds {
 
     /// Writes the sidecar atomically — a torn one costs a full re-read.
     pub fn save(&self, maildir: &std::path::Path) -> Result<()> {
-        debug_assert!(!self.file.is_empty(), "saving a RemoteIds that was never loaded");
+        debug_assert!(
+            !self.file.is_empty(),
+            "saving a RemoteIds that was never loaded"
+        );
         let json = serde_json::to_string_pretty(self)
             .map_err(|why| Error::Index(format!("serialising sync state: {why}")))?;
         cosmic_pim_core::atomic::write(&maildir.join(self.file), &json, None)

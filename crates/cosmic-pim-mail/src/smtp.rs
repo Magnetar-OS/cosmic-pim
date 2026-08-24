@@ -175,19 +175,19 @@ fn transport(endpoint: &SmtpEndpoint, credentials: &Credentials) -> Result<lettr
     }
     .map_err(|why| Error::Smtp(why.to_string()))?;
 
-    let builder = builder.port(endpoint.port).credentials(SmtpCredentials::new(
-        endpoint.username.clone(),
-        credentials.expose().to_owned(),
-    ));
+    let builder = builder
+        .port(endpoint.port)
+        .credentials(SmtpCredentials::new(
+            endpoint.username.clone(),
+            credentials.expose().to_owned(),
+        ));
 
     // Pinned rather than negotiated when the credential is a token. lettre
     // picks the strongest mechanism the server advertises, and Gmail advertises
     // PLAIN alongside XOAUTH2 — so an access token would go out as a PLAIN
     // password and be refused, with the refusal reading as a bad password.
     Ok(if credentials.is_oauth2() {
-        builder
-            .authentication(vec![Mechanism::Xoauth2])
-            .build()
+        builder.authentication(vec![Mechanism::Xoauth2]).build()
     } else {
         builder.build()
     })
@@ -222,7 +222,11 @@ mod tests {
             security: Security::Plaintext,
             username: "me".into(),
         };
-        let outcome = send(&endpoint, &Credentials::Password(String::new()), &Draft::new(Mailbox::default()));
+        let outcome = send(
+            &endpoint,
+            &Credentials::Password(String::new()),
+            &Draft::new(Mailbox::default()),
+        );
         assert!(
             outcome.is_retryable(),
             "validation was reported as ambiguous"
@@ -243,7 +247,11 @@ mod tests {
             security: Security::Plaintext,
             username: "me".into(),
         };
-        let outcome = send(&endpoint, &Credentials::Password("hunter2".into()), &draft());
+        let outcome = send(
+            &endpoint,
+            &Credentials::Password("hunter2".into()),
+            &draft(),
+        );
         assert!(
             outcome.is_retryable(),
             "an offline send was made terminal: {:?}",

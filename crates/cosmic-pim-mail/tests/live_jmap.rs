@@ -194,7 +194,9 @@ fn serve(emails: Vec<Email>) -> Server {
                 recorded.lock().expect("calls").push("upload".to_owned());
                 let mut inner = held.lock().expect("state");
                 let blob_id = format!("blob-up-{}", inner.uploads.len() + 1);
-                inner.uploads.push((blob_id.clone(), body.clone().into_bytes()));
+                inner
+                    .uploads
+                    .push((blob_id.clone(), body.clone().into_bytes()));
                 drop(inner);
                 let response = tiny_http::Response::from_string(
                     json!({ "blobId": blob_id, "size": body.len() }).to_string(),
@@ -222,9 +224,7 @@ fn serve(emails: Vec<Email>) -> Server {
 
                 let response = match bytes {
                     Some(raw) => tiny_http::Response::from_data(raw).with_status_code(200),
-                    None => {
-                        tiny_http::Response::from_data(Vec::new()).with_status_code(404)
-                    }
+                    None => tiny_http::Response::from_data(Vec::new()).with_status_code(404),
                 };
                 let _ = request.respond(response);
                 continue;
@@ -256,7 +256,11 @@ fn serve(emails: Vec<Email>) -> Server {
                 {
                     let name = call.get(0).and_then(Value::as_str).unwrap_or("").to_owned();
                     let args = call.get(1).cloned().unwrap_or(json!({}));
-                    let call_id = call.get(2).and_then(Value::as_str).unwrap_or("0").to_owned();
+                    let call_id = call
+                        .get(2)
+                        .and_then(Value::as_str)
+                        .unwrap_or("0")
+                        .to_owned();
                     recorded.lock().expect("calls").push(name.clone());
 
                     let mut state = held.lock().expect("state");
@@ -518,7 +522,11 @@ fn connect(server: &Server) -> Session {
     .expect("session")
 }
 
-fn sync(server: &Server, store: &mut MaildirStore, state: &mut JmapState) -> cosmic_pim_mail::jmap::JmapOutcome {
+fn sync(
+    server: &Server,
+    store: &mut MaildirStore,
+    state: &mut JmapState,
+) -> cosmic_pim_mail::jmap::JmapOutcome {
     let session = connect(server);
     sync_mailbox(&session, "mbox-1", store, state, 500, 1_000).expect("sync")
 }
@@ -653,7 +661,11 @@ fn a_new_message_arrives_incrementally() {
     let outcome = sync(&server, &mut store, &mut state);
 
     assert_eq!(outcome.fetched, 1);
-    assert_eq!(downloads(&server), 1, "only the new message should be fetched");
+    assert_eq!(
+        downloads(&server),
+        1,
+        "only the new message should be fetched"
+    );
     assert_eq!(store.state().expect("state").entries.len(), 2);
 
     let uid = state.uid_of("M3").expect("a local uid");
@@ -675,7 +687,11 @@ fn a_flag_changed_on_the_server_costs_no_download() {
 
     assert_eq!(outcome.reflagged, 1);
     assert_eq!(outcome.fetched, 0);
-    assert_eq!(downloads(&server), 0, "a flag change re-downloaded the message");
+    assert_eq!(
+        downloads(&server),
+        0,
+        "a flag change re-downloaded the message"
+    );
 
     let uid = state.uid_of("M1").expect("a local uid");
     assert!(store.state().expect("state").entries[&uid].flagged);
@@ -700,7 +716,10 @@ fn a_message_moved_to_another_mailbox_leaves_this_one() {
 
     assert_eq!(outcome.removed, 1);
     assert_eq!(store.state().expect("state").entries.len(), 1);
-    assert!(state.uid_of("M1").is_none(), "the id mapping outlived the message");
+    assert!(
+        state.uid_of("M1").is_none(),
+        "the id mapping outlived the message"
+    );
 }
 
 #[test]
@@ -741,7 +760,10 @@ fn a_server_that_cannot_report_changes_falls_back_to_a_full_read() {
         "the client did not fall back to reading the mailbox: {:?}",
         server.calls()
     );
-    assert_eq!(outcome.fetched, 1, "the message added while offline never arrived");
+    assert_eq!(
+        outcome.fetched, 1,
+        "the message added while offline never arrived"
+    );
     assert_eq!(store.state().expect("state").entries.len(), 2);
     assert!(
         state.cursor().is_some(),
@@ -795,8 +817,8 @@ fn a_local_flag_change_reaches_the_server_before_the_pull_can_undo_it() {
     // keywords over the local ones, and the queued push then sends the
     // server's own state back to it. The star the user set disappears with
     // every indicator reporting success.
-    use cosmic_pim_mail::push::{PushOp, PushQueue};
     use cosmic_pim_mail::model::Flags;
+    use cosmic_pim_mail::push::{PushOp, PushQueue};
 
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
@@ -816,8 +838,14 @@ fn a_local_flag_change_reaches_the_server_before_the_pull_can_undo_it() {
 
     let outcome = sync(&server, &mut store, &mut state);
 
-    assert_eq!(outcome.pushed.succeeded, 1, "the flag change never went out");
-    assert!(store.pending().is_empty(), "the queue entry outlived its push");
+    assert_eq!(
+        outcome.pushed.succeeded, 1,
+        "the flag change never went out"
+    );
+    assert!(
+        store.pending().is_empty(),
+        "the queue entry outlived its push"
+    );
 
     // The server has it, so the pass that follows agrees rather than fighting.
     let held = server.inner.lock().expect("state");
@@ -859,7 +887,11 @@ fn a_local_move_leaves_the_mailbox_and_forgets_the_id() {
 
     // On the server it is in the other mailbox, not gone.
     let held = server.inner.lock().expect("state");
-    let email = held.emails.iter().find(|e| e.id == "M1").expect("M1 was destroyed");
+    let email = held
+        .emails
+        .iter()
+        .find(|e| e.id == "M1")
+        .expect("M1 was destroyed");
     assert_eq!(email.mailboxes, vec!["mbox-archive".to_owned()]);
 }
 
@@ -868,8 +900,8 @@ fn a_queued_operation_for_an_unknown_message_asks_for_a_resync() {
     // The sidecar and the maildir have diverged. Retrying forever would never
     // fix it and dropping the entry would lose the user's change silently, so
     // it is handed to a sync pass.
-    use cosmic_pim_mail::push::{PushOp, PushQueue};
     use cosmic_pim_mail::model::Flags;
+    use cosmic_pim_mail::push::{PushOp, PushQueue};
 
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
@@ -921,10 +953,15 @@ fn an_import_of_an_unknown_blob_reports_rather_than_pretending() {
     let server = serve(vec![]);
     let session = connect(&server);
 
-    let error = session.import("blob-nobody-uploaded", "mbox-1").unwrap_err();
+    let error = session
+        .import("blob-nobody-uploaded", "mbox-1")
+        .unwrap_err();
 
     // Positive confirmation, as everywhere: an import the server did not
     // acknowledge did not happen, and saying so beats a Sent folder that is
     // silently missing messages.
-    assert!(error.to_string().contains("neither success nor failure"), "got {error}");
+    assert!(
+        error.to_string().contains("neither success nor failure"),
+        "got {error}"
+    );
 }
