@@ -83,7 +83,7 @@ impl ImportSummary {
 ///
 /// UIDs are arbitrary text and routinely contain `/` and `@`; without this an
 /// imported file could escape its collection directory.
-fn sanitise_file_stem(uid: &str) -> String {
+pub(crate) fn sanitise_file_stem(uid: &str) -> String {
     let cleaned: String = uid
         .chars()
         .map(|c| {

@@ -14,9 +14,9 @@
 //! third of what a real vCard carries. That is fine for a contact this app
 //! created and **lossy** for one that came from a server, which is why
 //! [`Contact::raw`] exists and why the CardDAV store keeps the server's bytes
-//! rather than a re-serialisation. Editing a synced contact needs a patcher of
-//! the kind `cosmic_pim_caldav::patch` provides for events; until that exists,
-//! callers should treat a synced contact as read-only.
+//! rather than a re-serialisation. Editing a synced contact goes through
+//! [`patch_vcard`], which rewrites only the modelled properties and passes
+//! every other byte through.
 
 use calcard::Parser;
 use calcard::vcard::{
@@ -247,6 +247,121 @@ fn birthday(card: &VCard) -> Option<NaiveDate> {
         u32::from(dt.month?),
         u32::from(dt.day?),
     )
+}
+
+/// Splits a document into one verbatim text segment per card.
+///
+/// [`parse_vcards`] hands every contact the *whole* file as its `raw`, which is
+/// right for a vdir (one card per file) and wrong for an import: writing each
+/// contact of a ten-card export would put all ten cards into every target file.
+/// This recovers the per-card bytes so an import can stay lossless. vCards
+/// cannot nest, so a line scan is exact.
+#[must_use]
+pub fn split_vcards(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+
+    // Physical lines, terminators preserved: the segment must be byte-faithful,
+    // and folding never splits a BEGIN/END line in practice (they are short).
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        let (line, tail) = rest.split_at(end);
+        rest = tail;
+
+        let upper = line.trim().to_ascii_uppercase();
+        if upper == "BEGIN:VCARD" {
+            current = Some(String::new());
+        }
+        if let Some(segment) = current.as_mut() {
+            segment.push_str(line);
+        }
+        if upper == "END:VCARD"
+            && let Some(segment) = current.take()
+        {
+            out.push(segment);
+        }
+    }
+    out
+}
+
+/* ------------------------------------------------------------------ */
+/* Photos                                                             */
+
+/// A contact's photo, as the card carries it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Photo {
+    /// Inline image bytes (vCard 3.0 `ENCODING=b`, or a 4.0 `data:` URI —
+    /// calcard decodes both), with the content type when the card names one.
+    Bytes {
+        data: Vec<u8>,
+        content_type: Option<String>,
+    },
+    /// A remote or file URI. Deliberately not fetched here: whether to touch
+    /// the network for an avatar is an application policy (and default-off in
+    /// every app in this suite), not a parsing decision.
+    Uri(String),
+}
+
+/// Extracts the photo from a stored card, decoding inline forms to bytes.
+///
+/// Separate from [`parse_vcards`] on purpose: a photo can be hundreds of
+/// kilobytes, and the contact list would otherwise pull every one of them into
+/// memory to render rows that show no image at all. [`Contact::has_photo`] says
+/// whether calling this is worth it; this does the actual work, once, for the
+/// card on screen.
+#[must_use]
+pub fn photo(raw: &str) -> Option<Photo> {
+    let mut parser = Parser::new(raw);
+    let card = loop {
+        match parser.entry() {
+            calcard::Entry::VCard(card) => break card,
+            calcard::Entry::Eof => return None,
+            _ => {}
+        }
+    };
+
+    let entry = card.property(&VCardProperty::Photo)?;
+    match entry.values.first()? {
+        VCardValue::Binary(data) => Some(Photo::Bytes {
+            data: data.data.clone(),
+            content_type: data.content_type.clone(),
+        }),
+        // calcard decodes a 3.0 `ENCODING=b` payload but still delivers it as
+        // `Text` — of the *decoded* bytes. A URI is the only text form the RFCs
+        // allow here, so anything without a scheme is that decoded payload.
+        VCardValue::Text(text) if !text.trim().is_empty() => {
+            let trimmed = text.trim();
+            if looks_like_uri(trimmed) {
+                Some(Photo::Uri(trimmed.to_owned()))
+            } else {
+                Some(Photo::Bytes {
+                    // The bytes went through a &str, so this is only exact for
+                    // payloads that happened to be valid UTF-8 — real JPEG and
+                    // PNG data is not. Prefer the Binary arm above, which 4.0
+                    // data: URIs take; this is the best that can be done with
+                    // what the parser kept.
+                    data: text.as_bytes().to_vec(),
+                    content_type: None,
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a PHOTO text value is a URI rather than a decoded inline payload:
+/// an RFC 3986 scheme followed by `:`.
+fn looks_like_uri(s: &str) -> bool {
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    let scheme = &s[..colon];
+    !scheme.is_empty()
+        && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /* ------------------------------------------------------------------ */
@@ -870,5 +985,84 @@ END:VCARD\r\n";
     fn a_document_with_no_vcard_is_none() {
         let contact = parsed();
         assert!(patch_vcard("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", &contact).is_none());
+    }
+}
+
+#[cfg(test)]
+mod photo_tests {
+    use super::*;
+
+    #[test]
+    fn an_inline_base64_photo_decodes_to_bytes() {
+        // "AAAABBBB" is valid base64 for six bytes.
+        let raw = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:x\r\nFN:Ada\r\n\
+PHOTO;ENCODING=b;TYPE=JPEG:AAAABBBB\r\nEND:VCARD\r\n";
+        match photo(raw) {
+            Some(Photo::Bytes { data, .. }) => assert!(!data.is_empty()),
+            other => panic!("expected inline bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_uri_photo_is_returned_unfetched() {
+        let raw = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:x\r\nFN:Ada\r\n\
+PHOTO:https://example.com/ada.jpeg\r\nEND:VCARD\r\n";
+        assert_eq!(
+            photo(raw),
+            Some(Photo::Uri("https://example.com/ada.jpeg".into()))
+        );
+    }
+
+    #[test]
+    fn a_card_without_a_photo_yields_none() {
+        let raw = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:x\r\nFN:Ada\r\nEND:VCARD\r\n";
+        assert_eq!(photo(raw), None);
+        assert_eq!(photo(""), None);
+        assert_eq!(photo("not a vcard"), None);
+    }
+
+    /// A data: URI (the 4.0 inline form) must come back as bytes, not as a URI
+    /// string the UI would then have to parse itself.
+    #[test]
+    fn a_data_uri_photo_decodes_to_bytes() {
+        // A 1x1 PNG, base64-encoded.
+        let raw = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:x\r\nFN:Ada\r\n\
+PHOTO:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\r\nEND:VCARD\r\n";
+        match photo(raw) {
+            Some(Photo::Bytes { data, content_type }) => {
+                assert!(data.starts_with(&[0x89, b'P', b'N', b'G']), "not decoded to PNG bytes");
+                assert_eq!(content_type.as_deref(), Some("image/png"));
+            }
+            other => panic!("expected decoded bytes, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn a_multi_card_file_splits_into_verbatim_segments() {
+        let text = "BEGIN:VCARD\r\nUID:a\r\nFN:Ada\r\nX-KEEP:me\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nUID:b\r\nFN:Bob\r\nEND:VCARD\r\n";
+        let parts = split_vcards(text);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("X-KEEP:me\r\n"));
+        assert!(!parts[0].contains("Bob"));
+        assert_eq!(parts.concat(), text, "splitting changed bytes");
+    }
+
+    #[test]
+    fn junk_between_cards_is_dropped_and_a_truncated_card_is_not_returned() {
+        let text = "noise\nBEGIN:VCARD\nUID:a\nEND:VCARD\nnoise\nBEGIN:VCARD\nUID:cut";
+        let parts = split_vcards(text);
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].starts_with("BEGIN:VCARD"));
+    }
+
+    #[test]
+    fn empty_input_yields_nothing() {
+        assert!(split_vcards("").is_empty());
     }
 }

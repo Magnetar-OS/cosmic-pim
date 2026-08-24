@@ -21,9 +21,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::StoreError;
+use super::{ImportSummary, StoreError};
 use crate::model::{CalendarMeta, Contact};
-use crate::vcard::{parse_vcards, to_vcard};
+use crate::vcard::{parse_vcards, split_vcards, to_vcard};
 
 /// Where address books live: `$XDG_DATA_HOME/contacts`.
 ///
@@ -217,6 +217,75 @@ impl ContactStore {
             }
         }
         Ok(())
+    }
+
+    /// Imports the cards from a `.vcf` document into `book_id`.
+    ///
+    /// UID-keyed, mirroring the calendar's `import_ics`: a card whose UID is
+    /// already in the book replaces that contact's file, so re-importing the
+    /// same export updates rather than duplicates — which is what makes this
+    /// usable as the handler for opening a `.vcf` from a file manager.
+    ///
+    /// Each card's **verbatim segment** is written, not a re-serialisation, so
+    /// an imported card keeps its PHOTO and everything else the model does not
+    /// carry. Same invariant as editing, met the same way.
+    pub fn import_vcf(&mut self, text: &str, book_id: &str) -> Result<ImportSummary, StoreError> {
+        let meta = self
+            .book(book_id)
+            .ok_or_else(|| StoreError::UnknownCalendar(book_id.to_owned()))?
+            .clone();
+        if meta.read_only {
+            return Err(StoreError::ReadOnly(meta.name));
+        }
+
+        let existing: Vec<Contact> = read_book(&meta);
+        let mut summary = ImportSummary::default();
+
+        for segment in split_vcards(text) {
+            let Some(card) = parse_vcards(&segment, book_id, "").into_iter().next() else {
+                // A segment calcard cannot parse would be written as a file no
+                // reader could use; skip it rather than plant it.
+                tracing::warn!(book_id, "skipping an unparseable card in the import");
+                continue;
+            };
+
+            let file_name = match existing.iter().find(|c| c.uid == card.uid) {
+                Some(known) => {
+                    summary.updated += 1;
+                    known.file_name.clone()
+                }
+                None => {
+                    summary.added += 1;
+                    format!("{}.vcf", super::sanitise_file_stem(&card.uid))
+                }
+            };
+
+            write_contact_raw(&meta, &file_name, &segment)?;
+        }
+        Ok(summary)
+    }
+
+    /// Serialises a whole book as one `.vcf` document — the cards' stored
+    /// bytes, concatenated, so nothing is lost in the export either.
+    pub fn export_book(&self, book_id: &str) -> Result<String, StoreError> {
+        let meta = self
+            .book(book_id)
+            .ok_or_else(|| StoreError::UnknownCalendar(book_id.to_owned()))?;
+
+        let mut out = String::new();
+        for contact in read_book(meta) {
+            // `raw` is the file's verbatim text; a card this app created and
+            // never re-read is serialised from the model instead.
+            if contact.raw.trim().is_empty() {
+                out.push_str(&to_vcard(&contact));
+            } else {
+                out.push_str(&contact.raw);
+                if !contact.raw.ends_with('\n') {
+                    out.push_str("\r\n");
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Creates a new address book on disk.
@@ -451,5 +520,78 @@ PHOTO;ENCODING=b:AAAABBBB\r\nX-ABShowAs:COMPANY\r\nEND:VCARD\r\n";
             "clearing the list removed a grouped address it does not own"
         );
         assert!(on_disk.contains("PHOTO;ENCODING=b:AAAABBBB"));
+    }
+}
+
+#[cfg(test)]
+mod import_export_tests {
+    use super::*;
+    use crate::model::Rgb;
+
+    const TWO_CARDS: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:ada@x\r\nFN:Ada\r\n\
+PHOTO;ENCODING=b:AAAABBBB\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob@x\r\nFN:Bob\r\nEND:VCARD\r\n";
+
+    fn store() -> (tempfile::TempDir, ContactStore, CalendarMeta) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ContactStore::open(&dir.path().join("contacts")).unwrap();
+        let meta = store.create_book("Personal", Rgb(1, 2, 3)).unwrap();
+        (dir, store, meta)
+    }
+
+    #[test]
+    fn a_multi_card_import_lands_one_file_per_card_with_its_own_bytes() {
+        let (_dir, mut store, meta) = store();
+
+        let summary = store.import_vcf(TWO_CARDS, &meta.id).unwrap();
+        assert_eq!((summary.added, summary.updated), (2, 0));
+
+        let ada = std::fs::read_to_string(meta.path.join("ada-x.vcf")).unwrap();
+        assert!(ada.contains("PHOTO;ENCODING=b:AAAABBBB"), "{ada}");
+        assert!(
+            !ada.contains("Bob"),
+            "one card's file carries the whole import: {ada}"
+        );
+    }
+
+    #[test]
+    fn reimporting_updates_rather_than_duplicates() {
+        let (_dir, mut store, meta) = store();
+        store.import_vcf(TWO_CARDS, &meta.id).unwrap();
+
+        let summary = store.import_vcf(TWO_CARDS, &meta.id).unwrap();
+        assert_eq!((summary.added, summary.updated), (0, 2));
+        assert_eq!(store.contacts().len(), 2);
+    }
+
+    #[test]
+    fn an_import_into_a_read_only_book_is_refused() {
+        let (_dir, mut store, meta) = store();
+        let mut frozen = meta.clone();
+        frozen.read_only = true;
+        // Route through the store with a doctored book list is intrusive;
+        // exercising write_contact_raw's own guard covers the same invariant.
+        assert!(write_contact_raw(&frozen, "x.vcf", "BEGIN:VCARD\r\nEND:VCARD\r\n").is_err());
+    }
+
+    #[test]
+    fn export_concatenates_verbatim_and_reimports_cleanly() {
+        let (_dir, mut store, meta) = store();
+        store.import_vcf(TWO_CARDS, &meta.id).unwrap();
+
+        let exported = store.export_book(&meta.id).unwrap();
+        assert!(exported.contains("PHOTO;ENCODING=b:AAAABBBB"), "{exported}");
+
+        // Round trip into a second book: everything arrives, nothing doubles.
+        let book2 = store.create_book("Second", Rgb(4, 5, 6)).unwrap();
+        let summary = store.import_vcf(&exported, &book2.id).unwrap();
+        assert_eq!((summary.added, summary.updated), (2, 0));
+    }
+
+    #[test]
+    fn garbage_imports_zero_and_says_so() {
+        let (_dir, mut store, meta) = store();
+        let summary = store.import_vcf("not a vcard at all", &meta.id).unwrap();
+        assert_eq!(summary.total(), 0);
     }
 }
