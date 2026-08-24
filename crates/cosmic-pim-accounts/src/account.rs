@@ -66,6 +66,15 @@ pub enum Transport {
 /// account store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailEndpoint {
+    /// Which protocol to read this account's mail with.
+    ///
+    /// A property of the endpoint rather than something probed per pass: a
+    /// provider that offers both IMAP and JMAP has a better answer than a
+    /// capability check does, and a user who wants the other one has said so
+    /// once rather than fighting a heuristic every cycle.
+    #[serde(default)]
+    pub protocol: crate::provider::MailProtocol,
+
     pub imap_host: String,
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
@@ -95,6 +104,18 @@ pub struct MailEndpoint {
     /// often a user id, and a provider with aliases lets one login send as
     /// several addresses. Empty falls back to the IMAP username when that looks
     /// like an address, which covers the common case without asking.
+    /// The JMAP session resource, for [`crate::provider::MailProtocol::Jmap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jmap_session_url: Option<String>,
+
+    /// The POP3 server, for [`crate::provider::MailProtocol::Pop3`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pop3_host: String,
+    #[serde(default = "default_pop3_port")]
+    pub pop3_port: u16,
+    #[serde(default)]
+    pub pop3_transport: Transport,
+
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -109,11 +130,16 @@ fn default_imap_port() -> u16 {
     993
 }
 
+fn default_pop3_port() -> u16 {
+    995
+}
+
 impl MailEndpoint {
     /// The conventional endpoint for a host: implicit TLS on 993 and 465.
     #[must_use]
     pub fn tls(imap_host: impl Into<String>) -> Self {
         Self {
+            protocol: crate::provider::MailProtocol::Imap,
             imap_host: imap_host.into(),
             imap_port: default_imap_port(),
             imap_transport: Transport::Tls,
@@ -121,6 +147,10 @@ impl MailEndpoint {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_transport: Transport::Tls,
+            jmap_session_url: None,
+            pop3_host: String::new(),
+            pop3_port: default_pop3_port(),
+            pop3_transport: Transport::Tls,
             from_address: String::new(),
             from_name: String::new(),
         }

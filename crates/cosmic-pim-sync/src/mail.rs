@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use cosmic_pim_accounts::{Account, MailEndpoint};
+use cosmic_pim_accounts::{Account, MailEndpoint, MailProtocol};
 use cosmic_pim_mail::imap::{Endpoint, Security, Session, SyncOptions};
 use cosmic_pim_mail::maildir::{MaildirStore, mailbox_path};
 use cosmic_pim_mail::{Credentials, Folder, SmtpEndpoint};
@@ -111,6 +111,23 @@ pub fn sync_account_mail(
         return Ok(MailReport::default());
     };
 
+    // Which protocol is a stored property of the endpoint, not a probe. See
+    // `MailEndpoint::protocol`.
+    match mail.protocol {
+        MailProtocol::Imap => sync_over_imap(account, mail, credentials, mail_root, options, now_ms),
+        MailProtocol::Jmap => sync_over_jmap(account, mail, credentials, mail_root),
+        MailProtocol::Pop3 => sync_over_pop3(account, mail, credentials, mail_root, now_ms),
+    }
+}
+
+fn sync_over_imap(
+    account: &Account,
+    mail: &MailEndpoint,
+    credentials: &Credentials,
+    mail_root: &Path,
+    options: SyncOptions,
+    now_ms: i64,
+) -> Result<MailReport> {
     let mut report = MailReport::default();
 
     let mut session = Session::connect(&imap_endpoint(account, mail), credentials)
@@ -153,6 +170,156 @@ pub fn sync_account_mail(
     }
 
     Ok(report)
+}
+
+/// How much of a mailbox one JMAP pass brings down.
+///
+/// A bound rather than everything: `Email/query` is sorted newest-first, so
+/// this means "the most recent 500" and a twenty-year archive backfills over
+/// several passes instead of one enormous one.
+const JMAP_WINDOW: usize = 500;
+
+fn sync_over_jmap(
+    account: &Account,
+    mail: &MailEndpoint,
+    credentials: &Credentials,
+    mail_root: &Path,
+) -> Result<MailReport> {
+    use cosmic_pim_mail::jmap;
+
+    let Some(session_url) = mail.jmap_session_url.as_deref() else {
+        return Err(Error::Mail(cosmic_pim_mail::Error::Jmap(
+            "this account is set to use JMAP but names no session resource".to_owned(),
+        )));
+    };
+
+    let session = jmap::Session::connect(session_url, account.mail_username(), credentials)
+        .map_err(Error::Mail)?;
+
+    let mut report = MailReport::default();
+
+    for mailbox in session.mailboxes().map_err(Error::Mail)? {
+        // JMAP has no wire/display distinction — a mailbox name is a name —
+        // but the local directory still has to be a legal path, so it goes
+        // through the same naming the IMAP path uses.
+        let folder = cosmic_pim_mail::Folder {
+            wire_name: mailbox.id.clone(),
+            display_name: mailbox.name.clone(),
+            delimiter: '/',
+            special_use: mailbox.role.as_deref().and_then(special_use),
+            no_select: false,
+        };
+
+        let outcome = (|| {
+            let path = mailbox_path(mail_root, &account.id, &folder);
+            let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
+            let mut state = jmap::JmapState::load(&path);
+            let outcome =
+                jmap::sync_mailbox(&session, &mailbox.id, &mut store, &mut state, JMAP_WINDOW)
+                    .map_err(Error::Mail)?;
+            state.save(&path).map_err(Error::Mail)?;
+            Ok(SyncOutcome {
+                fetched: outcome.fetched,
+                reflagged: outcome.reflagged,
+                removed: outcome.removed,
+                ..Default::default()
+            })
+        })();
+
+        report.mailboxes.push(MailboxReport {
+            wire_name: mailbox.id,
+            display_name: mailbox.name,
+            outcome,
+        });
+    }
+
+    Ok(report)
+}
+
+/// JMAP's roles and IMAP's SPECIAL-USE attributes carry the same information
+/// under different names, and the store keys folder layout on ours.
+fn special_use(role: &str) -> Option<cosmic_pim_mail::SpecialUse> {
+    use cosmic_pim_mail::SpecialUse;
+    Some(match role {
+        "inbox" => SpecialUse::Inbox,
+        "sent" => SpecialUse::Sent,
+        "drafts" => SpecialUse::Drafts,
+        "trash" => SpecialUse::Trash,
+        "junk" => SpecialUse::Junk,
+        "archive" => SpecialUse::Archive,
+        _ => return None,
+    })
+}
+
+fn sync_over_pop3(
+    account: &Account,
+    mail: &MailEndpoint,
+    credentials: &Credentials,
+    mail_root: &Path,
+    now_ms: i64,
+) -> Result<MailReport> {
+    use cosmic_pim_mail::pop3;
+
+    // POP3 has exactly one mailbox and no way to name another, so the maildir
+    // is the account's inbox and nothing else is walked.
+    let folder = cosmic_pim_mail::Folder {
+        wire_name: "INBOX".to_owned(),
+        display_name: "Inbox".to_owned(),
+        delimiter: '/',
+        special_use: Some(cosmic_pim_mail::SpecialUse::Inbox),
+        no_select: false,
+    };
+
+    let endpoint = pop3::Endpoint {
+        host: if mail.pop3_host.trim().is_empty() {
+            mail.imap_host.clone()
+        } else {
+            mail.pop3_host.clone()
+        },
+        port: mail.pop3_port,
+        security: security(mail.pop3_transport),
+        username: account.mail_username().to_owned(),
+    };
+
+    let mut session = pop3::Session::connect(&endpoint, credentials).map_err(Error::Mail)?;
+
+    let path = mailbox_path(mail_root, &account.id, &folder);
+    let outcome = (|| {
+        let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
+        let mut state = pop3::Pop3State::load(&path);
+        // Leave everything on the server. Deleting is a decision only the user
+        // can make — the same mailbox is very often also read on a phone — and
+        // a default that removes mail is not one to arrive at by omission.
+        let outcome = pop3::sync_inbox(
+            &mut session,
+            &mut store,
+            &mut state,
+            pop3::Retention::LeaveOnServer,
+            now_ms,
+        )
+        .map_err(Error::Mail)?;
+        state.save(&path).map_err(Error::Mail)?;
+        Ok(SyncOutcome {
+            fetched: outcome.fetched,
+            ..Default::default()
+        })
+    })();
+
+    // QUIT applies deletions; skipping it on the error path is deliberate.
+    if outcome.is_ok()
+        && let Err(why) = session.quit()
+    {
+        tracing::debug!(account = account.display_name, %why, "POP3 QUIT failed");
+    }
+
+    Ok(MailReport {
+        mailboxes: vec![MailboxReport {
+            wire_name: folder.wire_name,
+            display_name: folder.display_name,
+            outcome,
+        }],
+        ..Default::default()
+    })
 }
 
 fn sync_one(
@@ -216,6 +383,7 @@ mod tests {
     fn account_with_mail() -> Account {
         let mut account = Account::new("Work", "https://dav.example/", "ada@example.com");
         account.mail = Some(MailEndpoint {
+            protocol: MailProtocol::Imap,
             imap_host: "imap.example.com".into(),
             imap_port: 993,
             imap_transport: Transport::Tls,
@@ -223,6 +391,10 @@ mod tests {
             smtp_host: String::new(),
             smtp_port: 587,
             smtp_transport: Transport::StartTls,
+            jmap_session_url: None,
+            pop3_host: String::new(),
+            pop3_port: 995,
+            pop3_transport: Transport::Tls,
             from_address: "ada@example.com".into(),
             from_name: "Ada".into(),
         });

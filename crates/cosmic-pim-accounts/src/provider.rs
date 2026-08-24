@@ -203,6 +203,7 @@ impl MailService {
     #[must_use]
     pub fn endpoint_for(&self, username: &str) -> MailEndpoint {
         MailEndpoint {
+            protocol: self.protocol,
             imap_host: self.imap_host.clone(),
             imap_port: self.imap_port,
             imap_transport: self.imap_transport,
@@ -210,6 +211,10 @@ impl MailService {
             smtp_host: self.smtp_host.clone(),
             smtp_port: self.smtp_port,
             smtp_transport: self.smtp_transport,
+            jmap_session_url: self.jmap_session_url.clone(),
+            pop3_host: self.pop3_host.clone(),
+            pop3_port: self.pop3_port,
+            pop3_transport: self.pop3_transport,
             from_address: username.to_owned(),
             from_name: String::new(),
         }
@@ -240,6 +245,25 @@ impl Provider {
 /// character that matters there is `/`, which no provider allows in a login.
 fn substitute(template: &str, username: &str) -> String {
     template.replace("{username}", username)
+}
+
+impl Provider {
+    /// A ready-to-store account for this provider.
+    ///
+    /// Fills in every address the manifest knows so that adding an account is
+    /// one question — who are you — rather than the eight-field dialog that
+    /// asks a user for an IMAP hostname they have never heard of. What it does
+    /// *not* do is store anything: the caller pairs this with the credential
+    /// and hands both to [`crate::AccountStore`], which keeps "an account
+    /// exists" and "its secret is saved" from ever being separable.
+    #[must_use]
+    pub fn account_for(&self, username: &str) -> crate::Account {
+        let mut account = crate::Account::new(&self.name, "", username);
+        account.provider = Some(self.id.clone());
+        account.url = self.calendar_url(username).unwrap_or_default();
+        account.mail = self.services.mail.as_ref().map(|m| m.endpoint_for(username));
+        account
+    }
 }
 
 /// Every provider this installation knows about.
@@ -597,6 +621,47 @@ mod tests {
         // Google Workspace on a custom domain is not detectable here, and
         // guessing would send a Nextcloud user through a Google sign-in.
         assert_eq!(registry.for_email("ada@example.com"), None);
+    }
+
+    #[test]
+    fn an_account_created_from_a_provider_needs_no_further_questions() {
+        // The point of the registry: adding a Fastmail account should ask who
+        // you are and nothing else — not for an IMAP hostname, a port, a
+        // CalDAV path, or a submission server.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let fastmail = registry.get("fastmail").expect("built in");
+
+        let account = fastmail.account_for("ada@fastmail.com");
+
+        assert_eq!(account.provider.as_deref(), Some("fastmail"));
+        assert_eq!(
+            account.url,
+            "https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/"
+        );
+
+        let mail = account.mail.expect("mail endpoints");
+        assert_eq!(mail.protocol, MailProtocol::Jmap);
+        assert_eq!(mail.jmap_session_url.as_deref(), Some("https://api.fastmail.com/jmap/session"));
+        // …and the IMAP details are still filled in, because a user who
+        // prefers IMAP changes one field rather than typing four.
+        assert_eq!(mail.imap_host, "imap.fastmail.com");
+        assert_eq!(mail.smtp_host, "smtp.fastmail.com");
+    }
+
+    #[test]
+    fn a_provider_with_no_calendar_leaves_the_url_empty_rather_than_wrong() {
+        // Outlook.com withdrew CalDAV. Inventing an address would produce an
+        // account that fails every pass against a server that was never there.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let microsoft = registry.get("microsoft").expect("built in");
+
+        let account = microsoft.account_for("ada@outlook.com");
+
+        assert!(account.url.is_empty());
+        assert_eq!(
+            account.mail.expect("mail endpoints").imap_host,
+            "outlook.office365.com"
+        );
     }
 
     #[test]
