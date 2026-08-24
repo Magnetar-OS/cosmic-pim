@@ -86,6 +86,7 @@ pub mod maildir;
 pub mod model;
 pub mod outbox;
 pub mod plan;
+pub mod pop3;
 pub mod push;
 pub mod sasl;
 pub mod search;

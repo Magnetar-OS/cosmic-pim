@@ -37,6 +37,14 @@ pub enum Error {
     #[error("SMTP: {0}")]
     Smtp(String),
 
+    /// POP3 said no, or said something unusable.
+    ///
+    /// Its own variant rather than folded into [`Error::Imap`]: the two have
+    /// different consequences and a message that says IMAP about a POP3 account
+    /// sends whoever reads it looking in the wrong place.
+    #[error("POP3: {0}")]
+    Pop3(String),
+
     #[error("{0}")]
     Discovery(String),
 
