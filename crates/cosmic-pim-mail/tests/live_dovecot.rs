@@ -239,3 +239,66 @@ fn a_real_idle_wakes_when_mail_arrives() {
     );
     let _ = watcher.logout();
 }
+
+#[test]
+fn a_deletion_by_another_client_arrives_with_the_next_delta_not_the_next_reconcile() {
+    // QRESYNC's whole contribution. Without it, a message deleted on a phone
+    // lingers on the desktop until the periodic full reconciliation — up to
+    // ten cycles of a mailbox showing mail that is not there.
+    let Some((base, credentials)) = server() else {
+        eprintln!("PIM_TEST_IMAP not set; skipping the live QRESYNC test");
+        return;
+    };
+    let endpoint = fresh_user(&base);
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // This client establishes a cursor with the message present.
+    let mut session = connect(&endpoint, &credentials);
+    session
+        .append("INBOX", MESSAGE, Flags::default())
+        .expect("APPEND");
+    let mut store = MaildirStore::open(dir.path().join("INBOX")).expect("maildir");
+    sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0).expect("first sync");
+    // The Dovecot quirk again: the first SELECT of an APPEND-created mailbox
+    // carries no MODSEQ, so a second cycle is what arms the delta cursor.
+    sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0)
+        .expect("arming sync");
+    let state = store.state().expect("state");
+    assert_eq!(state.entries.len(), 1);
+    assert!(
+        state.cursor.highest_modseq > 0,
+        "no delta cursor, so this test would not be testing the delta path"
+    );
+    let uid = *state.entries.keys().next().expect("one uid");
+
+    // Another client deletes it. Its own sync is what SELECTs the mailbox,
+    // which the delete needs.
+    let mut other = connect(&endpoint, &credentials);
+    let mut other_store = MaildirStore::open(dir.path().join("other")).expect("maildir");
+    sync_mailbox(
+        &mut other,
+        "INBOX",
+        &mut other_store,
+        SyncOptions::default(),
+        0,
+    )
+    .expect("other's sync");
+    use cosmic_pim_mail::push::Writeback as _;
+    other
+        .delete_message(uid)
+        .expect("delete from the other client");
+    let _ = other.logout();
+
+    // A plain cycle — no reconcile — must notice, via VANISHED.
+    let outcome = sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0)
+        .expect("delta sync");
+    assert_eq!(
+        outcome.removed, 1,
+        "the deletion did not arrive with the delta: {outcome:?}"
+    );
+    assert!(
+        store.state().expect("state").entries.is_empty(),
+        "the mailbox still shows a message another client deleted"
+    );
+    let _ = session.logout();
+}

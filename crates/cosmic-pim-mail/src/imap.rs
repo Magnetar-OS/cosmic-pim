@@ -117,6 +117,9 @@ pub struct Session {
     /// already in.
     selected: Option<String>,
     condstore: bool,
+    /// QRESYNC on top of CONDSTORE: the same delta round trip also carries
+    /// the deletions, as VANISHED responses.
+    qresync: bool,
 }
 
 impl std::fmt::Debug for Session {
@@ -173,21 +176,36 @@ impl Session {
         // cycle silently took the full-reconciliation path instead of the
         // delta. The ENABLE is best-effort — a server that advertises the
         // capability but rejects the command is treated as not having it.
-        let condstore = inner
-            .capabilities()
-            .is_ok_and(|caps| caps.has_str("CONDSTORE"))
+        // QRESYNC preferred — enabling it enables CONDSTORE semantics too, and
+        // adds VANISHED, which is how a deletion made by another client
+        // arrives in the same round trip as the flag deltas instead of
+        // waiting for the periodic full reconciliation. CONDSTORE alone is
+        // the fallback; nothing at all falls back to full reconciliation.
+        let caps = inner.capabilities();
+        let has = |name: &str| caps.as_ref().is_ok_and(|caps| caps.has_str(name));
+        let qresync = has("QRESYNC")
             && inner
-                .run_command_and_check_ok("ENABLE CONDSTORE")
+                .run_command_and_check_ok("ENABLE QRESYNC")
                 .map_err(|why| {
-                    tracing::debug!(%why, "ENABLE CONDSTORE was refused; using full reconciliation");
+                    tracing::debug!(%why, "ENABLE QRESYNC was refused; trying CONDSTORE");
                     why
                 })
                 .is_ok();
+        let condstore = qresync
+            || (has("CONDSTORE")
+                && inner
+                    .run_command_and_check_ok("ENABLE CONDSTORE")
+                    .map_err(|why| {
+                        tracing::debug!(%why, "ENABLE CONDSTORE was refused; using full reconciliation");
+                        why
+                    })
+                    .is_ok());
 
         Ok(Self {
             inner,
             selected: None,
             condstore,
+            qresync,
         })
     }
 
@@ -463,7 +481,7 @@ pub fn sync_mailbox(
     let server_modseq = mailbox.highest_mod_seq.unwrap_or(0);
     if session.condstore && cursor.highest_modseq > 0 && server_modseq > cursor.highest_modseq {
         match fetch_flag_deltas(session, cursor.highest_modseq) {
-            Ok(deltas) => {
+            Ok((deltas, vanished)) => {
                 let held = store.state()?.entries;
                 for (uid, flags) in deltas {
                     if let Some(local) = held.get(&uid) {
@@ -472,6 +490,15 @@ pub fn sync_mailbox(
                             store.set_flags(uid, merged)?;
                             outcome.reflagged += 1;
                         }
+                    }
+                }
+                // QRESYNC's whole contribution: a deletion another client made
+                // leaves this store now, in the same round trip as the flags,
+                // instead of lingering until the periodic reconciliation.
+                for uid in vanished {
+                    if held.contains_key(&uid) {
+                        store.remove(uid)?;
+                        outcome.removed += 1;
                     }
                 }
                 cursor.highest_modseq = server_modseq;
@@ -576,16 +603,34 @@ fn fetch_batch(session: &mut Session, uids: &[u32]) -> Result<Vec<RemoteMessage>
     Ok(fetches.iter().filter_map(remote_message).collect())
 }
 
-/// Every flag change since `modseq`, in one round trip.
-fn fetch_flag_deltas(session: &mut Session, modseq: u64) -> Result<Vec<(u32, Flags)>> {
-    let fetches = session
-        .inner
-        .uid_fetch("1:*", format!("(FLAGS) (CHANGEDSINCE {modseq})"))
-        .map_err(imap_error)?;
-    Ok(fetches
+/// Every flag change since `modseq` — and, with QRESYNC, every deletion —
+/// in one round trip.
+fn fetch_flag_deltas(session: &mut Session, modseq: u64) -> Result<(Vec<(u32, Flags)>, Vec<u32>)> {
+    // The VANISHED modifier is only legal once QRESYNC is enabled; sending it
+    // to a CONDSTORE-only server is a BAD.
+    let query = if session.qresync {
+        format!("(FLAGS) (CHANGEDSINCE {modseq} VANISHED)")
+    } else {
+        format!("(FLAGS) (CHANGEDSINCE {modseq})")
+    };
+    let fetches = session.inner.uid_fetch("1:*", query).map_err(imap_error)?;
+    let deltas = fetches
         .iter()
         .filter_map(|fetch| Some((fetch.uid?, Flags::from_imap(fetch.flags()))))
-        .collect())
+        .collect();
+
+    // VANISHED (EARLIER) arrives as an unsolicited response alongside the
+    // fetch. Drained here, right after the command that provoked it, so the
+    // deletions are attributed to the window that reported them.
+    let mut vanished = Vec::new();
+    for response in session.inner.take_all_unsolicited() {
+        if let imap::types::UnsolicitedResponse::Vanished { uids, .. } = response {
+            for range in uids {
+                vanished.extend(range);
+            }
+        }
+    }
+    Ok((deltas, vanished))
 }
 
 /// The complete UID set with flags — the authoritative listing a full
