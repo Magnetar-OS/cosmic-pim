@@ -19,12 +19,20 @@ scopes = [
     "email",
     "profile",
     "offline_access",
+    # Graph. Mail.ReadWrite covers the delta feed, $value and the flag PATCH;
+    # Mail.Send covers submission without SMTP.
+    "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/Mail.Send",
+    # Kept so a tenant that still allows IMAP needs no re-consent.
     "https://outlook.office.com/IMAP.AccessAsUser.All",
     "https://outlook.office.com/SMTP.Send",
 ]
 
 [services.mail]
-protocol = "imap"
+# Graph rather than IMAP: tenants increasingly have IMAP and SMTP AUTH
+# switched off by policy, at which point Graph is the only way in. The IMAP
+# details stay filled in for tenants that still allow it.
+protocol = "graph"
 imap_host = "outlook.office365.com"
 imap_port = 993
 imap_transport = "tls"

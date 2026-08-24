@@ -196,6 +196,16 @@ pub enum MailProtocol {
     /// Download-and-forget. No folders, no server-side flags — see
     /// `cosmic_pim_mail::pop3` for what that costs.
     Pop3,
+    /// The Gmail API. Chosen over IMAP for a Google account because IMAP
+    /// cannot express an archive — Gmail has no Archive folder, only the
+    /// removal of the INBOX label — so a change made on a phone stays
+    /// invisible until a full reconcile.
+    Gmail,
+    /// Microsoft Graph. Chosen over IMAP for a Microsoft account because
+    /// tenants increasingly have IMAP switched off, and because Graph's delta
+    /// queries are what IMAP's CONDSTORE would be if Exchange implemented it
+    /// consistently.
+    Graph,
 }
 
 impl MailService {
@@ -621,6 +631,43 @@ mod tests {
         // Google Workspace on a custom domain is not detectable here, and
         // guessing would send a Nextcloud user through a Google sign-in.
         assert_eq!(registry.for_email("ada@example.com"), None);
+    }
+
+    #[test]
+    fn google_and_microsoft_default_to_their_own_apis() {
+        // Not a preference: IMAP cannot express a Gmail archive, and a
+        // Microsoft tenant may have IMAP switched off entirely. The IMAP
+        // details stay filled in so switching back is one field.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+
+        let google = registry.get("google").unwrap().services.mail.as_ref().unwrap();
+        assert_eq!(google.protocol, MailProtocol::Gmail);
+        assert_eq!(google.imap_host, "imap.gmail.com");
+
+        let microsoft = registry
+            .get("microsoft")
+            .unwrap()
+            .services
+            .mail
+            .as_ref()
+            .unwrap();
+        assert_eq!(microsoft.protocol, MailProtocol::Graph);
+        assert_eq!(microsoft.imap_host, "outlook.office365.com");
+    }
+
+    #[test]
+    fn the_api_scopes_are_requested_alongside_the_imap_ones() {
+        // Asking for both means an account switched from the API to IMAP, or
+        // back, needs no second trip through a consent screen.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+
+        let google = registry.get("google").unwrap().oauth.as_ref().unwrap();
+        assert!(google.scopes.iter().any(|s| s.contains("gmail.modify")));
+        assert!(google.scopes.iter().any(|s| s == "https://mail.google.com/"));
+
+        let microsoft = registry.get("microsoft").unwrap().oauth.as_ref().unwrap();
+        assert!(microsoft.scopes.iter().any(|s| s.contains("Mail.ReadWrite")));
+        assert!(microsoft.scopes.iter().any(|s| s.contains("IMAP.AccessAsUser")));
     }
 
     #[test]

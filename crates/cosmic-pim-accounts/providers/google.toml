@@ -15,6 +15,9 @@ scopes = [
     "profile",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/carddav",
+    # The Gmail API. `mail.google.com` is the IMAP/SMTP scope and is kept so
+    # that an account switched back to IMAP needs no re-consent.
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://mail.google.com/",
 ]
 
@@ -31,7 +34,12 @@ calendar = "https://apidata.googleusercontent.com/caldav/v2/"
 contacts = "https://www.googleapis.com/carddav/v1/principals/{username}/"
 
 [services.mail]
-protocol = "imap"
+# The Gmail API rather than IMAP: archiving is the removal of the INBOX label
+# and IMAP has no way to say that, so an archive performed anywhere else stays
+# invisible to an IMAP client until a full-mailbox reconcile. The IMAP details
+# below stay filled in, because switching back is then one field rather than
+# four.
+protocol = "gmail"
 imap_host = "imap.gmail.com"
 imap_port = 993
 imap_transport = "tls"

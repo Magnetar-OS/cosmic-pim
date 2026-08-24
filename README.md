@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
 | [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
-| **cosmic-pim** | — | This substrate | 692 tests |
+| **cosmic-pim** | — | This substrate | 740 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
@@ -26,7 +26,7 @@ Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 | `cosmic-pim-caldav` | CalDAV **and** CardDAV — protocol, reconciliation, durable writeback queue, and a store trait implemented over the vdir |
 | `cosmic-pim-accounts` | Accounts and credentials: the OS keychain with an encrypted local fallback, and the provider manifests that say where a named service lives |
 | `cosmic-pim-auth` | OAuth 2.0 sign-in and token renewal — the only crate here that talks to a provider's login endpoint |
-| `cosmic-pim-mail` | Mail — the message model over verbatim RFC 5322 bytes, a maildir store, JWZ threading, HTML-to-visible-text extraction, and IMAP, JMAP and POP3 with durable writeback |
+| `cosmic-pim-mail` | Mail — the message model over verbatim RFC 5322 bytes, a maildir store, JWZ threading, HTML-to-visible-text extraction, and five engines (IMAP, JMAP, POP3, the Gmail API, Microsoft Graph) with durable writeback |
 | `cosmic-pim-sync` | The layer that joins `core`, `caldav`, and `accounts` — provisioning, one sync pass per account over calendars and address books, and the conflicts a pass could not resolve alone |
 
 Dependencies point downward only. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
@@ -128,7 +128,10 @@ together, failing per collection rather than per run:
 let reports = cosmic_pim_sync::sync_all(&mut accounts, &registry, &calendar_root, &contacts_root);
 ```
 
-Mail, in whichever protocol the account uses — IMAP, JMAP, or POP3:
+Mail, in whichever protocol the account uses — IMAP, JMAP, POP3, the Gmail API
+or Microsoft Graph. Every one of them lands in the same maildir, because each
+provider API is used as a change feed while the message bytes still come from
+its raw endpoint:
 
 ```rust
 let secret = cosmic_pim_auth::resolve(&mut accounts, &registry, &account.id)?;

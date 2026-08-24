@@ -132,6 +132,8 @@ pub fn sync_account_mail(
         MailProtocol::Imap => sync_over_imap(account, mail, credentials, mail_root, options, now_ms),
         MailProtocol::Jmap => sync_over_jmap(account, mail, credentials, mail_root, now_ms),
         MailProtocol::Pop3 => sync_over_pop3(account, mail, credentials, mail_root, now_ms),
+        MailProtocol::Gmail => sync_over_gmail(account, credentials, mail_root, now_ms),
+        MailProtocol::Graph => sync_over_graph(account, credentials, mail_root, now_ms),
     }
 }
 
@@ -182,6 +184,109 @@ fn sync_over_imap(
     // as a sync failure would mark a completely successful pass as broken.
     if let Err(why) = session.logout() {
         tracing::debug!(account = account.display_name, %why, "IMAP logout failed");
+    }
+
+    Ok(report)
+}
+
+/// How much of a Gmail label one bootstrap brings down.
+///
+/// A bound rather than everything: a twenty-year archive backfills over
+/// several passes instead of one enormous one, and `messages.list` is
+/// newest-first so the bound means "the most recent N".
+const GMAIL_WINDOW: usize = 500;
+
+/// Syncs a Google account over the Gmail API.
+///
+/// One maildir per canonical label — see `cosmic_pim_mail::gmail`. Every
+/// folder shares the account's history feed, so an archive shows up as a
+/// removal in one pass and a fetch in another, and both land in the same
+/// sync.
+fn sync_over_gmail(
+    account: &Account,
+    credentials: &Credentials,
+    mail_root: &Path,
+    now_ms: i64,
+) -> Result<MailReport> {
+    use cosmic_pim_mail::gmail;
+
+    let session = gmail::Session::connect(credentials).map_err(Error::Mail)?;
+    let mut report = MailReport::default();
+
+    for folder in gmail::folders() {
+        let slug = folder.wire_name.clone();
+        let outcome = (|| {
+            let path = mailbox_path(mail_root, &account.id, &folder);
+            let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
+            let mut state = gmail::state(&path);
+            let outcome = gmail::sync_folder(
+                &session,
+                &slug,
+                &mut store,
+                &mut state,
+                GMAIL_WINDOW,
+                now_ms,
+            )
+            .map_err(Error::Mail)?;
+            state.save(&path).map_err(Error::Mail)?;
+            Ok(SyncOutcome {
+                fetched: outcome.fetched,
+                reflagged: outcome.reflagged,
+                removed: outcome.removed,
+                pushed: outcome.pushed,
+                ..Default::default()
+            })
+        })();
+
+        report.mailboxes.push(MailboxReport {
+            wire_name: folder.wire_name,
+            display_name: folder.display_name,
+            outcome,
+        });
+    }
+
+    Ok(report)
+}
+
+/// Syncs a Microsoft account over Graph.
+///
+/// One delta cursor per folder, so a folder whose pass failed replays only
+/// itself.
+fn sync_over_graph(
+    account: &Account,
+    credentials: &Credentials,
+    mail_root: &Path,
+    now_ms: i64,
+) -> Result<MailReport> {
+    use cosmic_pim_mail::graph;
+
+    let session = graph::Session::connect(credentials).map_err(Error::Mail)?;
+    let mut report = MailReport::default();
+
+    for remote in session.folders().map_err(Error::Mail)? {
+        let folder = graph::folder_for(&remote);
+        let outcome = (|| {
+            let path = mailbox_path(mail_root, &account.id, &folder);
+            let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
+            let mut state = graph::state(&path);
+            let outcome =
+                graph::sync_folder(&session, &remote.id, &mut store, &mut state, now_ms)
+                    .map_err(Error::Mail)?;
+            state.save(&path).map_err(Error::Mail)?;
+            Ok(SyncOutcome {
+                fetched: outcome.fetched,
+                reflagged: outcome.reflagged,
+                removed: outcome.removed,
+                pushed: outcome.pushed,
+                ..Default::default()
+            })
+        })();
+
+        report.mailboxes.push(MailboxReport {
+            wire_name: remote.id,
+            display_name: folder.display_name,
+            outcome,
+        });
     }
 
     Ok(report)

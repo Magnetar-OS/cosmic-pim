@@ -49,6 +49,20 @@ Meltemi (https://github.com/entro314-labs/meltemi)
 `crates/cosmic-pim-caldav` and `crates/cosmic-pim-core/src/ical.rs` are
 derived from `src-tauri/src/caldav.rs` in the Meltemi project.
 
+`crates/cosmic-pim-mail/src/gmail.rs` takes its label-bits model, its
+history-expiry decision, and the shape of its delta loop from
+`src-tauri/src/gmail.rs`.
+
+`crates/cosmic-pim-mail/src/graph.rs` takes its delta-query state machine, its
+`@removed.reason` distinction, and its Exchange datetime fallback ladder from
+`src-tauri/src/graph.rs`. That file in turn credits ratatoskr (Apache-2.0) for
+the wire protocol and folder-alias table, and records two design ideas taken
+from ravn as ideas only, with no code reproduced. Both attributions carry
+forward here.
+
+In every case the storage half is new rather than ported: the donor drove
+SQLite, these drive a maildir.
+
 NOTE: at the time of extraction the Meltemi repository carried no licence
 declaration. Both projects share a copyright holder, so redistribution here
 under MPL-2.0 is authorised by that holder. See LICENSING.md for the

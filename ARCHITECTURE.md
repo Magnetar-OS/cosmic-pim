@@ -84,6 +84,9 @@ in one place and all three apps get it.
 | Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
 | IMAP | `mail::imap` | Session, cycle, and durable writeback. Not a DAV flavour. |
 | JMAP | `mail::jmap` | RFC 8620/8621. Metadata by API, bytes by blob download; incremental via `Email/changes`. |
+| Gmail | `mail::gmail` | The Gmail API. Labels are the folder model; bytes by `format=raw`. |
+| Microsoft Graph | `mail::graph` | Delta queries per folder; bytes by `$value`. |
+| Id and cursor bookkeeping | `mail::store::RemoteIds` | Shared by all three: string id → local UID, plus a change-feed cursor that can expire. |
 | POP3 | `mail::pop3` | RFC 1939, for accounts that offer nothing else. |
 | SMTP | `mail::smtp` | Sending, and the one failure that must never be auto-retried. |
 | Conversation lists | `mail::index` | A rebuildable SQLite cache, same standing as the calendar's. |
@@ -254,6 +257,25 @@ for metadata plus `blobId` only, and the message itself comes from the download
 endpoint as the original octets. One extra request per message, and it is not
 optional.
 
+**A provider API is a change feed, not a message store.** Gmail and Graph both
+serve the original RFC 5322 octets — `messages.get?format=raw` and
+`GET /me/messages/{id}/$value` — so an engine built on either stays inside the
+verbatim-bytes rule: the API says *what changed*, and the bytes come from the
+raw endpoint. Their parsed representations (Gmail's `format=full`, Graph's
+`body`) are one request cheaper and would invalidate the DKIM signature of
+every message they touched. This is why there is no second storage path for
+them, and why a JMAP, Gmail or Graph mailbox lands in a maildir that `mbsync`
+and `notmuch` read exactly like an IMAP one.
+
+**Every change feed has a horizon, and running off it is not an error.**
+`cannotCalculateChanges` in JMAP, 404 or 410 from Gmail's `history.list`, 410
+from a Graph delta link: all three mean *I cannot tell you what changed*. None
+of them means "nothing changed", which freezes the account until somebody
+notices, and none means "everything was deleted", which empties the maildir.
+The only correct answer is to drop the cursor and read again — which is why
+the full-read path in each engine is not an optimisation that can be removed
+once the incremental one works.
+
 **A JMAP write is confirmed, not merely unrefused.** `Email/set` reports
 per-object failures in `notUpdated` rather than as a method error, and names
 each success in `updated` — so a response mentioning an object in neither did
@@ -261,6 +283,17 @@ nothing at all. Treating absence of an error as success drops the queue entry
 with the user's change unmade and nothing anywhere to say so, which is the
 exact shape of loss the durable queue exists to prevent. The client requires
 the positive acknowledgement.
+
+**Gmail's read flag is inverted, and Graph's is not.** Gmail marks `UNREAD`;
+IMAP, maildir and Graph all mark what *has* been read. Two engines in one crate
+spelling the same state oppositely is precisely where a copy-paste marks an
+entire mailbox read on every device the account is on, so each engine's mapping
+is pinned by its own test.
+
+**A Graph `@removed` is not always a removal.** An entry carrying
+`@removed.reason == "changed"` is a property update wearing the tombstone
+shape — Exchange emits it when a message leaves the *filter*, not existence.
+Treating every tombstone as a delete silently drops mail somebody just edited.
 
 **POP3 is not a small IMAP, and is not pretended to be.** One mailbox, no
 folders, no server-side flags, nothing visible to a second device. Flags are
@@ -365,7 +398,7 @@ the moment the model existed, because the engine never parses what it stores.
 
 ## Testing
 
-Roughly 690 tests in the substrate, `cargo test --workspace`.
+Roughly 740 tests in the substrate, `cargo test --workspace`.
 
 The one worth knowing about is `caldav/tests/live_sync.rs`: a real HTTP server
 answering PROPFIND and REPORT with canned multistatus XML, driving the real
