@@ -977,7 +977,7 @@ pub fn state(maildir: &Path) -> JmapState {
 }
 
 /// What one JMAP pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JmapOutcome {
     pub fetched: usize,
     pub reflagged: usize,

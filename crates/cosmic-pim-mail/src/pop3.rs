@@ -485,7 +485,7 @@ impl Pop3State {
 }
 
 /// What one POP3 pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pop3Outcome {
     pub fetched: usize,
     /// Messages the server was asked to delete.

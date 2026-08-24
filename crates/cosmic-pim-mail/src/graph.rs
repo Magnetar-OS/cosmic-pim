@@ -542,7 +542,7 @@ impl Session {
 }
 
 /// What one Graph pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphOutcome {
     pub fetched: usize,
     pub reflagged: usize,

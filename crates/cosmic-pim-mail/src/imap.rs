@@ -163,9 +163,26 @@ impl Session {
         // CONDSTORE turns flag reconciliation from "ask about every message" to
         // "ask what changed", which is the difference between a round trip
         // proportional to the mailbox and one proportional to the news.
+        //
+        // Advertised is not enabled. RFC 7162 lets a server withhold
+        // HIGHESTMODSEQ until the client opts in, and a real Dovecot does
+        // exactly that — SELECT carries no MODSEQ at all until `ENABLE
+        // CONDSTORE` has been issued. The scripted test server sent it
+        // unconditionally, which is why this was invisible until the client
+        // ran against the real thing: the cursor stayed at zero and every
+        // cycle silently took the full-reconciliation path instead of the
+        // delta. The ENABLE is best-effort — a server that advertises the
+        // capability but rejects the command is treated as not having it.
         let condstore = inner
             .capabilities()
-            .is_ok_and(|caps| caps.has_str("CONDSTORE"));
+            .is_ok_and(|caps| caps.has_str("CONDSTORE"))
+            && inner
+                .run_command_and_check_ok("ENABLE CONDSTORE")
+                .map_err(|why| {
+                    tracing::debug!(%why, "ENABLE CONDSTORE was refused; using full reconciliation");
+                    why
+                })
+                .is_ok();
 
         Ok(Self {
             inner,
@@ -347,7 +364,7 @@ pub enum Watched {
 }
 
 /// What one cycle did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncOutcome {
     pub fetched: usize,
     pub reflagged: usize,
@@ -413,6 +430,14 @@ pub fn sync_mailbox(
 
     // --- Push, before anything reads the server's version of the flags ------
     outcome.pushed = push::drain(session, store, now_ms);
+    // A move or delete the drain just performed leaves the store now, on the
+    // strength of the server's own OK. Waiting for the reconciliation to
+    // notice would work for a partial mailbox and deadlock for a full one:
+    // a mailbox moved to empty produces exactly the empty-listing shape the
+    // mass-delete guard refuses to act on.
+    for uid in outcome.pushed.departed.clone() {
+        store.remove(uid)?;
+    }
 
     // --- Pull: UIDs above the cursor ---------------------------------------
     let state = store.state()?;

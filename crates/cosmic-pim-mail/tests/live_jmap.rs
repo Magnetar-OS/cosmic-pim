@@ -201,19 +201,16 @@ fn serve(emails: Vec<Email>) -> Server {
                 if quiet {
                     // Longer than any client timeout the tests use.
                     std::thread::sleep(std::time::Duration::from_secs(5));
-                    let _ = request.respond(
-                        tiny_http::Response::from_string("event: ping\ndata: {}\n\n"),
-                    );
+                    let _ = request.respond(tiny_http::Response::from_string(
+                        "event: ping\ndata: {}\n\n",
+                    ));
                     continue;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 let body = "event: state\ndata: {\"changed\":{}}\n\n";
                 let response = tiny_http::Response::from_string(body).with_header(
-                    tiny_http::Header::from_bytes(
-                        &b"Content-Type"[..],
-                        &b"text/event-stream"[..],
-                    )
-                    .expect("header"),
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..])
+                        .expect("header"),
                 );
                 let _ = request.respond(response);
                 continue;

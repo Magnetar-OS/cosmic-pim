@@ -671,7 +671,7 @@ fn fold_history(records: &[Value], delta: &mut HistoryDelta) {
 }
 
 /// What one Gmail pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GmailOutcome {
     pub fetched: usize,
     pub reflagged: usize,

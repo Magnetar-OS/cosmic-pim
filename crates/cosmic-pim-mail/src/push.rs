@@ -221,9 +221,18 @@ pub trait Writeback {
     fn delete_message(&mut self, uid: u32) -> crate::Result<()>;
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
     pub succeeded: usize,
+    /// UIDs whose Move or Delete reached the server this drain.
+    ///
+    /// The caller removes these from its store directly. A departure the
+    /// client itself performed must not wait for a full reconciliation to be
+    /// believed — and the reconciliation's mass-delete guard would in fact
+    /// *refuse* to believe it when the mailbox went to empty, because an
+    /// empty listing over a non-empty store is indistinguishable from the
+    /// server hiccup the guard exists for.
+    pub departed: Vec<u32>,
     /// Failed transiently and rescheduled.
     pub deferred: usize,
     /// Failed in a way a sync pass has to resolve.
@@ -266,6 +275,9 @@ pub fn drain(server: &mut impl Writeback, queue: &mut impl PushQueue, now_ms: i6
             Ok(()) => {
                 if let Err(why) = queue.resolve(uid) {
                     tracing::warn!(uid, %why, "push succeeded but the queue entry survived");
+                }
+                if matches!(entry.op, PushOp::Move { .. } | PushOp::Delete { .. }) {
+                    outcome.departed.push(uid);
                 }
                 outcome.succeeded += 1;
             }
