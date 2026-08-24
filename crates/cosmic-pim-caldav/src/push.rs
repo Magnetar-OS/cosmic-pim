@@ -388,7 +388,10 @@ mod tests {
 
         let pending = queue.pending();
         assert_eq!(pending.len(), 1, "the queue accumulated duplicate entries");
-        assert_eq!(pending[0].attempts, 0, "backoff was not reset by a new edit");
+        assert_eq!(
+            pending[0].attempts, 0,
+            "backoff was not reset by a new edit"
+        );
         assert_eq!(pending[0].next_attempt_ms, 0, "the new edit is not due now");
     }
 
@@ -525,7 +528,10 @@ mod tests {
         let outcome = drain(&client, &mut queue, 0);
 
         assert_eq!(outcome.needs_reconcile, 1);
-        assert_eq!(outcome.deferred, 0, "a stale etag was put on the retry schedule");
+        assert_eq!(
+            outcome.deferred, 0,
+            "a stale etag was put on the retry schedule"
+        );
 
         let entry = &queue.pending()[0];
         assert!(entry.blocked, "the doomed retry was left live");
@@ -559,8 +565,14 @@ mod tests {
 
             let outcome = drain(&client, &mut queue, 0);
 
-            assert_eq!(outcome.needs_user, 1, "HTTP {status} did not ask for a human");
-            assert_eq!(outcome.deferred, 0, "HTTP {status} kept hammering the server");
+            assert_eq!(
+                outcome.needs_user, 1,
+                "HTTP {status} did not ask for a human"
+            );
+            assert_eq!(
+                outcome.deferred, 0,
+                "HTTP {status} kept hammering the server"
+            );
             assert!(outcome.needs_attention());
             assert!(queue.pending()[0].blocked);
         }
@@ -575,10 +587,16 @@ mod tests {
         let outcome = drain(&client, &mut queue, 0);
 
         assert_eq!(outcome.deferred, 1);
-        assert_eq!(outcome.needs_reconcile + outcome.needs_user + outcome.rejected, 0);
+        assert_eq!(
+            outcome.needs_reconcile + outcome.needs_user + outcome.rejected,
+            0
+        );
 
         let entry = &queue.pending()[0];
-        assert!(!entry.blocked, "a transient failure parked a retryable push");
+        assert!(
+            !entry.blocked,
+            "a transient failure parked a retryable push"
+        );
         assert_eq!(entry.attempts, 1);
         assert_eq!(entry.next_attempt_ms, retry_delay_ms(1));
     }

@@ -1,0 +1,20 @@
+# iCloud. App-password only for third-party clients, and the CalDAV and
+# CardDAV hosts are per-partition — discovery resolves the real one from the
+# principal, so these are the documented entry points rather than the final
+# addresses.
+id = "icloud"
+name = "iCloud"
+hint = "Create an app-specific password at appleid.apple.com — your Apple ID password will not work."
+
+[services]
+calendar = "https://caldav.icloud.com/"
+contacts = "https://contacts.icloud.com/"
+
+[services.mail]
+protocol = "imap"
+imap_host = "imap.mail.me.com"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "smtp.mail.me.com"
+smtp_port = 587
+smtp_transport = "start-tls"

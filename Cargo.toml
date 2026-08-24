@@ -4,6 +4,7 @@ members = [
     "crates/cosmic-pim-core",
     "crates/cosmic-pim-caldav",
     "crates/cosmic-pim-accounts",
+    "crates/cosmic-pim-auth",
     "crates/cosmic-pim-mail",
     "crates/cosmic-pim-sync",
 ]
@@ -16,7 +17,7 @@ edition = "2024"
 # exists and the one trap (Exhibit B) to avoid.
 license = "MPL-2.0"
 repository = "https://github.com/entro314-labs/cosmic-pim"
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 
 [profile.release]
 lto = "thin"

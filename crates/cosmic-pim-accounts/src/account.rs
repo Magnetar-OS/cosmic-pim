@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::credential::OAuthCredential;
 use crate::error::{Error, Result};
 use crate::secret::SecretStore;
 
@@ -28,11 +29,12 @@ pub enum AuthMethod {
     /// A password or, far more commonly, a provider-issued app password.
     #[default]
     Password,
-    /// An OAuth 2.0 refresh token, held in the same secret slot.
+    /// An OAuth 2.0 grant, held in [`Account::credential_slot`] as a whole
+    /// [`crate::OAuthCredential`] rather than as a bare token.
     ///
-    /// Not yet exercised by the sync path: reaching a CalDAV server with a
-    /// bearer token needs the token refreshed per cycle, which is the job of an
-    /// online-accounts daemon rather than of this crate.
+    /// The account's [`Account::provider`] names the manifest that says how to
+    /// renew it. Resolving a grant to the token of the moment is
+    /// `cosmic_pim_auth::resolve`; nothing below that layer sees a refresh.
     OAuth,
 }
 
@@ -146,6 +148,14 @@ pub struct Account {
     pub username: String,
     #[serde(default)]
     pub auth: AuthMethod,
+    /// The provider manifest this account came from, if it came from one.
+    ///
+    /// Required for [`AuthMethod::OAuth`] — it is where the token endpoint and
+    /// the client id live, and a grant cannot be renewed without them. Optional
+    /// otherwise: an account typed in by hand has a URL and a password and
+    /// needs no manifest at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// CalDAV calendar href → the vdir collection id it is bound to.
@@ -173,6 +183,7 @@ impl Account {
             url: url.trim().to_owned(),
             username: username.trim().to_owned(),
             auth: AuthMethod::Password,
+            provider: None,
             enabled: true,
             collections: BTreeMap::new(),
             mail: None,
@@ -225,6 +236,23 @@ impl Account {
     pub fn secret_slot(&self) -> String {
         format!("caldav/{}/password", self.id)
     }
+
+    /// The secret slot holding this account's OAuth grant.
+    ///
+    /// Separate from [`Self::secret_slot`] rather than reusing it: the two hold
+    /// different shapes (a password, versus JSON), and an account that is
+    /// migrated from one mechanism to the other must not leave a value behind
+    /// that the other reader would try to parse.
+    #[must_use]
+    pub fn credential_slot(&self) -> String {
+        format!("oauth/{}/credential", self.id)
+    }
+
+    /// Whether this account signs in with OAuth.
+    #[must_use]
+    pub fn is_oauth(&self) -> bool {
+        self.auth == AuthMethod::OAuth
+    }
 }
 
 /// Where account metadata lives: `$XDG_CONFIG_HOME/cosmic-pim/accounts.toml`.
@@ -241,7 +269,7 @@ pub fn default_config_path() -> PathBuf {
     config_dir().join("accounts.toml")
 }
 
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("COSMIC_PIM_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
@@ -336,6 +364,10 @@ impl AccountStore {
         };
         let account = self.accounts.remove(index);
         self.secrets.forget(&account.secret_slot());
+        // Both slots: an account that was migrated between mechanisms has a
+        // value in each, and leaving either behind means a removed account's
+        // credentials outlive it in the keychain.
+        self.secrets.forget(&account.credential_slot());
         self.save()
     }
 
@@ -352,6 +384,60 @@ impl AccountStore {
             .get(id)
             .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?;
         self.secrets.load(&account.secret_slot())
+    }
+
+    /// Adds an OAuth account and stores the grant it was created with.
+    ///
+    /// The counterpart of [`Self::add`], and inseparable for the same reason:
+    /// an account whose grant never reached the keychain fails at sync time
+    /// looking exactly like a revoked authorisation.
+    pub fn add_oauth(
+        &mut self,
+        mut account: Account,
+        provider_id: &str,
+        credential: &OAuthCredential,
+    ) -> Result<()> {
+        account.auth = AuthMethod::OAuth;
+        account.provider = Some(provider_id.to_owned());
+        self.store_credential_for(&account, credential)?;
+        self.accounts.push(account);
+        self.save()
+    }
+
+    /// Replaces an account's OAuth grant — after a refresh, or a re-sign-in.
+    pub fn set_credential(&mut self, id: &str, credential: &OAuthCredential) -> Result<()> {
+        let account = self
+            .get(id)
+            .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?
+            .clone();
+        self.store_credential_for(&account, credential)
+    }
+
+    /// The account's OAuth grant, if one is stored.
+    ///
+    /// A slot holding something that is not a grant is reported as an error
+    /// rather than as an absent credential: "you are signed out" and "your
+    /// keychain entry is corrupt" need different answers from the user, and
+    /// silently re-running a sign-in flow over a decryption failure would hide
+    /// a real fault.
+    pub fn credential(&self, id: &str) -> Result<Option<OAuthCredential>> {
+        let account = self
+            .get(id)
+            .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?;
+        let Some(json) = self.secrets.load(&account.credential_slot())? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&json).map(Some).map_err(|why| {
+            Error::config(format!(
+                "stored OAuth grant for “{id}” is unreadable: {why}"
+            ))
+        })
+    }
+
+    fn store_credential_for(&self, account: &Account, credential: &OAuthCredential) -> Result<()> {
+        let json = serde_json::to_string(credential)
+            .map_err(|why| Error::config(format!("serialising an OAuth grant: {why}")))?;
+        self.secrets.store(&account.credential_slot(), &json)
     }
 
     /// Records that a CalDAV calendar is bound to a vdir collection.
@@ -427,7 +513,11 @@ mod tests {
     }
 
     fn account() -> Account {
-        Account::new("Fastmail", "https://caldav.fastmail.com/", "me@fastmail.com")
+        Account::new(
+            "Fastmail",
+            "https://caldav.fastmail.com/",
+            "me@fastmail.com",
+        )
     }
 
     #[test]
@@ -445,7 +535,10 @@ mod tests {
         store.add(account, "app-password").unwrap();
 
         assert_eq!(store.accounts().len(), 1);
-        assert_eq!(store.password(&id).unwrap().as_deref(), Some("app-password"));
+        assert_eq!(
+            store.password(&id).unwrap().as_deref(),
+            Some("app-password")
+        );
     }
 
     #[test]
@@ -610,7 +703,10 @@ mod tests {
             store.password("nope"),
             Err(Error::UnknownAccount(_))
         ));
-        assert!(matches!(store.remove("nope"), Err(Error::UnknownAccount(_))));
+        assert!(matches!(
+            store.remove("nope"),
+            Err(Error::UnknownAccount(_))
+        ));
         assert!(matches!(
             store.set_password("nope", "x"),
             Err(Error::UnknownAccount(_))

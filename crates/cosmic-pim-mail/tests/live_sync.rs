@@ -228,7 +228,11 @@ fn store(dir: &tempfile::TempDir) -> MaildirStore {
 }
 
 fn connect(server: &FakeServer) -> Session {
-    Session::connect(&server.endpoint(), "hunter2").expect("connect and log in")
+    Session::connect(
+        &server.endpoint(),
+        &cosmic_pim_mail::Credentials::Password("hunter2".into()),
+    )
+    .expect("connect and log in")
 }
 
 #[test]
@@ -269,7 +273,9 @@ fn a_full_cycle_lands_messages_in_a_maildir_readable_by_anything() {
         .collect();
     assert_eq!(names.len(), 2, "{names:?}");
     assert!(
-        names.iter().any(|n| n.contains(",U=1:") && n.ends_with("S")),
+        names
+            .iter()
+            .any(|n| n.contains(",U=1:") && n.ends_with("S")),
         "the \\Seen flag did not reach a filename: {names:?}"
     );
 
@@ -277,7 +283,10 @@ fn a_full_cycle_lands_messages_in_a_maildir_readable_by_anything() {
     let raw = store.raw(2).expect("read").expect("uid 2 is stored");
     let message = Message::parse(&raw).expect("parse");
     assert_eq!(message.subject, "Re: Hello");
-    assert_eq!(message.sender().expect("a sender").address, "bob@example.net");
+    assert_eq!(
+        message.sender().expect("a sender").address,
+        "bob@example.net"
+    );
 
     let cursor = store.state().expect("state").cursor;
     assert_eq!(cursor.last_uid, 2);
@@ -350,7 +359,10 @@ fn queued_flag_changes_are_pushed_before_the_pull_reads_them_back() {
         sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0).expect("sync");
 
     assert_eq!(outcome.pushed.succeeded, 1);
-    assert!(store.pending().is_empty(), "the queue kept a successful push");
+    assert!(
+        store.pending().is_empty(),
+        "the queue kept a successful push"
+    );
 
     let commands = server.commands();
     let store_at = commands
@@ -469,7 +481,10 @@ fn a_reconcile_pass_removes_what_another_client_deleted() {
     assert_eq!(outcome.removed, 1);
     assert_eq!(outcome.reflagged, 1);
     let state = store.state().expect("state");
-    assert!(!state.entries.contains_key(&1), "a deleted message survived");
+    assert!(
+        !state.entries.contains_key(&1),
+        "a deleted message survived"
+    );
     assert!(state.entries[&2].flagged);
 }
 
@@ -551,8 +566,8 @@ fn a_second_cycle_with_nothing_new_fetches_nothing() {
         let server = FakeServer::start(scenario.clone());
         let mut store = MaildirStore::open(&path).expect("open");
         let mut session = connect(&server);
-        let first =
-            sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0).expect("sync");
+        let first = sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0)
+            .expect("sync");
         assert_eq!(first.fetched, 1);
     }
 
@@ -563,14 +578,19 @@ fn a_second_cycle_with_nothing_new_fetches_nothing() {
         sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0).expect("sync");
 
     assert_eq!(second.fetched, 0, "an idle poll re-downloaded the mailbox");
-    let commands: HashMap<bool, usize> = server.commands().into_iter().fold(
-        HashMap::new(),
-        |mut counts, command| {
-            *counts
-                .entry(command.to_ascii_uppercase().contains("BODY.PEEK"))
-                .or_default() += 1;
-            counts
-        },
+    let commands: HashMap<bool, usize> =
+        server
+            .commands()
+            .into_iter()
+            .fold(HashMap::new(), |mut counts, command| {
+                *counts
+                    .entry(command.to_ascii_uppercase().contains("BODY.PEEK"))
+                    .or_default() += 1;
+                counts
+            });
+    assert_eq!(
+        commands.get(&true),
+        None,
+        "a body was fetched with nothing new"
     );
-    assert_eq!(commands.get(&true), None, "a body was fetched with nothing new");
 }

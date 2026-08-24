@@ -45,7 +45,6 @@
 //! [`crate::error::Error::UidValidityChanged`] is classified as needing a sync
 //! pass rather than a retry.
 
-
 use imap::types::Fetch;
 
 use crate::error::{Error, Result};
@@ -53,6 +52,7 @@ use crate::folder::{self, Folder};
 use crate::model::Flags;
 use crate::plan;
 use crate::push::{self, DrainOutcome, PushQueue, Writeback};
+use crate::sasl::{Credentials, XOAuth2};
 use crate::store::{Cursor, MailStore, RemoteMessage};
 
 /// How many messages are fetched in one round trip.
@@ -128,8 +128,13 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    /// Connects and logs in.
-    pub fn connect(endpoint: &Endpoint, password: &str) -> Result<Self> {
+    /// Connects and authenticates.
+    ///
+    /// Which mechanism is decided by what it is handed: a password goes over
+    /// `LOGIN`, an access token over `AUTHENTICATE XOAUTH2`. Sending a token as
+    /// a password — which is what happens if the two are conflated — is refused
+    /// by the server in a way that reads as a wrong password.
+    pub fn connect(endpoint: &Endpoint, credentials: &Credentials) -> Result<Self> {
         let client = imap::ClientBuilder::new(&endpoint.host, endpoint.port)
             .mode(match endpoint.security {
                 Security::Tls => imap::ConnectionMode::Tls,
@@ -139,12 +144,20 @@ impl Session {
             .connect()
             .map_err(imap_error)?;
 
-        let mut inner = client
-            .login(&endpoint.username, password)
-            // `login` hands back the client along with the error so it can be
-            // retried; we only want the reason, and it is a credential problem
-            // rather than a transport one.
-            .map_err(|(error, _client)| Error::Auth(error.to_string()))?;
+        // Both arms hand the client back with the error so it can be retried;
+        // we only want the reason, and it is a credential problem rather than
+        // a transport one.
+        let mut inner = match credentials {
+            Credentials::Password(password) => client
+                .login(&endpoint.username, password)
+                .map_err(|(error, _client)| Error::Auth(error.to_string()))?,
+            Credentials::OAuth2(token) => {
+                let authenticator = XOAuth2::new(&endpoint.username, token);
+                client
+                    .authenticate("XOAUTH2", &authenticator)
+                    .map_err(|(error, _client)| Error::Auth(error.to_string()))?
+            }
+        };
 
         // CONDSTORE turns flag reconciliation from "ask about every message" to
         // "ask what changed", which is the difference between a round trip
@@ -616,5 +629,4 @@ mod tests {
         assert!(FETCH_ITEMS.contains("BODY.PEEK["));
         assert!(!FETCH_ITEMS.contains("BODY["));
     }
-
 }

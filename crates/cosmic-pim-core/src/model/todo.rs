@@ -235,7 +235,10 @@ mod tests {
         ] {
             assert_eq!(TodoStatus::parse(status.as_ical()), Some(status));
         }
-        assert_eq!(TodoStatus::parse("needs-action"), Some(TodoStatus::NeedsAction));
+        assert_eq!(
+            TodoStatus::parse("needs-action"),
+            Some(TodoStatus::NeedsAction)
+        );
         assert_eq!(TodoStatus::parse("nonsense"), None);
     }
 
@@ -279,7 +282,9 @@ mod tests {
     #[test]
     fn a_finished_task_is_never_overdue() {
         let mut todo = Todo::draft("personal");
-        todo.due = Some(EventTime::Date(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap()));
+        todo.due = Some(EventTime::Date(
+            NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+        ));
         todo.set_done(true);
         assert!(!todo.is_overdue(at(2030, 1, 1, 12), chrono_tz::UTC));
     }
@@ -287,7 +292,9 @@ mod tests {
     #[test]
     fn an_all_day_task_is_not_overdue_until_its_day_has_passed() {
         let mut todo = Todo::draft("personal");
-        todo.due = Some(EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()));
+        todo.due = Some(EventTime::Date(
+            NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+        ));
 
         assert!(
             !todo.is_overdue(at(2026, 8, 4, 0), chrono_tz::UTC),
@@ -321,7 +328,9 @@ mod tests {
     fn sorting_puts_undated_tasks_last() {
         let mut dated = Todo::draft("personal");
         dated.summary = "zzz".into();
-        dated.due = Some(EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()));
+        dated.due = Some(EventTime::Date(
+            NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+        ));
         let mut undated = Todo::draft("personal");
         undated.summary = "aaa".into();
 

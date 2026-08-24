@@ -68,10 +68,7 @@ pub fn queue_delete(root: &Path, collection_id: &str, file_name: &str) -> Result
     // Only a file the server actually knows about needs a DELETE. An event
     // created and removed locally between two syncs was never uploaded, and
     // asking the server to delete it would just 404.
-    let Some(href) = store
-        .entry_for_by_file(file_name)
-        .map(|(href, _)| href)
-    else {
+    let Some(href) = store.entry_for_by_file(file_name).map(|(href, _)| href) else {
         return Ok(false);
     };
 

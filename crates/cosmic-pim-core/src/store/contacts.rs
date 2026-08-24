@@ -339,8 +339,11 @@ mod tests {
     fn an_ics_file_in_an_address_book_is_ignored() {
         let (_dir, mut store) = store();
         let book = store.create_book("Personal", Rgb(1, 2, 3)).unwrap();
-        std::fs::write(book.path.join("event.ics"), "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
-            .unwrap();
+        std::fs::write(
+            book.path.join("event.ics"),
+            "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+        )
+        .unwrap();
 
         assert!(store.contacts().is_empty());
     }

@@ -781,8 +781,8 @@ mod todo_tests {
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("calendars"), &dir.path().join("i.sqlite"))
-            .unwrap();
+        let store =
+            Store::open(&dir.path().join("calendars"), &dir.path().join("i.sqlite")).unwrap();
         (dir, store)
     }
 
@@ -793,7 +793,9 @@ mod todo_tests {
 
         let mut todo = Todo::draft(&cal.id);
         todo.summary = "Buy milk".into();
-        todo.due = Some(EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()));
+        todo.due = Some(EventTime::Date(
+            NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+        ));
         store.save_todo(&todo).unwrap();
 
         let all = store.todos(&HashSet::new());
@@ -823,7 +825,11 @@ mod todo_tests {
         todo.summary = "Buy milk".into();
         store.save_todo(&todo).unwrap();
 
-        assert_eq!(store.todos(&HashSet::new()).len(), 1, "an event leaked into the task list");
+        assert_eq!(
+            store.todos(&HashSet::new()).len(),
+            1,
+            "an event leaked into the task list"
+        );
         assert_eq!(
             store
                 .occurrences(
@@ -889,7 +895,9 @@ mod todo_tests {
 
         let mut soon = Todo::draft(&cal.id);
         soon.summary = "Tomorrow".into();
-        soon.due = Some(EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()));
+        soon.due = Some(EventTime::Date(
+            NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+        ));
         store.save_todo(&soon).unwrap();
 
         let mut done = Todo::draft(&cal.id);
@@ -946,12 +954,18 @@ mod sidecar_hygiene_tests {
     fn litter(dir: &std::path::Path) {
         for (name, body) in [
             (".caldav-state.json", r#"{"ctag":"x","entries":{}}"#),
-            (".abc.ics.tmp", "BEGIN:VCALENDAR
+            (
+                ".abc.ics.tmp",
+                "BEGIN:VCALENDAR
 END:VCALENDAR
-"),
-            ("abc.ics.1718700000.conflict", "BEGIN:VCALENDAR
+",
+            ),
+            (
+                "abc.ics.1718700000.conflict",
+                "BEGIN:VCALENDAR
 END:VCALENDAR
-"),
+",
+            ),
             (".vdirsyncer", "status"),
             (".vdirsyncer.status", "{}"),
             ("README", "not calendar data"),
@@ -993,7 +1007,11 @@ END:VCALENDAR
             )
             .unwrap();
         assert_eq!(occurrences.len(), 1, "a sidecar was read as an event");
-        assert_eq!(store.todos(&HashSet::new()).len(), 1, "a sidecar was read as a task");
+        assert_eq!(
+            store.todos(&HashSet::new()).len(),
+            1,
+            "a sidecar was read as a task"
+        );
     }
 
     #[test]

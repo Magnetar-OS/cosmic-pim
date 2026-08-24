@@ -1,0 +1,33 @@
+# Microsoft personal accounts and Microsoft 365.
+#
+# `common` covers both; a tenant-locked deployment overrides auth_url and
+# token_url with its tenant id in place of `common`.
+#
+# No CalDAV or CardDAV: Outlook.com withdrew both, and the calendar and
+# contacts live behind Microsoft Graph. Mail is IMAP + SMTP with XOAUTH2,
+# which is still offered and is what this suite uses.
+id = "microsoft"
+name = "Microsoft"
+hint = "Requires an OAuth client id from an Entra ID app registration."
+
+[oauth]
+auth_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+redirect_port = 49174
+scopes = [
+    "openid",
+    "email",
+    "profile",
+    "offline_access",
+    "https://outlook.office.com/IMAP.AccessAsUser.All",
+    "https://outlook.office.com/SMTP.Send",
+]
+
+[services.mail]
+protocol = "imap"
+imap_host = "outlook.office365.com"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "smtp.office365.com"
+smtp_port = 587
+smtp_transport = "start-tls"

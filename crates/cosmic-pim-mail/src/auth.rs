@@ -346,7 +346,6 @@ fn comment_policy(comments: &str) -> String {
         .unwrap_or_default()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,7 +360,9 @@ mod tests {
 
     #[test]
     fn mechanisms_and_their_domains_are_extracted() {
-        let hops = parse("mx.google.com; spf=pass smtp.mailfrom=news@example.com; dkim=pass header.d=example.com; dmarc=pass header.from=example.com");
+        let hops = parse(
+            "mx.google.com; spf=pass smtp.mailfrom=news@example.com; dkim=pass header.d=example.com; dmarc=pass header.from=example.com",
+        );
         assert_eq!(hops.len(), 1);
         assert_eq!(hops[0].authserv_id, "mx.google.com");
         let dkim = hops[0]
@@ -377,7 +378,9 @@ mod tests {
     fn a_dmarc_policy_in_a_comment_is_read() {
         // The conventional spelling, not the RFC's property syntax — and the
         // one every large receiver actually emits.
-        let hops = parse("mx.example.net; dmarc=fail (p=REJECT sp=NONE dis=NONE) header.from=bank.example");
+        let hops = parse(
+            "mx.example.net; dmarc=fail (p=REJECT sp=NONE dis=NONE) header.from=bank.example",
+        );
         let dmarc = &hops[0].mechanisms[0];
         assert_eq!(dmarc.result, "fail");
         assert_eq!(dmarc.policy, "reject");
@@ -407,7 +410,9 @@ mod tests {
 
     #[test]
     fn one_good_signature_outweighs_a_broken_second() {
-        let hops = parse("mx.example; dkim=fail header.d=old.example; dkim=pass header.d=example.com; spf=pass smtp.mailfrom=x@example.com; dmarc=pass header.from=example.com");
+        let hops = parse(
+            "mx.example; dkim=fail header.d=old.example; dkim=pass header.d=example.com; spf=pass smtp.mailfrom=x@example.com; dmarc=pass header.from=example.com",
+        );
         assert_eq!(rollup(&hops), "pass");
     }
 

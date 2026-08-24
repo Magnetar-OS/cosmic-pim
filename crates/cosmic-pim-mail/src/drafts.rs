@@ -92,8 +92,8 @@ impl Drafts {
             saved_ms: now_ms,
             draft: draft.clone(),
         };
-        let json = serde_json::to_string_pretty(&record)
-            .map_err(|why| Error::Draft(why.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(&record).map_err(|why| Error::Draft(why.to_string()))?;
         // Through the substrate's writer, so a crash mid-save cannot leave a
         // truncated draft where a whole one was.
         atomic::write(&self.path(id), &json, None)?;
@@ -283,7 +283,10 @@ mod tests {
         let id = new_id(1_700_000_000_000);
 
         drafts.save(&id, &draft(), 1_700_000_000_000).unwrap();
-        let loaded = drafts.load(&id, me()).unwrap().expect("the draft came back");
+        let loaded = drafts
+            .load(&id, me())
+            .unwrap()
+            .expect("the draft came back");
 
         assert_eq!(loaded.subject, "Half-written");
         assert_eq!(loaded.body.trim(), "This is as far as I got.");
@@ -323,7 +326,9 @@ mod tests {
         .unwrap();
 
         let id = new_id(2);
-        drafts.save(&id, &Draft::reply(&original, me(), false), 2).unwrap();
+        drafts
+            .save(&id, &Draft::reply(&original, me(), false), 2)
+            .unwrap();
 
         let loaded = drafts.load(&id, me()).unwrap().unwrap();
         assert_eq!(loaded.in_reply_to.as_deref(), Some("parent@x"));
@@ -344,7 +349,10 @@ mod tests {
         }
 
         assert_eq!(drafts.count(), 1, "every keystroke left a file behind");
-        assert_eq!(drafts.load(&id, me()).unwrap().unwrap().body.trim(), "third");
+        assert_eq!(
+            drafts.load(&id, me()).unwrap().unwrap().body.trim(),
+            "third"
+        );
     }
 
     #[test]
@@ -373,7 +381,9 @@ mod tests {
         drafts.save(&id, &draft(), 4).unwrap();
 
         drafts.delete(&id).unwrap();
-        drafts.delete(&id).expect("a retried send must not fail here");
+        drafts
+            .delete(&id)
+            .expect("a retried send must not fail here");
         assert!(drafts.load(&id, me()).unwrap().is_none());
         assert_eq!(drafts.count(), 0);
     }
@@ -389,7 +399,9 @@ mod tests {
         draft.body = "…".into();
 
         let id = new_id(5);
-        drafts.save(&id, &draft, 5).expect("a half-written draft must save");
+        drafts
+            .save(&id, &draft, 5)
+            .expect("a half-written draft must save");
         let loaded = drafts.load(&id, me()).unwrap().unwrap();
         assert_eq!(loaded.subject, "Thinking about it");
         assert!(loaded.to.is_empty());

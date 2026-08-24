@@ -51,7 +51,6 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-
 /// Whether an UNFOLDED content line is an ATTENDEE property whose
 /// cal-address names `me_lower` (lowercased, mailto:-stripped). The
 /// property-name check requires `;` or `:` at byte 8 so `ATTENDEEX-FOO`
@@ -202,7 +201,6 @@ pub fn patch_attendee_partstat(ical: &str, me_email: &str, partstat: &str) -> Op
     patched.then_some(out)
 }
 
-
 /* ------------------------------------------------------------------ */
 /* Local-edit writeback patch (F-CAL-3)                               */
 
@@ -239,7 +237,6 @@ fn line_property_name(unfolded: &str) -> String {
     let end = unfolded.find([';', ':']).unwrap_or(unfolded.len());
     unfolded[..end].trim().to_ascii_uppercase()
 }
-
 
 /// Classify an original DTSTART/DTEND line's serialization form from its
 /// parameters (unquoted-`;` segmentation, quoted values respected - the same
@@ -388,11 +385,7 @@ fn emit_patched_props(
         // RRULE is structured, not TEXT - no escaping.
         put(&format!("RRULE:{}", patch.rrule.trim()), term, out);
     }
-    put(
-        &format!("SUMMARY:{}", escape_text(patch.title)),
-        term,
-        out,
-    );
+    put(&format!("SUMMARY:{}", escape_text(patch.title)), term, out);
     if !patch.location.is_empty() {
         put(
             &format!("LOCATION:{}", escape_text(patch.location)),
@@ -572,7 +565,6 @@ fn resolve_form(
 mod tests {
     use super::*;
 
-
     /// Assertions compare UNFOLDED content: the patcher refolds long lines
     /// at 75 octets (correct output), which raw `contains` would miss.
     fn unfold(s: &str) -> String {
@@ -674,7 +666,7 @@ END:VCALENDAR\r\n";
         );
         let unfolded = unfold(&out);
         assert!(
-            unfolded.contains("ATTENDEE;PARTSTAT=ACCEPTED;CN=") 
+            unfolded.contains("ATTENDEE;PARTSTAT=ACCEPTED;CN=")
                 || unfolded.contains("PARTSTAT=ACCEPTED"),
             "PARTSTAT was lost in the refold: {unfolded}"
         );
@@ -709,7 +701,6 @@ END:VCALENDAR\n";
     }
 
     /* ---------------- free-busy ---------------- */
-
 
     /// the editor doesn't model must survive VERBATIM, and the TZID form of
     /// the times must not be rewritten to UTC.

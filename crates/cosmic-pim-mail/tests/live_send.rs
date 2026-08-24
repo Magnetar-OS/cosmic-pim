@@ -12,6 +12,13 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 
+/// Every test here authenticates the same way; the mechanism is not what is
+/// under test, the SMTP conversation is.
+fn password() -> cosmic_pim_mail::Credentials {
+    cosmic_pim_mail::Credentials::Password("hunter2".into())
+}
+
+
 use cosmic_pim_mail::compose::Draft;
 use cosmic_pim_mail::imap::Security;
 use cosmic_pim_mail::model::{Mailbox, Message};
@@ -167,7 +174,7 @@ fn a_send_reaches_the_server_and_comes_back_with_the_copy_to_file() {
     draft.subject = "Hello".into();
     draft.body = "Hi there.".into();
 
-    let outcome = send(&server.endpoint(), "hunter2", &draft);
+    let outcome = send(&server.endpoint(), &password(), &draft);
     let Outcome::Sent(filed) = outcome else {
         panic!("the send did not succeed: {:?}", outcome.error());
     };
@@ -198,7 +205,7 @@ fn bcc_reaches_the_envelope_and_never_the_wire() {
     draft.subject = "Quiet".into();
     draft.body = "…".into();
 
-    let outcome = send(&server.endpoint(), "hunter2", &draft);
+    let outcome = send(&server.endpoint(), &password(), &draft);
     let Outcome::Sent(filed) = outcome else {
         panic!("the send did not succeed: {:?}", outcome.error());
     };
@@ -217,7 +224,10 @@ fn bcc_reaches_the_envelope_and_never_the_wire() {
         !wire.contains("secret@example.org"),
         "the blind copy leaked to every recipient:\n{wire}"
     );
-    assert!(wire.contains("bob@example.net"), "the Cc header went missing");
+    assert!(
+        wire.contains("bob@example.net"),
+        "the Cc header went missing"
+    );
 
     assert!(
         String::from_utf8_lossy(&filed).contains("secret@example.org"),
@@ -243,7 +253,7 @@ fn a_reply_goes_out_threaded_for_the_recipients_client() {
     let mut draft = Draft::reply(&original, me(), false);
     draft.body.insert_str(0, "Looks good.");
 
-    let outcome = send(&server.endpoint(), "hunter2", &draft);
+    let outcome = send(&server.endpoint(), &password(), &draft);
     assert!(outcome.is_sent(), "{:?}", outcome.error());
 
     let wire = server.transcript().message();
@@ -262,7 +272,7 @@ fn a_server_that_refuses_before_data_is_safe_to_retry() {
     draft.subject = "Hello".into();
     draft.body = "Hi.".into();
 
-    let outcome = send(&server.endpoint(), "hunter2", &draft);
+    let outcome = send(&server.endpoint(), &password(), &draft);
     assert!(!outcome.is_sent());
     assert!(
         outcome.is_retryable(),
@@ -286,6 +296,6 @@ fn an_unreachable_server_is_safe_to_retry() {
     draft.subject = "Hello".into();
     draft.body = "Hi.".into();
 
-    let outcome = send(&endpoint, "hunter2", &draft);
+    let outcome = send(&endpoint, &password(), &draft);
     assert!(outcome.is_retryable(), "{:?}", outcome.error());
 }

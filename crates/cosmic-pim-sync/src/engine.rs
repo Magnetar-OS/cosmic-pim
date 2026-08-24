@@ -270,12 +270,13 @@ fn sync_provisioned(client: &CaldavClient, entry: &Provisioned, root: &Path) -> 
             });
         }
 
-        let meta = crate::provision::open_collection(root, &entry.collection_id).ok_or_else(|| {
-            Error::CalDav(cosmic_pim_caldav::Error::internal(format!(
-                "collection “{}” vanished between provisioning and sync",
-                entry.collection_id
-            )))
-        })?;
+        let meta =
+            crate::provision::open_collection(root, &entry.collection_id).ok_or_else(|| {
+                Error::CalDav(cosmic_pim_caldav::Error::internal(format!(
+                    "collection “{}” vanished between provisioning and sync",
+                    entry.collection_id
+                )))
+            })?;
 
         let mut store = open_store(entry.flavor, meta)?;
 
@@ -316,9 +317,7 @@ pub fn sync_account(
 ) -> Result<AccountReport> {
     let account = store
         .get(account_id)
-        .ok_or_else(|| {
-            cosmic_pim_accounts::Error::UnknownAccount(account_id.to_owned())
-        })?
+        .ok_or_else(|| cosmic_pim_accounts::Error::UnknownAccount(account_id.to_owned()))?
         .clone();
     Ok(sync_one(store, &account, calendar_root, contacts_root))
 }

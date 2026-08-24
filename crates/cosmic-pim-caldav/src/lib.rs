@@ -32,13 +32,13 @@
 pub mod dav;
 pub mod error;
 pub mod patch;
-pub mod push;
 pub mod plan;
+pub mod push;
 pub mod store;
 pub mod sync;
 pub mod vdir;
 
-pub use dav::{CalDavEventEntry, CaldavClient, DiscoveredCalendar, Flavor, PropfindEventsResult};
+pub use dav::{Auth, CalDavEventEntry, CaldavClient, DiscoveredCalendar, Flavor, PropfindEventsResult};
 pub use error::{Error, Result};
 pub use plan::{SyncPlan, plan_sync};
 pub use store::{CalDavStore, CollectionState, Conflict, RemoteEvent};

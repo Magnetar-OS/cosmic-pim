@@ -201,7 +201,10 @@ mod tests {
                 "HTTP {status} did not back off"
             );
         }
-        assert_eq!(Error::protocol("connection reset").disposition(), Disposition::Retry);
+        assert_eq!(
+            Error::protocol("connection reset").disposition(),
+            Disposition::Retry
+        );
         assert_eq!(
             Error::Io(std::io::Error::other("broken pipe")).disposition(),
             Disposition::Retry
@@ -217,12 +220,18 @@ mod tests {
                 "HTTP {status} was retried despite being about the request itself"
             );
         }
-        assert_eq!(Error::internal("bad method").disposition(), Disposition::Fatal);
+        assert_eq!(
+            Error::internal("bad method").disposition(),
+            Disposition::Fatal
+        );
     }
 
     #[test]
     fn a_missing_collection_resyncs_rather_than_retrying() {
-        assert_eq!(Error::status(409, "x").disposition(), Disposition::Reconcile);
+        assert_eq!(
+            Error::status(409, "x").disposition(),
+            Disposition::Reconcile
+        );
     }
 
     #[test]

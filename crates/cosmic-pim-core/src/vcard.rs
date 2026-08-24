@@ -179,7 +179,12 @@ fn structured_name(card: &VCard) -> StructuredName {
             .map(|v| v.as_text().unwrap_or_default().to_owned())
             .collect(),
     };
-    let at = |i: usize| parts.get(i).map(|s| s.trim().to_owned()).unwrap_or_default();
+    let at = |i: usize| {
+        parts
+            .get(i)
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default()
+    };
 
     StructuredName {
         family: at(0),
@@ -202,7 +207,12 @@ fn addresses(card: &VCard) -> Vec<Address> {
                     .map(|v| v.as_text().unwrap_or_default().to_owned())
                     .collect(),
             };
-            let at = |i: usize| parts.get(i).map(|s| s.trim().to_owned()).unwrap_or_default();
+            let at = |i: usize| {
+                parts
+                    .get(i)
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_default()
+            };
 
             Address {
                 po_box: at(0),
@@ -761,7 +771,10 @@ END:VCARD\r\n";
     fn to_vcard_would_have_lost_them_which_is_why_patch_exists() {
         let contact = parsed();
         let rebuilt = to_vcard(&contact);
-        assert!(!rebuilt.contains("PHOTO"), "the premise of this module changed");
+        assert!(
+            !rebuilt.contains("PHOTO"),
+            "the premise of this module changed"
+        );
         assert!(!rebuilt.contains("X-ABShowAs"));
         assert!(!rebuilt.contains("GEO:"));
     }
@@ -814,7 +827,10 @@ END:VCARD\r\n";
     fn rev_is_refreshed_on_every_patch() {
         let contact = parsed();
         let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
-        assert!(!out.contains("REV:20200101T000000Z"), "REV was not refreshed");
+        assert!(
+            !out.contains("REV:20200101T000000Z"),
+            "REV was not refreshed"
+        );
         assert!(out.contains("REV:"));
     }
 

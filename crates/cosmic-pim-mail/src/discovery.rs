@@ -108,7 +108,13 @@ const KNOWN: &[Known] = &[
     },
     Known {
         display_name: "Outlook",
-        domains: &["outlook.com", "hotmail.com", "live.com", "msn.com", "passport.com"],
+        domains: &[
+            "outlook.com",
+            "hotmail.com",
+            "live.com",
+            "msn.com",
+            "passport.com",
+        ],
         imap_host: "outlook.office365.com",
         smtp_host: "smtp-mail.outlook.com",
         smtp_starttls: true,
@@ -266,7 +272,9 @@ fn autoconfig_urls(domain: &str, email: &str) -> [String; 3] {
     let email = percent_encode(email);
     [
         format!("https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress={email}"),
-        format!("https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress={email}"),
+        format!(
+            "https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress={email}"
+        ),
         format!("https://autoconfig.thunderbird.net/v1.1/{domain}"),
     ]
 }
@@ -399,8 +407,12 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
 
     Some(Discovered {
         display_name,
-        imap_security: imap.security.unwrap_or_else(|| security_for_port(imap_port)),
-        smtp_security: smtp.security.unwrap_or_else(|| security_for_port(smtp_port)),
+        imap_security: imap
+            .security
+            .unwrap_or_else(|| security_for_port(imap_port)),
+        smtp_security: smtp
+            .security
+            .unwrap_or_else(|| security_for_port(smtp_port)),
         imap_port,
         smtp_port,
         username: if imap.username.is_empty() {
@@ -507,11 +519,12 @@ pub fn domain_of(email: &str) -> Result<String> {
     }
     // Characters that would let the "domain" smuggle URL syntax — a port, a
     // path, a query, userinfo, an IPv6 literal — into a probe URL.
-    if domain
-        .bytes()
-        .any(|b| matches!(b, b':' | b'/' | b'\\' | b'?' | b'#' | b'@' | b'[' | b']' | b' ' | b'\t')
-            || b.is_ascii_control())
-    {
+    if domain.bytes().any(|b| {
+        matches!(
+            b,
+            b':' | b'/' | b'\\' | b'?' | b'#' | b'@' | b'[' | b']' | b' ' | b'\t'
+        ) || b.is_ascii_control()
+    }) {
         return Err(Error::Discovery("that domain cannot be looked up".into()));
     }
     if !domain.contains('.') {
@@ -539,11 +552,12 @@ fn is_probe_host(host: &str) -> bool {
     if host.is_empty() || !host.contains('.') {
         return false;
     }
-    if host
-        .bytes()
-        .any(|b| matches!(b, b':' | b'/' | b'\\' | b'?' | b'#' | b'@' | b'[' | b']' | b' ')
-            || b.is_ascii_control())
-    {
+    if host.bytes().any(|b| {
+        matches!(
+            b,
+            b':' | b'/' | b'\\' | b'?' | b'#' | b'@' | b'[' | b']' | b' '
+        ) || b.is_ascii_control()
+    }) {
         return false;
     }
     // A name is fine; an address literal has to be a public one.
@@ -617,12 +631,7 @@ mod tests {
     fn provider_aliases_resolve_to_the_same_settings() {
         // Somebody with a hotmail.com address is on Outlook and should not have
         // to know that.
-        for address in [
-            "a@hotmail.com",
-            "a@live.com",
-            "a@msn.com",
-            "a@OUTLOOK.COM",
-        ] {
+        for address in ["a@hotmail.com", "a@live.com", "a@msn.com", "a@OUTLOOK.COM"] {
             let found = known(address).unwrap_or_else(|| panic!("{address}"));
             assert_eq!(found.imap_host, "outlook.office365.com", "{address}");
         }
@@ -694,7 +703,10 @@ mod tests {
         assert!(!is_probe_host("10.0.0.5"));
         assert!(!is_probe_host("host:993"));
         assert!(!is_probe_host(""));
-        assert!(is_probe_host("8.8.8.8"), "a public literal is admissible here");
+        assert!(
+            is_probe_host("8.8.8.8"),
+            "a public literal is admissible here"
+        );
     }
 
     #[test]
@@ -764,7 +776,10 @@ mod tests {
         let found = parse_autoconfig(xml, "a@example.com").unwrap();
         assert_eq!(found.imap_port, 993);
         assert_eq!(found.imap_security, Security::Tls);
-        assert_eq!(found.username, "a@example.com", "the whole address by default");
+        assert_eq!(
+            found.username, "a@example.com",
+            "the whole address by default"
+        );
     }
 
     #[test]

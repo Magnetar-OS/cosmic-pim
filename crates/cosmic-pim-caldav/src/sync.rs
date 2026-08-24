@@ -131,7 +131,10 @@ pub fn sync_collection(
             // A body for an href the listing did not mention. Storing it would
             // leave an entry with no etag to diff against, so it would be
             // re-fetched forever.
-            tracing::warn!(href, "multiget returned a body for an unlisted href; ignoring");
+            tracing::warn!(
+                href,
+                "multiget returned a body for an unlisted href; ignoring"
+            );
             continue;
         };
         // Both sides changed: record it, write neither over the other.
@@ -396,7 +399,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.deleted, 0, "a transient failure deleted a real event");
+        assert_eq!(
+            outcome.deleted, 0,
+            "a transient failure deleted a real event"
+        );
         assert!(store.events.contains_key("/a.ics"));
     }
 
@@ -460,7 +466,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.fetched, 2);
-        assert!(!outcome.guard_tripped, "an empty local store is not a guard case");
+        assert!(
+            !outcome.guard_tripped,
+            "an empty local store is not a guard case"
+        );
         assert_eq!(store.events.len(), 2);
     }
 
@@ -569,7 +578,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.conflicts, 0, "identical content was called a conflict");
+        assert_eq!(
+            outcome.conflicts, 0,
+            "identical content was called a conflict"
+        );
         assert_eq!(outcome.fetched, 1);
     }
 

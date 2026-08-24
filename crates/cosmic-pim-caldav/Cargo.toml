@@ -23,7 +23,7 @@ cosmic-pim-core = { path = "../cosmic-pim-core" }
 #
 # NOT ureq: ureq 3 enforces a hardcoded HTTP-method allowlist and rejects every
 # WebDAV verb before it reaches the socket. See the comment in CaldavClient::new.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
 # Streaming pull parser. Multistatus responses are large and deeply nested, and
 # a DOM parser on a 5000-event listing is a needless allocation storm.
 quick-xml = "0.41"
@@ -31,7 +31,7 @@ quick-xml = "0.41"
 # the document's own VTIMEZONE blocks to resolve a TZID when it reformats a
 # time. Pinned together with core's copy on purpose: two versions here would
 # mean the read path and the write path could disagree about a zone.
-calcard = "0.3.8"
+calcard = "0.3.10"
 
 # Basic auth header encoding. App passwords are still how most self-hosted
 # CalDAV is reached, OAuth notwithstanding.

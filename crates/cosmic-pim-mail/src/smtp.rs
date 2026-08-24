@@ -40,6 +40,7 @@ use lettre::Transport as _;
 
 use crate::error::{Error, Result};
 use crate::imap::Security;
+use crate::sasl::Credentials;
 
 /// Where and how to reach one account's submission server.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -110,7 +111,7 @@ impl Outcome {
 /// *which* failure this was, and a `Result` invites treating them the same.
 pub fn send(
     endpoint: &SmtpEndpoint,
-    password: &str,
+    credentials: &Credentials,
     draft: &crate::compose::Draft,
 ) -> Outcome {
     // Built twice, deliberately: the copy that goes over the wire has no `Bcc`
@@ -126,7 +127,7 @@ pub fn send(
         Err(why) => return Outcome::NotSent(why),
     };
 
-    let transport = match transport(endpoint, password) {
+    let transport = match transport(endpoint, credentials) {
         Ok(transport) => transport,
         Err(why) => return Outcome::NotSent(why),
     };
@@ -160,8 +161,8 @@ fn classify(error: &lettre::transport::smtp::Error) -> Outcome {
     }
 }
 
-fn transport(endpoint: &SmtpEndpoint, password: &str) -> Result<lettre::SmtpTransport> {
-    use lettre::transport::smtp::authentication::Credentials;
+fn transport(endpoint: &SmtpEndpoint, credentials: &Credentials) -> Result<lettre::SmtpTransport> {
+    use lettre::transport::smtp::authentication::{Credentials as SmtpCredentials, Mechanism};
 
     let builder = match endpoint.security {
         Security::Tls => lettre::SmtpTransport::relay(&endpoint.host),
@@ -173,13 +174,22 @@ fn transport(endpoint: &SmtpEndpoint, password: &str) -> Result<lettre::SmtpTran
     }
     .map_err(|why| Error::Smtp(why.to_string()))?;
 
-    Ok(builder
-        .port(endpoint.port)
-        .credentials(Credentials::new(
-            endpoint.username.clone(),
-            password.to_owned(),
-        ))
-        .build())
+    let builder = builder.port(endpoint.port).credentials(SmtpCredentials::new(
+        endpoint.username.clone(),
+        credentials.expose().to_owned(),
+    ));
+
+    // Pinned rather than negotiated when the credential is a token. lettre
+    // picks the strongest mechanism the server advertises, and Gmail advertises
+    // PLAIN alongside XOAUTH2 — so an access token would go out as a PLAIN
+    // password and be refused, with the refusal reading as a bad password.
+    Ok(if credentials.is_oauth2() {
+        builder
+            .authentication(vec![Mechanism::Xoauth2])
+            .build()
+    } else {
+        builder.build()
+    })
 }
 
 #[cfg(test)]
@@ -211,8 +221,11 @@ mod tests {
             security: Security::Plaintext,
             username: "me".into(),
         };
-        let outcome = send(&endpoint, "", &Draft::new(Mailbox::default()));
-        assert!(outcome.is_retryable(), "validation was reported as ambiguous");
+        let outcome = send(&endpoint, &Credentials::Password(String::new()), &Draft::new(Mailbox::default()));
+        assert!(
+            outcome.is_retryable(),
+            "validation was reported as ambiguous"
+        );
         assert!(
             outcome.error().unwrap().to_string().contains("no sender"),
             "{:?}",
@@ -229,7 +242,7 @@ mod tests {
             security: Security::Plaintext,
             username: "me".into(),
         };
-        let outcome = send(&endpoint, "hunter2", &draft());
+        let outcome = send(&endpoint, &Credentials::Password("hunter2".into()), &draft());
         assert!(
             outcome.is_retryable(),
             "an offline send was made terminal: {:?}",

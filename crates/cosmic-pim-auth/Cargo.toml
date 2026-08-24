@@ -1,0 +1,37 @@
+[package]
+name = "cosmic-pim-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OAuth 2.0 sign-in and token renewal for the COSMIC PIM suite"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Accounts owns the credential shape and the provider manifests; this crate
+# performs the exchange that produces one. The dependency points this way, not
+# the other, so `accounts` keeps its "never opens a socket" property.
+cosmic-pim-accounts = { path = "../cosmic-pim-accounts" }
+
+# Token endpoints are ordinary HTTPS form posts. Same major version as the
+# CalDAV client so one TLS stack is linked, not two.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls", "json", "form"] }
+
+# PKCE: a random verifier, its SHA-256, and both base64url-encoded.
+sha2 = "0.11"
+rand = "0.10"
+base64 = "0.23"
+
+chrono = { version = "0.4.45", features = ["clock"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tiny_http = "0.12"
+tempfile = "3"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

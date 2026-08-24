@@ -412,8 +412,6 @@ fn extract_alarms(
     out
 }
 
-
-
 /* ------------------------------------------------------------------ */
 /* Tasks (VTODO)                                                      */
 
@@ -588,7 +586,10 @@ fn write_vtodo(todo: &Todo, out: &mut String) {
         fold_line(&format!("SEQUENCE:{}", todo.sequence), out);
     }
     if let Some(created) = todo.created {
-        fold_line(&format!("CREATED:{}", created.format("%Y%m%dT%H%M%SZ")), out);
+        fold_line(
+            &format!("CREATED:{}", created.format("%Y%m%dT%H%M%SZ")),
+            out,
+        );
     }
     fold_line(
         &format!(
@@ -808,12 +809,18 @@ fn write_vevent(event: &Event, out: &mut String) {
         fold_line(&format!("SEQUENCE:{}", event.sequence), out);
     }
     if let Some(created) = event.created {
-        fold_line(&format!("CREATED:{}", created.format("%Y%m%dT%H%M%SZ")), out);
+        fold_line(
+            &format!("CREATED:{}", created.format("%Y%m%dT%H%M%SZ")),
+            out,
+        );
     }
     fold_line(
         &format!(
             "LAST-MODIFIED:{}",
-            event.last_modified.unwrap_or_else(Utc::now).format("%Y%m%dT%H%M%SZ")
+            event
+                .last_modified
+                .unwrap_or_else(Utc::now)
+                .format("%Y%m%dT%H%M%SZ")
         ),
         out,
     );
@@ -979,7 +986,9 @@ mod tests {
     }
 
     fn wrap(body: &str) -> String {
-        format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\nBEGIN:VEVENT\r\nUID:x@test\r\n{body}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\nBEGIN:VEVENT\r\nUID:x@test\r\n{body}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
     }
 
     #[test]
@@ -1374,7 +1383,11 @@ mod tests {
             Duration::zero(),
         ] {
             let text = format_iso_duration(d);
-            assert_eq!(parse_iso_duration(&text), Some(d), "round trip failed: {text}");
+            assert_eq!(
+                parse_iso_duration(&text),
+                Some(d),
+                "round trip failed: {text}"
+            );
         }
     }
 
@@ -1441,14 +1454,9 @@ mod recurrence_id_tests {
     #[test]
     fn a_zoned_recurrence_id_keeps_its_tzid_rather_than_resolving() {
         // Resolving through the local zone would make this key host-dependent.
-        let ids = recurrence_ids(&doc(&[
-            "DTSTART;TZID=Europe/Athens:20260810T100000\r\n\
-             RECURRENCE-ID;TZID=Europe/Athens:20260810T090000",
-        ]));
-        assert_eq!(
-            ids,
-            vec![Some("20260810T090000;TZID=Europe/Athens".into())]
-        );
+        let ids = recurrence_ids(&doc(&["DTSTART;TZID=Europe/Athens:20260810T100000\r\n\
+             RECURRENCE-ID;TZID=Europe/Athens:20260810T090000"]));
+        assert_eq!(ids, vec![Some("20260810T090000;TZID=Europe/Athens".into())]);
     }
 
     #[test]
@@ -1507,7 +1515,9 @@ mod todo_tests {
 
     #[test]
     fn due_uses_the_same_timezone_rules_as_an_event_start() {
-        let todo = one(&wrap("SUMMARY:x\r\nDUE;TZID=Europe/Athens :20260804T170000"));
+        let todo = one(&wrap(
+            "SUMMARY:x\r\nDUE;TZID=Europe/Athens :20260804T170000",
+        ));
         assert_eq!(
             todo.due,
             Some(EventTime::Zoned(
@@ -1526,7 +1536,9 @@ mod todo_tests {
         let todo = one(&wrap("SUMMARY:x\r\nDUE;VALUE=DATE:20260804"));
         assert_eq!(
             todo.due,
-            Some(EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()))
+            Some(EventTime::Date(
+                NaiveDate::from_ymd_opt(2026, 8, 4).unwrap()
+            ))
         );
     }
 

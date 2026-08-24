@@ -341,7 +341,11 @@ mod tests {
     fn subject_prefixes_strip_to_fixpoint_in_any_order() {
         assert_eq!(normalize_subject("Re: [devs] Fwd: Release"), "Release");
         assert_eq!(normalize_subject("RE: FW: re: Budget"), "Budget");
-        assert_eq!(normalize_subject("R: Ciao"), "Ciao", "the Italian/Greek prefix");
+        assert_eq!(
+            normalize_subject("R: Ciao"),
+            "Ciao",
+            "the Italian/Greek prefix"
+        );
         assert_eq!(normalize_subject("Release"), "Release");
     }
 
@@ -385,7 +389,13 @@ mod tests {
         let child = resolve_thread(
             &index,
             ACCOUNT,
-            threadable(Some("c@x"), "<root@x> <parent@x>", "<parent@x>", "Re: X", "X"),
+            threadable(
+                Some("c@x"),
+                "<root@x> <parent@x>",
+                "<parent@x>",
+                "Re: X",
+                "X",
+            ),
         );
         assert_eq!(child.thread_id, "legacy-thread");
     }
@@ -399,7 +409,13 @@ mod tests {
         let child = resolve_thread(
             &index,
             ACCOUNT,
-            threadable(Some("c@x"), "<root@x> <parent@x>", "<parent@x>", "Re: X", "X"),
+            threadable(
+                Some("c@x"),
+                "<root@x> <parent@x>",
+                "<parent@x>",
+                "Re: X",
+                "X",
+            ),
         );
         assert_eq!(
             child.thread_id, "current-thread",

@@ -440,7 +440,8 @@ mod tests {
         // routine, none of them valid UTF-8. Lossy conversion would corrupt
         // the message and invalidate its DKIM signature in one step.
         let (_dir, mut store) = open();
-        let raw = b"Subject: caf\xe9\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\ncaf\xe9\r\n";
+        let raw =
+            b"Subject: caf\xe9\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\ncaf\xe9\r\n";
         store
             .upsert(&RemoteMessage {
                 uid: 1,
@@ -484,7 +485,10 @@ mod tests {
             let mut store = MaildirStore::open(&path).unwrap();
             store.commit_cursor(cursor).unwrap();
         }
-        assert_eq!(MaildirStore::open(&path).unwrap().state().unwrap().cursor, cursor);
+        assert_eq!(
+            MaildirStore::open(&path).unwrap().state().unwrap().cursor,
+            cursor
+        );
     }
 
     #[test]
@@ -498,9 +502,23 @@ mod tests {
 
         let after = store.path_of(3).unwrap();
         assert_ne!(before, after, "the flags did not reach the filename");
-        assert!(!before.exists(), "the old name was left behind as a duplicate");
-        assert!(after.file_name().unwrap().to_str().unwrap().ends_with(":2,S"));
-        assert_eq!(store.raw(3).unwrap().unwrap(), bytes, "the bytes were rewritten");
+        assert!(
+            !before.exists(),
+            "the old name was left behind as a duplicate"
+        );
+        assert!(
+            after
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(":2,S")
+        );
+        assert_eq!(
+            store.raw(3).unwrap().unwrap(),
+            bytes,
+            "the bytes were rewritten"
+        );
     }
 
     #[test]
@@ -531,7 +549,11 @@ mod tests {
         store.upsert(&message(5, seen())).unwrap();
         store.rescan().unwrap();
         let state = store.state().unwrap();
-        assert_eq!(state.entries.len(), 1, "the mailbox now shows the message twice");
+        assert_eq!(
+            state.entries.len(),
+            1,
+            "the mailbox now shows the message twice"
+        );
         assert_eq!(state.entries[&5], seen());
     }
 
@@ -540,7 +562,9 @@ mod tests {
         let (_dir, mut store) = open();
         store.upsert(&message(6, seen())).unwrap();
         store.remove(6).unwrap();
-        store.remove(6).expect("sync re-runs and must be idempotent");
+        store
+            .remove(6)
+            .expect("sync re-runs and must be idempotent");
         assert!(store.raw(6).unwrap().is_none());
     }
 
@@ -654,9 +678,7 @@ mod queue_tests {
         let path = dir.path().join("INBOX");
         {
             let mut store = MaildirStore::open(&path).unwrap();
-            store
-                .enqueue(PushOp::Delete { uid: 9 })
-                .unwrap();
+            store.enqueue(PushOp::Delete { uid: 9 }).unwrap();
             store
                 .defer(9, Failure::User, "NO [NOPERM] read-only mailbox", 0)
                 .unwrap();

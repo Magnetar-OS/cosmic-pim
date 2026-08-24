@@ -1,0 +1,21 @@
+# Fastmail. No OAuth flow here on purpose: Fastmail's app passwords are
+# scoped per protocol and per device, revocable individually, and need no
+# client registration — which makes them strictly better than OAuth for a
+# desktop client, and available today.
+id = "fastmail"
+name = "Fastmail"
+hint = "Create an app password at fastmail.com under Settings → Privacy & Security → App passwords."
+
+[services]
+calendar = "https://caldav.fastmail.com/dav/calendars/user/{username}/"
+contacts = "https://carddav.fastmail.com/dav/addressbooks/user/{username}/"
+
+[services.mail]
+protocol = "jmap"
+jmap_session_url = "https://api.fastmail.com/jmap/session"
+imap_host = "imap.fastmail.com"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "smtp.fastmail.com"
+smtp_port = 465
+smtp_transport = "tls"

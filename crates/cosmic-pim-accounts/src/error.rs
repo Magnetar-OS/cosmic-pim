@@ -21,6 +21,15 @@ pub enum Error {
     #[error("no account with id “{0}”")]
     UnknownAccount(String),
 
+    /// The account exists but nothing is stored for it to authenticate with.
+    ///
+    /// Kept apart from an authentication failure deliberately: "nothing was
+    /// saved" and "what was saved is wrong" send a user to two different
+    /// places, and reporting the first as the second sends them to re-type a
+    /// password that was never the problem.
+    #[error("no credential is stored for account “{0}”")]
+    MissingSecret(String),
+
     /// A lock was poisoned, meaning a previous holder panicked. Fail closed
     /// rather than proceeding over state of unknown validity.
     #[error("credential store lock was poisoned by an earlier panic")]

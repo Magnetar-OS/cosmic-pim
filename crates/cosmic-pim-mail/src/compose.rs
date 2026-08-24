@@ -94,9 +94,10 @@ impl Attachment {
     pub fn from_path(path: &std::path::Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .map_err(|why| Error::Draft(format!("{} could not be read: {why}", path.display())))?;
-        let name = path
-            .file_name()
-            .map_or_else(|| "attachment".to_string(), |n| n.to_string_lossy().into_owned());
+        let name = path.file_name().map_or_else(
+            || "attachment".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         Ok(Self {
             mime_type: crate::attachment::mime_for(&name).to_owned(),
             name,
@@ -118,9 +119,7 @@ mod base64_bytes {
         serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let text = String::deserialize(deserializer)?;
         base64::engine::general_purpose::STANDARD
             .decode(text.as_bytes())
@@ -294,14 +293,13 @@ impl Draft {
                 .body(self.body.clone()),
         );
         for attachment in &self.attachments {
-            let content_type = header::ContentType::parse(&attachment.mime_type).unwrap_or_else(
-                |_| {
+            let content_type =
+                header::ContentType::parse(&attachment.mime_type).unwrap_or_else(|_| {
                     // A type we cannot parse must not stop the send; RFC 2046's
                     // default is the honest fallback.
                     header::ContentType::parse("application/octet-stream")
                         .unwrap_or(header::ContentType::TEXT_PLAIN)
-                },
-            );
+                });
             parts = parts.singlepart(
                 LettreAttachment::new(attachment.name.clone())
                     .body(attachment.bytes.clone(), content_type),
@@ -342,8 +340,7 @@ fn mailbox(from: &Mailbox) -> Result<LettreMailbox> {
 /// first entry is what every threading implementation hashes as the root.
 fn reply_references(message: &Message) -> Vec<String> {
     const MAX: usize = 20;
-    let mut chain =
-        crate::threading::reference_chain(&message.references, &message.in_reply_to);
+    let mut chain = crate::threading::reference_chain(&message.references, &message.in_reply_to);
     if let Some(id) = &message.message_id
         && !chain.contains(id)
     {
@@ -503,10 +500,7 @@ mod tests {
         // Including yourself puts a copy of every sent message back in your
         // inbox, and on a list it is how loops start.
         let draft = Draft::reply(&incoming(), me(), true);
-        let addresses: Vec<&str> = draft
-            .recipients()
-            .map(|m| m.address.as_str())
-            .collect();
+        let addresses: Vec<&str> = draft.recipients().map(|m| m.address.as_str()).collect();
         assert!(addresses.contains(&"ada@example.com"));
         assert!(addresses.contains(&"cleo@example.org"));
         assert!(addresses.contains(&"bob@example.net"));
@@ -542,10 +536,7 @@ mod tests {
         let draft = Draft::reply(&incoming(), me(), false);
         assert_eq!(draft.subject, "Re: Release plan");
         let again = parse("Subject: Re: Re: Fwd: Deep thread\r\n\r\nbody\r\n");
-        assert_eq!(
-            Draft::reply(&again, me(), false).subject,
-            "Re: Deep thread"
-        );
+        assert_eq!(Draft::reply(&again, me(), false).subject, "Re: Deep thread");
     }
 
     #[test]
@@ -705,7 +696,9 @@ mod tests {
             mime_type: "not a mime type at all".into(),
             bytes: b"bytes".to_vec(),
         });
-        let built = draft.build(false).expect("a bad type must not block the mail");
+        let built = draft
+            .build(false)
+            .expect("a bad type must not block the mail");
         let wire = String::from_utf8(built.formatted()).unwrap();
         assert!(wire.contains("application/octet-stream"), "{wire}");
     }
@@ -769,7 +762,12 @@ mod tests {
         ] {
             assert!(looks_like_an_address(good), "{good} was rejected");
         }
-        for bad in ["example.com", "a@@example.com", "a@localhost", "@example.com"] {
+        for bad in [
+            "example.com",
+            "a@@example.com",
+            "a@localhost",
+            "@example.com",
+        ] {
             assert!(!looks_like_an_address(bad), "{bad} was accepted");
         }
     }

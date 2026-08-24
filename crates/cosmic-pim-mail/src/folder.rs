@@ -35,7 +35,9 @@ use base64::Engine as _;
 ///
 /// `Inbox` is not an RFC 6154 attribute — INBOX is special in RFC 3501 itself,
 /// case-insensitively — but every consumer wants it in the same enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum SpecialUse {
     Inbox,
@@ -173,7 +175,9 @@ pub fn detect_special_use(
     match leaf {
         "inbox" => Some(SpecialUse::Inbox),
         "sent" | "sent messages" | "sent items" | "sent mail" => Some(SpecialUse::Sent),
-        "trash" | "deleted" | "deleted items" | "deleted messages" | "bin" => Some(SpecialUse::Trash),
+        "trash" | "deleted" | "deleted items" | "deleted messages" | "bin" => {
+            Some(SpecialUse::Trash)
+        }
         "junk" | "spam" | "junk e-mail" | "bulk mail" => Some(SpecialUse::Junk),
         "archive" | "archives" | "all mail" => Some(SpecialUse::Archive),
         "drafts" | "draft" => Some(SpecialUse::Drafts),
@@ -187,9 +191,11 @@ pub fn detect_special_use(
 pub fn sort_for_display(folders: &mut [Folder]) {
     folders.sort_by(|a, b| {
         let rank = |f: &Folder| f.special_use.map_or(u8::MAX, SpecialUse::order);
-        rank(a)
-            .cmp(&rank(b))
-            .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()))
+        rank(a).cmp(&rank(b)).then_with(|| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        })
     });
 }
 
@@ -355,7 +361,10 @@ mod tests {
     #[test]
     fn only_the_leaf_segment_names_a_role() {
         // `Archive/Work` is a folder inside the archive, not the archive.
-        assert_eq!(from_list_entry("Archive/Work", Some('/'), &[]).special_use, None);
+        assert_eq!(
+            from_list_entry("Archive/Work", Some('/'), &[]).special_use,
+            None
+        );
         assert_eq!(
             from_list_entry("Work/Archive", Some('/'), &[]).special_use,
             Some(SpecialUse::Archive)
@@ -375,7 +384,10 @@ mod tests {
     #[test]
     fn a_noselect_placeholder_is_marked_rather_than_looking_empty() {
         let folder = from_list_entry("Archive", Some('/'), &[A::NoSelect]);
-        assert!(folder.no_select, "SELECTing this is an error, not an empty mailbox");
+        assert!(
+            folder.no_select,
+            "SELECTing this is an error, not an empty mailbox"
+        );
     }
 
     #[test]

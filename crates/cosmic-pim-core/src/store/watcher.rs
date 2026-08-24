@@ -2,9 +2,14 @@
 
 //! Watches the vdir for changes made by anything other than us.
 //!
-//! The point is that `vdirsyncer`, `khal`, or a text editor can change files
-//! underneath a running app, and the view should follow along without the user
-//! having to reopen anything.
+//! The point is that `vdirsyncer`, `khal`, `khard`, or a text editor can change
+//! files underneath a running app, and the view should follow along without the
+//! user having to reopen anything.
+//!
+//! Calendars and address books share this one watcher: a vdir collection is a
+//! vdir collection, and the only difference between them is the item extension.
+//! Two watchers would mean two debounce policies and two sidecar-ignore lists
+//! to keep in step.
 //!
 //! Raw filesystem events are coalesced before being forwarded: a sync run
 //! rewrites dozens of files in a burst, and re-indexing once at the end is both
@@ -47,7 +52,7 @@ pub fn watch(root: &Path) -> Result<(Watch, tokio::sync::mpsc::Receiver<()>), St
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
 
     std::thread::Builder::new()
-        .name("calendar-watch".into())
+        .name("vdir-watch".into())
         .spawn(move || debounce_loop(&raw_rx, &tx))
         .map_err(StoreError::Io)?;
 
@@ -98,7 +103,7 @@ fn debounce_loop(
 }
 
 /// Filters out noise: our own atomic-write temp files, and anything that is not
-/// calendar data.
+/// collection data.
 fn is_interesting(event: &notify::Result<notify::Event>) -> bool {
     let Ok(event) = event else {
         return false;
@@ -111,15 +116,15 @@ fn is_interesting(event: &notify::Result<notify::Event>) -> bool {
         return false;
     }
 
-    event.paths.iter().any(|p| is_calendar_path(p))
+    event.paths.iter().any(|p| is_collection_path(p))
 }
 
-fn is_calendar_path(path: &Path) -> bool {
+fn is_collection_path(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
         return false;
     };
 
-    // Nothing that starts with a dot is calendar data. That covers our own
+    // Nothing that starts with a dot is collection data. That covers our own
     // `.name.ics.tmp` staging files (which land here a moment before the
     // rename), the `.caldav-state.json` sidecar rewritten on every sync cycle,
     // and whatever metadata another tool decides to drop in the collection.
@@ -131,7 +136,11 @@ fn is_calendar_path(path: &Path) -> bool {
         return false;
     }
 
+    // `.ics` for calendars and tasks, `.vcf` for address books. Both layouts
+    // are otherwise identical, so both are watched here rather than in two
+    // near-copies that would drift on the next sidecar.
     name.ends_with(".ics")
+        || name.ends_with(".vcf")
         || name == "displayname"
         || name == "color"
         // A whole collection appearing or disappearing has no extension at all.
@@ -159,14 +168,14 @@ mod tests {
 
     #[test]
     fn ignores_our_own_temp_files() {
-        assert!(!is_calendar_path(Path::new("/c/personal/.abc.ics.tmp")));
-        assert!(is_calendar_path(Path::new("/c/personal/abc.ics")));
+        assert!(!is_collection_path(Path::new("/c/personal/.abc.ics.tmp")));
+        assert!(is_collection_path(Path::new("/c/personal/abc.ics")));
     }
 
     #[test]
     fn watches_metadata_files() {
-        assert!(is_calendar_path(Path::new("/c/personal/displayname")));
-        assert!(is_calendar_path(Path::new("/c/personal/color")));
+        assert!(is_collection_path(Path::new("/c/personal/displayname")));
+        assert!(is_collection_path(Path::new("/c/personal/color")));
     }
 
     /// Sidecars and scratch files must never wake the UI.
@@ -175,7 +184,7 @@ mod tests {
     /// and each would otherwise trigger a rescan on every sync cycle — or, in
     /// the `.conflict` case, on every conflict. Pinned as a test because the
     /// list only grows, and the next sidecar added will be added by someone who
-    /// did not read `is_calendar_path`.
+    /// did not read `is_collection_path`.
     #[test]
     fn ignores_sidecars_and_scratch_files() {
         for name in [
@@ -194,16 +203,26 @@ mod tests {
             "/c/personal/.vdirsyncer-metadata.json",
         ] {
             assert!(
-                !is_calendar_path(Path::new(name)),
+                !is_collection_path(Path::new(name)),
                 "{name} should not wake the watcher"
             );
         }
     }
 
+    /// Address books are watched by the same code path as calendars. Without
+    /// this, a contacts app got a watcher that could never fire and looked
+    /// simply broken: `khard` or a sync run would change a card and the list
+    /// would sit there stale until the window was reopened.
+    #[test]
+    fn watches_address_book_items() {
+        assert!(is_collection_path(Path::new("/c/contacts/ada.vcf")));
+        assert!(!is_collection_path(Path::new("/c/contacts/.ada.vcf.tmp")));
+    }
+
     #[test]
     fn ignores_unrelated_files() {
-        assert!(!is_calendar_path(Path::new("/c/personal/notes.txt")));
-        assert!(!is_calendar_path(Path::new("/c/personal/photo.png")));
+        assert!(!is_collection_path(Path::new("/c/personal/notes.txt")));
+        assert!(!is_collection_path(Path::new("/c/personal/photo.png")));
     }
 
     #[tokio::test]

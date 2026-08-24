@@ -261,7 +261,10 @@ impl VdirStore {
         }
 
         let collection = self.state.href.as_deref()?;
-        Some(format!("{}{file}", collection.trim_end_matches('/').to_owned() + "/"))
+        Some(format!(
+            "{}{file}",
+            collection.trim_end_matches('/').to_owned() + "/"
+        ))
     }
 
     /// The href and etag recorded for a local file, if the server knows it.
@@ -430,12 +433,7 @@ impl VdirStore {
         // Two distinct hrefs can sanitise to the same name (different
         // collections on the same server, percent-encoding collapsing). Storing
         // both under one file would make each sync overwrite the other, forever.
-        if self
-            .state
-            .entries
-            .values()
-            .any(|entry| entry.file == name)
-        {
+        if self.state.entries.values().any(|entry| entry.file == name) {
             let mut n = 2;
             loop {
                 let candidate = format!("{}-{n}.{extension}", sanitise_stem(stem));
@@ -604,9 +602,11 @@ impl CalDavStore for VdirStore {
     /// disappears again on the next sync is a visible annoyance; it is not the
     /// silent loss this method exists to prevent.
     fn unpushed_local(&self, href: &str) -> Result<Option<String>> {
-        let queued_put = self.state.pending.iter().any(|entry| {
-            matches!(&entry.op, PushOp::Put { href: h, .. } if h == href)
-        });
+        let queued_put = self
+            .state
+            .pending
+            .iter()
+            .any(|entry| matches!(&entry.op, PushOp::Put { href: h, .. } if h == href));
         if !queued_put {
             return Ok(None);
         }
@@ -695,8 +695,7 @@ mod tests {
             })
             .unwrap();
 
-        let written =
-            std::fs::read_to_string(store.collection().path.join("abc.ics")).unwrap();
+        let written = std::fs::read_to_string(store.collection().path.join("abc.ics")).unwrap();
         assert!(
             written.contains("ATTENDEE;CN=Someone"),
             "an unmodelled property was lost on the way to disk"
@@ -714,7 +713,10 @@ mod tests {
         let state = reopened.state().unwrap();
 
         assert_eq!(state.ctag.as_deref(), Some("ctag-1"));
-        assert_eq!(state.entries.get("/cal/abc.ics").map(String::as_str), Some("\"v1\""));
+        assert_eq!(
+            state.entries.get("/cal/abc.ics").map(String::as_str),
+            Some("\"v1\"")
+        );
     }
 
     #[test]
@@ -729,7 +731,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".ics"))
             .collect();
-        assert_eq!(ics_files.len(), 1, "update duplicated the file: {ics_files:?}");
+        assert_eq!(
+            ics_files.len(),
+            1,
+            "update duplicated the file: {ics_files:?}"
+        );
         assert_eq!(
             store.state().unwrap().entries["/cal/abc.ics"],
             "\"v2\"",
@@ -843,12 +849,7 @@ impl PushQueue for VdirStore {
         // Replace rather than append: the newest edit is the one that should
         // reach the server, and replaying a stale state on top of a fresh one
         // is worse than not pushing at all.
-        if let Some(existing) = self
-            .state
-            .pending
-            .iter_mut()
-            .find(|e| e.op.href() == href)
-        {
+        if let Some(existing) = self.state.pending.iter_mut().find(|e| e.op.href() == href) {
             existing.op = op;
             existing.attempts = 0;
             existing.next_attempt_ms = 0;
@@ -877,12 +878,7 @@ impl PushQueue for VdirStore {
     }
 
     fn defer(&mut self, href: &str, error: &str, next_attempt_ms: i64) -> Result<()> {
-        if let Some(entry) = self
-            .state
-            .pending
-            .iter_mut()
-            .find(|e| e.op.href() == href)
-        {
+        if let Some(entry) = self.state.pending.iter_mut().find(|e| e.op.href() == href) {
             entry.attempts = entry.attempts.saturating_add(1);
             entry.next_attempt_ms = next_attempt_ms;
             entry.last_error = Some(error.to_owned());
@@ -892,12 +888,7 @@ impl PushQueue for VdirStore {
     }
 
     fn park(&mut self, href: &str, error: &str) -> Result<()> {
-        if let Some(entry) = self
-            .state
-            .pending
-            .iter_mut()
-            .find(|e| e.op.href() == href)
-        {
+        if let Some(entry) = self.state.pending.iter_mut().find(|e| e.op.href() == href) {
             entry.blocked = true;
             entry.last_error = Some(error.to_owned());
             self.save_sidecar()?;
@@ -990,7 +981,9 @@ mod push_queue_tests {
     fn deferring_records_the_error_durably() {
         let (dir, mut store) = store();
         store.queue_put("/cal/a.ics").unwrap();
-        store.defer("/cal/a.ics", "connection refused", 12_345).unwrap();
+        store
+            .defer("/cal/a.ics", "connection refused", 12_345)
+            .unwrap();
 
         let meta = vdir::collections(dir.path()).remove(0);
         let pending = VdirStore::open(meta).unwrap().pending();
@@ -1157,7 +1150,10 @@ mod conflict_tests {
     #[test]
     fn an_unsent_edit_is_visible_to_the_pull_path() {
         let (_dir, store) = diverged();
-        assert_eq!(store.unpushed_local(HREF).unwrap().as_deref(), Some(LOCAL_EDIT));
+        assert_eq!(
+            store.unpushed_local(HREF).unwrap().as_deref(),
+            Some(LOCAL_EDIT)
+        );
     }
 
     #[test]
@@ -1225,7 +1221,9 @@ mod conflict_tests {
         let meta = vdir::collections(dir.path()).remove(0);
         let reopened = VdirStore::open(meta).unwrap();
 
-        let conflict = reopened.conflict_for(HREF).expect("conflict lost on restart");
+        let conflict = reopened
+            .conflict_for(HREF)
+            .expect("conflict lost on restart");
         assert_eq!(conflict.local, LOCAL_EDIT);
         assert_eq!(conflict.remote, SERVER_V2);
     }
@@ -1239,7 +1237,10 @@ mod conflict_tests {
 
         assert_eq!(file(&store), SERVER_V2);
         assert_eq!(store.entry_for(HREF).unwrap().1, "\"v2\"");
-        assert!(store.pending().is_empty(), "a push survived the edit it carried");
+        assert!(
+            store.pending().is_empty(),
+            "a push survived the edit it carried"
+        );
         assert!(store.conflicts().is_empty());
     }
 
@@ -1271,7 +1272,11 @@ mod conflict_tests {
         let (_dir, mut store) = diverged();
         record(&mut store);
 
-        assert!(store.resolve_conflict_keep_local(HREF, Some(MERGED)).unwrap());
+        assert!(
+            store
+                .resolve_conflict_keep_local(HREF, Some(MERGED))
+                .unwrap()
+        );
 
         assert_eq!(file(&store), MERGED);
         assert_eq!(store.payload("a.ics").as_deref(), Some(MERGED));
@@ -1385,7 +1390,10 @@ mod sync_ownership_tests {
         std::fs::write(meta.path.join(".vdirsyncer.collection.items"), "").unwrap();
 
         assert_eq!(
-            VdirStore::open(meta).unwrap().foreign_sync_marker().as_deref(),
+            VdirStore::open(meta)
+                .unwrap()
+                .foreign_sync_marker()
+                .as_deref(),
             Some(".vdirsyncer.collection.items")
         );
     }
@@ -1396,7 +1404,10 @@ mod sync_ownership_tests {
         let mut store = VdirStore::open(meta.clone()).unwrap();
         store.set_remote("/cal/", false).unwrap();
 
-        assert!(meta.path.join(STATE_FILE).exists(), "no sidecar was written");
+        assert!(
+            meta.path.join(STATE_FILE).exists(),
+            "no sidecar was written"
+        );
         assert_eq!(store.foreign_sync_marker(), None);
     }
 

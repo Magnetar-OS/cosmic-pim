@@ -25,11 +25,7 @@ pub enum Error {
     /// fetch against renumbered UIDs silently stores the wrong message under
     /// the right name, which is worse than failing.
     #[error("mailbox {mailbox} was renumbered (UIDVALIDITY {had} → {now})")]
-    UidValidityChanged {
-        mailbox: String,
-        had: u32,
-        now: u32,
-    },
+    UidValidityChanged { mailbox: String, had: u32, now: u32 },
 
     #[error("the server rejected our credentials: {0}")]
     Auth(String),

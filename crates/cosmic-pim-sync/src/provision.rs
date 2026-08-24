@@ -127,7 +127,8 @@ pub fn provision_account(
         let contested = store.foreign_sync_marker();
         if let Some(marker) = &contested {
             tracing::warn!(
-                collection = meta.id, marker,
+                collection = meta.id,
+                marker,
                 "another sync engine already owns this collection; not syncing it"
             );
         }
@@ -185,8 +186,14 @@ mod tests {
 
     #[test]
     fn a_name_is_derived_from_the_last_href_segment() {
-        assert_eq!(name_from_href("/dav/calendars/user/work/", Flavor::CalDav), "work");
-        assert_eq!(name_from_href("/dav/calendars/user/work", Flavor::CalDav), "work");
+        assert_eq!(
+            name_from_href("/dav/calendars/user/work/", Flavor::CalDav),
+            "work"
+        );
+        assert_eq!(
+            name_from_href("/dav/calendars/user/work", Flavor::CalDav),
+            "work"
+        );
     }
 
     #[test]

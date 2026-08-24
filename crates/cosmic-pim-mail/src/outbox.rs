@@ -32,6 +32,7 @@ use cosmic_pim_core::atomic;
 
 use crate::compose::Draft;
 use crate::error::{Error, Result};
+use crate::sasl::Credentials;
 use crate::smtp::{self, Outcome, SmtpEndpoint};
 
 /// Where queued messages live, beside the account's maildirs.
@@ -234,7 +235,7 @@ impl Outbox {
     pub fn drain(
         &self,
         endpoint: &SmtpEndpoint,
-        password: &str,
+        credentials: &Credentials,
         now_ms: i64,
     ) -> Result<DrainOutcome> {
         let mut outcome = DrainOutcome::default();
@@ -245,7 +246,7 @@ impl Outbox {
                 continue;
             }
 
-            match smtp::send(endpoint, password, &queued.draft) {
+            match smtp::send(endpoint, credentials, &queued.draft) {
                 Outcome::Sent(filed) => {
                     self.remove(&queued.id)?;
                     outcome.sent.push((queued.id, filed));
@@ -303,8 +304,8 @@ impl Outbox {
         if !crate::drafts::is_valid_id(&queued.id) {
             return Err(Error::Draft(format!("{} is not an id", queued.id)));
         }
-        let json = serde_json::to_string_pretty(queued)
-            .map_err(|why| Error::Draft(why.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(queued).map_err(|why| Error::Draft(why.to_string()))?;
         atomic::write(&self.path(&queued.id), &json, None)?;
         Ok(())
     }
@@ -317,6 +318,12 @@ impl Outbox {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// The credential every outbox test uses. The mechanism is irrelevant
+    /// here — nothing in these tests reaches a server.
+    fn password() -> Credentials {
+        Credentials::Password("hunter2".into())
+    }
     use super::*;
     use crate::model::Mailbox;
 
@@ -383,7 +390,11 @@ mod tests {
         let refused_error = outbox
             .queue("00000001", &draft("Risky"), &ambiguous, 0)
             .expect_err("an ambiguous send must not be queueable");
-        assert!(refused_error.to_string().contains("may already have been delivered"));
+        assert!(
+            refused_error
+                .to_string()
+                .contains("may already have been delivered")
+        );
         assert!(outbox.list().unwrap().is_empty());
     }
 
@@ -404,7 +415,7 @@ mod tests {
             .queue("00000001", &draft("Later"), &refused(), 0)
             .unwrap();
 
-        let outcome = outbox.drain(&unreachable(), "hunter2", 1_000).unwrap();
+        let outcome = outbox.drain(&unreachable(), &password(), 1_000).unwrap();
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.deferred, 0);
         assert_eq!(
@@ -422,7 +433,7 @@ mod tests {
             .unwrap();
 
         let outcome = outbox
-            .drain(&unreachable(), "hunter2", MAX_DELAY_MS + 1)
+            .drain(&unreachable(), &password(), MAX_DELAY_MS + 1)
             .unwrap();
         assert_eq!(outcome.deferred, 1);
         assert!(outcome.sent.is_empty());
@@ -431,7 +442,10 @@ mod tests {
         let queued = &outbox.list().unwrap()[0];
         assert_eq!(queued.attempts, 2);
         assert!(queued.is_live());
-        assert_eq!(queued.draft.subject, "Still offline", "the message was lost");
+        assert_eq!(
+            queued.draft.subject, "Still offline",
+            "the message was lost"
+        );
     }
 
     #[test]
@@ -446,11 +460,14 @@ mod tests {
         let mut now = 0_i64;
         for _ in 0..MAX_ATTEMPTS {
             now += MAX_DELAY_MS + 1;
-            outbox.drain(&unreachable(), "hunter2", now).unwrap();
+            outbox.drain(&unreachable(), &password(), now).unwrap();
         }
 
         let queued = &outbox.list().unwrap()[0];
-        assert!(queued.given_up, "it is still retrying after {MAX_ATTEMPTS} attempts");
+        assert!(
+            queued.given_up,
+            "it is still retrying after {MAX_ATTEMPTS} attempts"
+        );
         assert!(
             !queued.draft.subject.is_empty(),
             "giving up must not discard the message"
@@ -466,10 +483,12 @@ mod tests {
         let mut now = 0_i64;
         for _ in 0..MAX_ATTEMPTS {
             now += MAX_DELAY_MS + 1;
-            outbox.drain(&unreachable(), "hunter2", now).unwrap();
+            outbox.drain(&unreachable(), &password(), now).unwrap();
         }
 
-        let outcome = outbox.drain(&unreachable(), "hunter2", now + MAX_DELAY_MS).unwrap();
+        let outcome = outbox
+            .drain(&unreachable(), &password(), now + MAX_DELAY_MS)
+            .unwrap();
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.deferred, 0);
 
@@ -483,7 +502,11 @@ mod tests {
     #[test]
     fn messages_go_out_in_the_order_they_were_written() {
         let (_dir, outbox) = outbox();
-        for (id, subject) in [("00000003", "third"), ("00000001", "first"), ("00000002", "second")] {
+        for (id, subject) in [
+            ("00000003", "third"),
+            ("00000001", "first"),
+            ("00000002", "second"),
+        ] {
             outbox.queue(id, &draft(subject), &refused(), 0).unwrap();
         }
         let subjects: Vec<String> = outbox
@@ -525,7 +548,9 @@ mod tests {
     #[test]
     fn removing_a_message_that_is_already_gone_is_not_an_error() {
         let (_dir, outbox) = outbox();
-        outbox.queue("00000001", &draft("x"), &refused(), 0).unwrap();
+        outbox
+            .queue("00000001", &draft("x"), &refused(), 0)
+            .unwrap();
         outbox.remove("00000001").unwrap();
         outbox.remove("00000001").unwrap();
         assert_eq!(outbox.count(), 0);
@@ -534,7 +559,11 @@ mod tests {
     #[test]
     fn an_id_that_could_escape_the_directory_is_refused() {
         let (_dir, outbox) = outbox();
-        assert!(outbox.queue("../../evil", &draft("x"), &refused(), 0).is_err());
+        assert!(
+            outbox
+                .queue("../../evil", &draft("x"), &refused(), 0)
+                .is_err()
+        );
         assert_eq!(outbox.count(), 0);
     }
 }

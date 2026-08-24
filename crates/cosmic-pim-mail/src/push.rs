@@ -245,11 +245,7 @@ impl DrainOutcome {
 ///
 /// `now_ms` is a parameter rather than read from the clock so the backoff
 /// schedule is testable without sleeping.
-pub fn drain(
-    server: &mut impl Writeback,
-    queue: &mut impl PushQueue,
-    now_ms: i64,
-) -> DrainOutcome {
+pub fn drain(server: &mut impl Writeback, queue: &mut impl PushQueue, now_ms: i64) -> DrainOutcome {
     let mut outcome = DrainOutcome::default();
 
     for entry in queue.pending() {
@@ -468,7 +464,10 @@ mod tests {
 
         let pending = queue.pending();
         assert_eq!(pending.len(), 1, "the queue accumulated duplicates");
-        assert_eq!(pending[0].attempts, 0, "backoff was not reset by a new edit");
+        assert_eq!(
+            pending[0].attempts, 0,
+            "backoff was not reset by a new edit"
+        );
         assert_eq!(pending[0].next_attempt_ms, 0);
     }
 
@@ -506,7 +505,10 @@ mod tests {
         assert_eq!(entry.attempts, 1);
         assert_eq!(entry.next_attempt_ms, retry_delay_ms(1));
         assert!(entry.is_live());
-        assert!(entry.last_error.is_some(), "the reason was not kept for the UI");
+        assert!(
+            entry.last_error.is_some(),
+            "the reason was not kept for the UI"
+        );
     }
 
     #[test]
@@ -559,7 +561,9 @@ mod tests {
         // must not stay stuck on the old verdict.
         let mut queue = MemoryQueue::default();
         queue.enqueue(set_flags(1)).unwrap();
-        queue.defer(1, Failure::User, "[AUTHENTICATIONFAILED]", 0).unwrap();
+        queue
+            .defer(1, Failure::User, "[AUTHENTICATIONFAILED]", 0)
+            .unwrap();
         queue.enqueue(set_flags(1)).unwrap();
         assert!(queue.pending()[0].is_live());
     }
@@ -583,9 +587,7 @@ mod tests {
         let mut server = FakeServer::default();
         let mut queue = MemoryQueue::default();
         queue.enqueue(set_flags(1)).unwrap();
-        queue
-            .enqueue(PushOp::Delete { uid: 2 })
-            .unwrap();
+        queue.enqueue(PushOp::Delete { uid: 2 }).unwrap();
 
         let outcome = drain(&mut server, &mut queue, 0);
 

@@ -156,7 +156,10 @@ mod tests {
         let local: BTreeMap<u32, Flags> = [(1, seen())].into_iter().collect();
         let plan = plan_reconcile(&[], &local);
         assert!(plan.guard_tripped);
-        assert!(plan.to_remove.is_empty(), "a server hiccup deleted the mailbox");
+        assert!(
+            plan.to_remove.is_empty(),
+            "a server hiccup deleted the mailbox"
+        );
         assert!(plan.to_fetch.is_empty());
     }
 

@@ -78,7 +78,9 @@ fn serve(rounds: Vec<Round>) -> Server {
                 next_cycle += 1;
             }
 
-            let Some(current) = rounds.get(serving) else { break };
+            let Some(current) = rounds.get(serving) else {
+                break;
+            };
 
             let xml = if method == "PROPFIND" && body.contains("getctag") {
                 propfinds.fetch_add(1, Ordering::SeqCst);
@@ -498,6 +500,9 @@ fn resolving_a_conflict_in_favour_of_the_server_leaves_a_clean_collection() {
 
     let reports_before = server.report_count.load(Ordering::SeqCst);
     let outcome = sync_collection(&client, &server.url, &mut store).expect("third sync");
-    assert!(outcome.unchanged, "the resolved collection re-listed itself");
+    assert!(
+        outcome.unchanged,
+        "the resolved collection re-listed itself"
+    );
     assert_eq!(server.report_count.load(Ordering::SeqCst), reports_before);
 }

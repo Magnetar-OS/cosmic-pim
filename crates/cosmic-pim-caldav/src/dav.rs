@@ -12,7 +12,6 @@
 
 //! The CalDAV protocol layer: URLs, XML, and HTTP. No storage, no state.
 
-
 use std::time::Duration;
 
 use quick_xml::Reader;
@@ -1017,9 +1016,7 @@ const PROPFIND_SCHEDULING: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 /// URL resolution, the redirect and credential policy, the multistatus
 /// scaffolding, the etag handling — is shared verbatim, which is why this is an
 /// enum rather than a second crate.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Flavor {
     #[default]
@@ -1117,9 +1114,53 @@ struct DavResponse {
     body: String,
 }
 
+/// How a request proves who it is.
+///
+/// Two schemes, because there are two kinds of CalDAV server left: the ones
+/// reached with a URL and an app password, and Google and Microsoft, which
+/// withdrew password authentication and take an OAuth bearer token. The
+/// difference is one header, and it stops here — nothing else in this crate
+/// knows which one it is using, and this client never renews anything. A token
+/// arrives already valid (see `cosmic_pim_auth::resolve`) because a protocol
+/// client that could refresh credentials would need the account store, the
+/// provider registry and an HTTP client of its own, and would be reimplemented
+/// in the IMAP session next to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Auth {
+    /// RFC 7617 Basic. The password is normally an app password.
+    Basic { username: String, password: String },
+    /// RFC 6750 Bearer. Valid for about an hour; the caller resolves it.
+    Bearer(String),
+}
+
+impl Auth {
+    /// The `Authorization` header value.
+    fn header(&self) -> String {
+        match self {
+            Self::Basic { username, password } => {
+                let credentials = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    format!("{username}:{password}"),
+                );
+                format!("Basic {credentials}")
+            }
+            Self::Bearer(token) => format!("Bearer {token}"),
+        }
+    }
+}
+
+/// Deliberately opaque, so a client in a `{:?}` never prints a credential.
+impl std::fmt::Debug for CaldavClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaldavClient")
+            .field("flavor", &self.flavor)
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Minimal `CalDAV` client: PROPFIND discovery/listing, REPORT multiget,
-/// PUT/DELETE writeback, HTTP Basic auth (username = account email,
-/// password from the secret backend).
+/// PUT/DELETE writeback, and one `Authorization` header — see [`Auth`].
 pub struct CaldavClient {
     flavor: Flavor,
     agent: reqwest::blocking::Client,
@@ -1131,7 +1172,24 @@ pub struct CaldavClient {
 }
 
 impl CaldavClient {
+    /// A client authenticating with a username and password.
     pub fn new(base_url: &str, username: &str, password: &str) -> Self {
+        Self::with_auth(
+            base_url,
+            Flavor::CalDav,
+            &Auth::Basic {
+                username: username.to_owned(),
+                password: password.to_owned(),
+            },
+        )
+    }
+
+    /// A client for either flavour, authenticating either way.
+    ///
+    /// The general constructor the other three delegate to. `sync` uses this
+    /// one, because which scheme an account needs is a property of the account
+    /// rather than of the call site.
+    pub fn with_auth(base_url: &str, flavor: Flavor, auth: &Auth) -> Self {
         // `redirect::Policy::none()`: the client returns 3xx responses instead
         // of following them, and `request()` below walks the chain manually —
         // the only way to both know the final URL for href resolution and to
@@ -1150,15 +1208,11 @@ impl CaldavClient {
             .timeout(DAV_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
-        let credentials = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            format!("{username}:{password}"),
-        );
         Self {
-            flavor: Flavor::CalDav,
+            flavor,
             agent,
             base_url: base_url.trim_end_matches('/').to_string(),
-            auth_header: format!("Basic {credentials}"),
+            auth_header: auth.header(),
             principal_url: None,
             calendar_home_url: None,
         }
@@ -1167,10 +1221,14 @@ impl CaldavClient {
     /// The same client, speaking CardDAV.
     #[must_use]
     pub fn carddav(base_url: &str, username: &str, password: &str) -> Self {
-        Self {
-            flavor: Flavor::CardDav,
-            ..Self::new(base_url, username, password)
-        }
+        Self::with_auth(
+            base_url,
+            Flavor::CardDav,
+            &Auth::Basic {
+                username: username.to_owned(),
+                password: password.to_owned(),
+            },
+        )
     }
 
     #[must_use]
@@ -1529,9 +1587,10 @@ impl CaldavClient {
     /// the server files new scheduling objects on (the preferred landing
     /// spot for mail-borne invitations, F-CAL-12).
     pub fn discover_scheduling(&self) -> Result<SchedulingInfo> {
-        let principal = self.principal_url.clone().ok_or_else(|| {
-            Error::protocol("caldav: no principal URL — call discover() first")
-        })?;
+        let principal = self
+            .principal_url
+            .clone()
+            .ok_or_else(|| Error::protocol("caldav: no principal URL — call discover() first"))?;
         let (final_url, body) = self.propfind(&principal, "0", PROPFIND_SCHEDULING)?;
         let supports_scheduling = extract_first_href_property(&body, "schedule-outbox-URL")
             .is_some_and(|h| !h.trim().is_empty());
@@ -1678,7 +1737,6 @@ impl CaldavClient {
     }
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1813,7 +1871,11 @@ mod tests {
 
     #[test]
     fn icalendar_resource_classification() {
-        assert!(is_syncable_resource("/cal/e.ics", "text/calendar", Flavor::CalDav));
+        assert!(is_syncable_resource(
+            "/cal/e.ics",
+            "text/calendar",
+            Flavor::CalDav
+        ));
         // Case-insensitive media types (RFC 7231 §3.1.1.1).
         assert!(is_syncable_resource(
             "/cal/e",
@@ -1826,12 +1888,24 @@ mod tests {
             Flavor::CalDav
         ));
         // Extension match survives query strings and case.
-        assert!(is_syncable_resource("/cal/e.ICS?rev=42", "", Flavor::CalDav));
+        assert!(is_syncable_resource(
+            "/cal/e.ICS?rev=42",
+            "",
+            Flavor::CalDav
+        ));
         // Empty content-type + non-slash tail is the last-resort accept...
         assert!(is_syncable_resource("/cal/e", "", Flavor::CalDav));
         // ...but a collection (slash tail after query-strip) is not.
-        assert!(!is_syncable_resource("/cal/folder/?rev=1", "", Flavor::CalDav));
-        assert!(!is_syncable_resource("/cal/e", "text/plain", Flavor::CalDav));
+        assert!(!is_syncable_resource(
+            "/cal/folder/?rev=1",
+            "",
+            Flavor::CalDav
+        ));
+        assert!(!is_syncable_resource(
+            "/cal/e",
+            "text/plain",
+            Flavor::CalDav
+        ));
     }
 
     /* ---------------- multistatus parsing ---------------- */
@@ -2069,7 +2143,6 @@ END:VCALENDAR]]></C:calendar-data></D:prop>
         assert!(!status_line_is_ok("garbage"));
     }
 
-
     /* ---------------- CardDAV flavour ---------------- */
 
     #[test]
@@ -2128,14 +2201,91 @@ END:VCARD</card:address-data>
         // The bug this prevents: CardDAV listings were being filtered by a
         // CalDAV-only content-type gate, so every .vcf was silently skipped and
         // an address book synced as empty.
-        assert!(is_syncable_resource("/c/a.vcf", "text/vcard", Flavor::CardDav));
-        assert!(is_syncable_resource("/c/a", "text/vcard; charset=utf-8", Flavor::CardDav));
+        assert!(is_syncable_resource(
+            "/c/a.vcf",
+            "text/vcard",
+            Flavor::CardDav
+        ));
+        assert!(is_syncable_resource(
+            "/c/a",
+            "text/vcard; charset=utf-8",
+            Flavor::CardDav
+        ));
         assert!(is_syncable_resource("/c/a.VCF?rev=1", "", Flavor::CardDav));
         // text/directory is what vCard 3.0 servers still send.
-        assert!(is_syncable_resource("/c/a", "text/directory", Flavor::CardDav));
+        assert!(is_syncable_resource(
+            "/c/a",
+            "text/directory",
+            Flavor::CardDav
+        ));
 
-        assert!(!is_syncable_resource("/c/a.vcf", "text/vcard", Flavor::CalDav));
-        assert!(!is_syncable_resource("/cal/e.ics", "text/calendar", Flavor::CardDav));
+        assert!(!is_syncable_resource(
+            "/c/a.vcf",
+            "text/vcard",
+            Flavor::CalDav
+        ));
+        assert!(!is_syncable_resource(
+            "/cal/e.ics",
+            "text/calendar",
+            Flavor::CardDav
+        ));
         assert!(!is_syncable_resource("/c/folder/", "", Flavor::CardDav));
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn basic_is_rfc_7617_base64_of_user_colon_password() {
+        let auth = Auth::Basic {
+            username: "Aladdin".into(),
+            password: "open sesame".into(),
+        };
+        // The example from RFC 7617 §2 itself.
+        assert_eq!(auth.header(), "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    }
+
+    #[test]
+    fn a_bearer_token_is_sent_as_a_bearer_token() {
+        // Google and Microsoft withdrew password authentication for CalDAV and
+        // CardDAV; sending an access token as a Basic password — which is what
+        // happened before this existed — collects a 401 that reads as a wrong
+        // password.
+        assert_eq!(
+            Auth::Bearer("ya29.token".into()).header(),
+            "Bearer ya29.token"
+        );
+    }
+
+    #[test]
+    fn a_client_does_not_print_its_credentials() {
+        // `{:?}` on a client ends up in tracing spans and panic messages.
+        let client = CaldavClient::with_auth(
+            "https://dav.example/",
+            Flavor::CardDav,
+            &Auth::Bearer("ya29.secret".into()),
+        );
+        let rendered = format!("{client:?}");
+
+        assert!(!rendered.contains("ya29.secret"), "a token leaked into Debug output");
+        assert!(rendered.contains("CardDav"), "the useful part was redacted too");
+    }
+
+    #[test]
+    fn the_general_constructor_agrees_with_the_two_shorthands() {
+        let basic = Auth::Basic {
+            username: "ada".into(),
+            password: "pw".into(),
+        };
+        assert_eq!(
+            CaldavClient::new("https://dav.example/", "ada", "pw").auth_header,
+            CaldavClient::with_auth("https://dav.example/", Flavor::CalDav, &basic).auth_header
+        );
+        assert_eq!(
+            CaldavClient::carddav("https://dav.example/", "ada", "pw").flavor(),
+            Flavor::CardDav
+        );
     }
 }

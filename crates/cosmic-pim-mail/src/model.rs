@@ -65,7 +65,9 @@ impl Mailbox {
 /// maildir filename and the IMAP wire form are fixed vocabularies. Custom
 /// keywords are a different thing with a different lifetime and are not
 /// modelled here — see [`crate::maildir`] for why they are not in the filename.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Flags {
     /// `\Seen` / maildir `S`.
     pub seen: bool,
@@ -313,7 +315,11 @@ impl Message {
 }
 
 fn strip_angles(id: &str) -> String {
-    id.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string()
+    id.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_string()
 }
 
 /// `mail_parser` hands back one address, a group, or a list behind one type;
@@ -330,7 +336,10 @@ fn mailboxes(address: Option<&mail_parser::Address<'_>>) -> Vec<Mailbox> {
                 return None;
             }
             Some(Mailbox {
-                name: addr.name().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
+                name: addr
+                    .name()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty()),
                 address: email.to_ascii_lowercase(),
             })
         })
@@ -360,15 +369,13 @@ fn attachments(msg: &ParsedMessage<'_>) -> Vec<Attachment> {
                 .unwrap_or("attachment")
                 .trim()
                 .to_string(),
-            mime_type: part
-                .content_type()
-                .map_or_else(
-                    || "application/octet-stream".to_string(),
-                    |ct| match ct.subtype() {
-                        Some(sub) => format!("{}/{}", ct.ctype(), sub),
-                        None => ct.ctype().to_string(),
-                    },
-                ),
+            mime_type: part.content_type().map_or_else(
+                || "application/octet-stream".to_string(),
+                |ct| match ct.subtype() {
+                    Some(sub) => format!("{}/{}", ct.ctype(), sub),
+                    None => ct.ctype().to_string(),
+                },
+            ),
             size: part.len(),
             inline: part.content_id().is_some(),
         })
@@ -410,8 +417,7 @@ Body text.\r\n";
     fn reference_headers_round_trip_into_threadable_text() {
         let msg = Message::parse(SIMPLE).unwrap();
         assert_eq!(
-            msg.references,
-            "<root@example.com> <parent@example.com>",
+            msg.references, "<root@example.com> <parent@example.com>",
             "References must reach threading as header text, oldest first"
         );
         assert_eq!(msg.in_reply_to, "<parent@example.com>");
@@ -444,7 +450,11 @@ Body text.\r\n";
             draft: true,
             ..Default::default()
         };
-        assert_eq!(flags.to_maildir_info(), "DFS", "flags must be ASCII-ordered");
+        assert_eq!(
+            flags.to_maildir_info(),
+            "DFS",
+            "flags must be ASCII-ordered"
+        );
         assert_eq!(Flags::from_maildir_info("SFD"), flags);
     }
 
@@ -469,7 +479,10 @@ Body text.\r\n";
             ..Default::default()
         };
         let merged = from_server.with_local_only_from(local);
-        assert!(merged.passed, "P is maildir-only and the server cannot report it");
+        assert!(
+            merged.passed,
+            "P is maildir-only and the server cannot report it"
+        );
         assert!(merged.flagged);
     }
 
@@ -480,6 +493,10 @@ Body text.\r\n";
             passed: true,
             ..Default::default()
         };
-        assert_eq!(flags.to_imap(), vec!["\\Seen"], "P was invented as a keyword");
+        assert_eq!(
+            flags.to_imap(),
+            vec!["\\Seen"],
+            "P was invented as a keyword"
+        );
     }
 }

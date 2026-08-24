@@ -701,7 +701,14 @@ mod tests {
     #[test]
     fn a_conversation_is_assembled_from_its_messages() {
         let store = store(vec![
-            message(1, "a@x", "", "Release plan", "Ada <ada@example.com>", "First."),
+            message(
+                1,
+                "a@x",
+                "",
+                "Release plan",
+                "Ada <ada@example.com>",
+                "First.",
+            ),
             message(
                 2,
                 "b@x",
@@ -710,7 +717,14 @@ mod tests {
                 "Bob <bob@example.net>",
                 "Second.",
             ),
-            message(3, "c@x", "", "Lunch", "Cleo <cleo@example.org>", "One o'clock?"),
+            message(
+                3,
+                "c@x",
+                "",
+                "Lunch",
+                "Cleo <cleo@example.org>",
+                "One o'clock?",
+            ),
         ]);
         let mut index = Index::in_memory().unwrap();
         assert_eq!(index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap(), 3);
@@ -724,10 +738,16 @@ mod tests {
             .iter()
             .find(|t| t.uids.len() == 2)
             .expect("the reply did not join its parent");
-        assert_eq!(plan.subject, "Release plan", "a Re: prefix reached the list");
+        assert_eq!(
+            plan.subject, "Release plan",
+            "a Re: prefix reached the list"
+        );
         assert_eq!(plan.uids, vec![1, 2]);
         assert_eq!(plan.participants, vec!["Ada", "Bob"]);
-        assert_eq!(plan.snippet, "Second.", "the snippet is not from the newest");
+        assert_eq!(
+            plan.snippet, "Second.",
+            "the snippet is not from the newest"
+        );
         assert!(plan.unread);
     }
 
@@ -782,8 +802,22 @@ mod tests {
         // child hashes the parent's Message-ID as its root and sits under an id
         // the parent will not land on.
         let store = store(vec![
-            message(1, "reply@x", "<parent@x>", "Re: X", "b@example.com", "second"),
-            message(2, "parent@x", "<grand@x>", "Re: X", "a@example.com", "first"),
+            message(
+                1,
+                "reply@x",
+                "<parent@x>",
+                "Re: X",
+                "b@example.com",
+                "second",
+            ),
+            message(
+                2,
+                "parent@x",
+                "<grand@x>",
+                "Re: X",
+                "a@example.com",
+                "first",
+            ),
         ]);
         let mut index = Index::in_memory().unwrap();
         index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
@@ -791,7 +825,11 @@ mod tests {
         let threads = index
             .conversations(ACCOUNT, MAILBOX, &flags(&store))
             .unwrap();
-        assert_eq!(threads.len(), 1, "the conversation stayed split: {threads:?}");
+        assert_eq!(
+            threads.len(),
+            1,
+            "the conversation stayed split: {threads:?}"
+        );
         assert_eq!(threads[0].uids, vec![1, 2]);
     }
 
@@ -872,9 +910,30 @@ mod tests {
 
     fn searchable() -> MemoryStore {
         store(vec![
-            message(1, "a@x", "", "Invoice 42 overdue", "Ada <ada@example.com>", "Please pay."),
-            message(2, "b@x", "", "Release plan", "Bob <bob@example.net>", "Draft attached."),
-            message(3, "c@x", "", "Lunch", "Ada <ada@example.com>", "One o'clock?"),
+            message(
+                1,
+                "a@x",
+                "",
+                "Invoice 42 overdue",
+                "Ada <ada@example.com>",
+                "Please pay.",
+            ),
+            message(
+                2,
+                "b@x",
+                "",
+                "Release plan",
+                "Bob <bob@example.net>",
+                "Draft attached.",
+            ),
+            message(
+                3,
+                "c@x",
+                "",
+                "Lunch",
+                "Ada <ada@example.com>",
+                "One o'clock?",
+            ),
         ])
     }
 

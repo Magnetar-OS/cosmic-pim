@@ -138,8 +138,7 @@ impl<'a> ContentLine<'a> {
     /// `Some(component)` when this is an `END:` line.
     #[must_use]
     pub fn ends(&self) -> Option<String> {
-        component_delimiter(&self.unfolded)
-            .and_then(|(is_begin, name)| (!is_begin).then_some(name))
+        component_delimiter(&self.unfolded).and_then(|(is_begin, name)| (!is_begin).then_some(name))
     }
 }
 
@@ -421,8 +420,7 @@ pub fn patch_nth_component(
             // keeping the group prefix and every parameter.
             (Some(edit), Some(existing)) if edit.groups.contains_key(existing) => {
                 let unfolded = line.unfolded();
-                let head =
-                    &unfolded[..find_unquoted_colon(unfolded).unwrap_or(unfolded.len())];
+                let head = &unfolded[..find_unquoted_colon(unfolded).unwrap_or(unfolded.len())];
                 let value = &edit.groups[existing];
                 fold(&format!("{head}:{value}"), terminator, &mut out);
             }
@@ -635,8 +633,8 @@ END:VCARD\r\n";
 
     #[test]
     fn removing_drops_only_ungrouped_occurrences() {
-        let out = patch_component(CARD, "VCARD", &edits(&[("EMAIL", Edit::remove())]))
-            .expect("patched");
+        let out =
+            patch_component(CARD, "VCARD", &edits(&[("EMAIL", Edit::remove())])).expect("patched");
         assert!(!out.contains("EMAIL;TYPE=work:ada@work.example"));
         assert!(out.contains("item1.EMAIL;type=INTERNET:ada@home.example\r\n"));
     }
@@ -735,7 +733,10 @@ END:VCALENDAR\r\n";
         )
         .expect("patched");
 
-        assert!(out.contains("SUMMARY:Master\r\n"), "the master was rewritten");
+        assert!(
+            out.contains("SUMMARY:Master\r\n"),
+            "the master was rewritten"
+        );
         assert!(out.contains("SUMMARY:Edited override\r\n"));
         assert!(!out.contains("SUMMARY:Override\r\n"));
     }

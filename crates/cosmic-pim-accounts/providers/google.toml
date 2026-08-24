@@ -1,0 +1,40 @@
+# Google. OAuth only: Basic authentication was withdrawn for Gmail, Calendar
+# and Contacts, so an app password does not exist here — a client id must be
+# configured before this provider can be used at all.
+id = "google"
+name = "Google"
+hint = "Requires an OAuth client id from a Google Cloud project. See providers(5) in the docs."
+
+[oauth]
+auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+redirect_port = 49173
+scopes = [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/carddav",
+    "https://mail.google.com/",
+]
+
+[oauth.extra_params]
+# Without this Google returns an access token and no refresh token, and the
+# account stops working an hour later with what looks like a revoked password.
+access_type = "offline"
+# And without this it stops returning a refresh token on every *subsequent*
+# authorisation, so re-adding a removed account yields an unrefreshable one.
+prompt = "consent"
+
+[services]
+calendar = "https://apidata.googleusercontent.com/caldav/v2/"
+contacts = "https://www.googleapis.com/carddav/v1/principals/{username}/"
+
+[services.mail]
+protocol = "imap"
+imap_host = "imap.gmail.com"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
+smtp_transport = "tls"

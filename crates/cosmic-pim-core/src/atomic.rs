@@ -70,7 +70,9 @@ pub enum Error {
     /// The target is left untouched. The content this call was asked to write
     /// has been preserved at `conflict`, so the caller can diff, merge, or
     /// discard rather than having silently lost one side.
-    #[error("{target} changed on disk since it was read; the incoming version was kept as {conflict}")]
+    #[error(
+        "{target} changed on disk since it was read; the incoming version was kept as {conflict}"
+    )]
     ModifiedSince { target: PathBuf, conflict: PathBuf },
 
     #[error("atomic write target has no parent directory: {0}")]
