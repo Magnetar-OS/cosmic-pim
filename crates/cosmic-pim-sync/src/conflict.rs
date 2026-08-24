@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 
 //! Reading and resolving the conflicts a sync pass recorded.

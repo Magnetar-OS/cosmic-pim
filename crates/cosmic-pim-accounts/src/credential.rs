@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 
 //! What an account authenticates with, whichever way it signs in.

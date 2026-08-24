@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 
 //! OAuth 2.0 sign-in and token renewal for the COSMIC PIM suite.

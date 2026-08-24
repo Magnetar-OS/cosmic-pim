@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 //
 // The date-time precedence rules, the TZID hardening, and the escaping and

@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 //
 // Ported from `src-tauri/src/model_text.rs` in the Meltemi project, with the

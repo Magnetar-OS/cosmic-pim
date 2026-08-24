@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 //
 // The filename sanitiser and the collision-suffixing rule are ported from

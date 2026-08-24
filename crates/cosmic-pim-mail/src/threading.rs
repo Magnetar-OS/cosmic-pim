@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 //
 // The algorithm, the deterministic-id scheme, and the healing rules are ported

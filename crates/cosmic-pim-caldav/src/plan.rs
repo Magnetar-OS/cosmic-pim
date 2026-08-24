@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 //
 // Ported verbatim from `src-tauri/src/caldav.rs` in the Meltemi project.

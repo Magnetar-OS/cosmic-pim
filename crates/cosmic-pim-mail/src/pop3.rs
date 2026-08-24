@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 
 //! POP3 (RFC 1939), for the accounts where it is the only thing on offer.

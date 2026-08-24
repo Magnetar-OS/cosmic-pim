@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 
 //! Tasks: `VTODO`, the other half of what a calendar collection can hold.

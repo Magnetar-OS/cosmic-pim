@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 //
 // The cascade's shape, the SSRF guard, and the autoconfig URL order are ported

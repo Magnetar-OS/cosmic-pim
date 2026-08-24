@@ -1,3 +1,4 @@
+// Copyright 2026 Dominikos Pritis
 // SPDX-License-Identifier: MPL-2.0
 //
 // The pre-acceptance / ambiguous split is ported from `smtp_send_as` in the

@@ -396,6 +396,26 @@ Tasks (VTODO) were the test of this and cost roughly 200 lines of model, 200 of
 iCalendar, 60 of store, and **zero** in the sync engine — a synced VTODO worked
 the moment the model existed, because the engine never parses what it stores.
 
+## COSMIC conventions, applied to a library
+
+`cosmic-conventions.md` records what the COSMIC ecosystem's repositories agree
+on. Most of it is about applications — libcosmic, applets, desktop entries,
+layer surfaces — and lands on Slate, Circle and Envelope rather than here. For
+the substrate, the project-level conventions and the deliberate divergences:
+
+| Convention | Here | Why |
+|---|---|---|
+| `rust-toolchain.toml` agreeing with `rust-version` | follows | 1.98.0 in both; raise together. |
+| `rustfmt.toml`, `imports_granularity = "Module"` | follows | |
+| `Cargo.lock` committed, libraries included | follows | |
+| justfile with the conventional recipe set | follows | Trimmed of install/uninstall — a library ships nothing installable. `vendor` stays for offline distro builds. |
+| Copyright line + SPDX header per source file | follows | |
+| MPL-2.0 for the linkable layer, GPL-3.0-only apps | follows | The same split libcosmic itself uses. See LICENSING.md. |
+| libcosmic as a git dependency | **rejected** | The substrate is deliberately toolkit-free; that is what makes it testable headless and reusable outside COSMIC. The apps take libcosmic. |
+| cosmic-config for configuration | **rejected** | `accounts.toml` + the keychain, shared suite-wide. cosmic-config is per-app desktop state; account identity is neither per-app nor desktop state, and depending on it would drag the toolkit in. |
+| i18n / Fluent catalogues | **rejected** | No user-visible strings — errors here are for developers and logs; the apps translate what they present. |
+| RDNN identity, desktop entry, metainfo, icons | n/a | Nothing here is launchable or discoverable. |
+
 ## Testing
 
 Roughly 740 tests in the substrate, `cargo test --workspace`.
