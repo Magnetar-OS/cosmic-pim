@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use cosmic_pim_accounts::{Account, AccountStore};
+use cosmic_pim_accounts::{Account, AccountStore, AuthMethod};
 use cosmic_pim_caldav::push::{DrainOutcome, drain};
 use cosmic_pim_caldav::{CaldavClient, Flavor, SyncOutcome, sync_collection};
 
@@ -183,6 +183,17 @@ fn sync_one(
         contacts_unavailable,
     };
 
+    // Before anything reaches the network: an OAuth account's secret slot holds
+    // a refresh token, and every client below sends what it is given as an HTTP
+    // Basic password. Attempting it would put that token on the wire, collect a
+    // 401, and tell the user their password is wrong.
+    if account.auth == AuthMethod::OAuth {
+        return report(
+            Err(Error::UnsupportedAuth(account.display_name.clone())),
+            None,
+        );
+    }
+
     let password = match store.password(&account.id) {
         Ok(Some(password)) => password,
         Ok(None) => {
@@ -310,4 +321,57 @@ pub fn sync_account(
         })?
         .clone();
     Ok(sync_one(store, &account, calendar_root, contacts_root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic_pim_accounts::{Account, AccountStore, AuthMethod, SecretStore};
+
+    /// An account store backed by a temp directory and the envelope secret
+    /// backend, so a test never touches the developer's real keychain.
+    fn store_with(auth: AuthMethod) -> (tempfile::TempDir, AccountStore, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+        let mut store = AccountStore::open(&dir.path().join("accounts.toml"), secrets).unwrap();
+
+        let mut account = Account::new("Work", "https://dav.example.com/", "ada@example.com");
+        account.auth = auth;
+        let id = account.id.clone();
+        store.add(account, "s3cret").unwrap();
+
+        (dir, store, id)
+    }
+
+    #[test]
+    fn an_oauth_account_is_refused_before_anything_reaches_the_network() {
+        // The secret slot for an OAuth account holds a refresh token, and every
+        // client below sends what it is handed as an HTTP Basic password.
+        // Proceeding would put that token on the wire and report the resulting
+        // 401 as a wrong password — for a password the user never set.
+        let (dir, mut store, id) = store_with(AuthMethod::OAuth);
+
+        let report = sync_account(&mut store, &id, dir.path(), dir.path()).unwrap();
+
+        let Err(Error::UnsupportedAuth(name)) = report.collections else {
+            panic!("an OAuth account was attempted with Basic credentials");
+        };
+        assert_eq!(name, "Work");
+    }
+
+    #[test]
+    fn a_password_account_gets_as_far_as_the_network() {
+        // The same account with the default auth method must *not* be refused
+        // here — the guard has to be about OAuth, not about accounts in general.
+        // `dav.example.com` does not resolve, so this fails at discovery, which
+        // is exactly how far it should get.
+        let (dir, mut store, id) = store_with(AuthMethod::Password);
+
+        let report = sync_account(&mut store, &id, dir.path(), dir.path()).unwrap();
+
+        assert!(
+            !matches!(report.collections, Err(Error::UnsupportedAuth(_))),
+            "a password account was refused as unsupported"
+        );
+    }
 }
