@@ -570,9 +570,12 @@ dependencies = [
 name = "cosmic-pim-sync"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "cosmic-pim-accounts",
+ "cosmic-pim-auth",
  "cosmic-pim-caldav",
  "cosmic-pim-core",
+ "cosmic-pim-mail",
  "tempfile",
  "thiserror",
  "tracing",

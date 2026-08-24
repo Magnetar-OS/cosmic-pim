@@ -13,6 +13,13 @@ pub enum Error {
     Account(#[from] cosmic_pim_accounts::Error),
 
     #[error(transparent)]
+    Mail(#[from] cosmic_pim_mail::Error),
+
+    /// Signing in, or renewing a sign-in, did not produce a usable token.
+    #[error(transparent)]
+    Auth(#[from] cosmic_pim_auth::Error),
+
+    #[error(transparent)]
     Store(#[from] cosmic_pim_core::StoreError),
 
     /// The collection carries another sync engine's metadata.
@@ -26,23 +33,6 @@ pub enum Error {
          syncing it here as well would make the two overwrite each other"
     )]
     ForeignSyncOwner { collection: String, marker: String },
-
-    /// The account authenticates with OAuth, which the sync path cannot do.
-    ///
-    /// Refused rather than attempted. The secret slot for such an account holds
-    /// a *refresh* token, and the CalDAV client sends whatever it is given as an
-    /// HTTP Basic password — so proceeding would put a refresh token on the wire
-    /// as a password, be rejected, and present as "wrong password" for a
-    /// password the user never set.
-    ///
-    /// Reaching an OAuth provider needs a short-lived access token refreshed per
-    /// cycle, which is what an online-accounts daemon is for. See
-    /// `cosmic_pim_accounts::AuthMethod::OAuth`.
-    #[error(
-        "account “{0}” signs in with OAuth, which this sync path does not support yet; \
-         it needs an online-accounts daemon to supply access tokens"
-    )]
-    UnsupportedAuth(String),
 
     /// The account exists but has no password in the keychain. Distinct from an
     /// authentication failure on purpose: the fix is "re-enter your password",

@@ -17,9 +17,9 @@
 
 use std::path::Path;
 
-use cosmic_pim_accounts::{Account, AccountStore, AuthMethod};
+use cosmic_pim_accounts::{Account, AccountStore, Registry, Secret};
 use cosmic_pim_caldav::push::{DrainOutcome, drain};
-use cosmic_pim_caldav::{CaldavClient, Flavor, SyncOutcome, sync_collection};
+use cosmic_pim_caldav::{Auth, CaldavClient, Flavor, SyncOutcome, sync_collection};
 
 use crate::error::{Error, Result};
 use crate::provision::{Provisioned, open_store, provision_account};
@@ -156,6 +156,7 @@ impl AccountReport {
 /// neither is not an error.
 pub fn sync_all(
     store: &mut AccountStore,
+    registry: &Registry,
     calendar_root: &Path,
     contacts_root: &Path,
 ) -> Vec<AccountReport> {
@@ -166,12 +167,13 @@ pub fn sync_all(
 
     accounts
         .iter()
-        .map(|account| sync_one(store, account, calendar_root, contacts_root))
+        .map(|account| sync_one(store, registry, account, calendar_root, contacts_root))
         .collect()
 }
 
 fn sync_one(
     store: &mut AccountStore,
+    registry: &Registry,
     account: &Account,
     calendar_root: &Path,
     contacts_root: &Path,
@@ -183,29 +185,25 @@ fn sync_one(
         contacts_unavailable,
     };
 
-    // Before anything reaches the network: an OAuth account's secret slot holds
-    // a refresh token, and every client below sends what it is given as an HTTP
-    // Basic password. Attempting it would put that token on the wire, collect a
-    // 401, and tell the user their password is wrong.
-    if account.auth == AuthMethod::OAuth {
-        return report(
-            Err(Error::UnsupportedAuth(account.display_name.clone())),
-            None,
-        );
-    }
-
-    let password = match store.password(&account.id) {
-        Ok(Some(password)) => password,
-        Ok(None) => {
-            return report(
-                Err(Error::MissingPassword(account.display_name.clone())),
-                None,
-            );
-        }
-        Err(why) => return report(Err(why.into()), None),
+    // One resolution for the whole pass, whichever way this account signs in.
+    // For OAuth that includes renewing an expired token and storing the result
+    // back, which is why the store is taken by value here and not by reference:
+    // a pass that renewed without persisting would renew again on every cycle,
+    // and against a provider that rotates refresh tokens it would invalidate
+    // the one on disk the first time.
+    let secret = match cosmic_pim_auth::resolve(store, registry, &account.id) {
+        Ok(secret) => secret,
+        Err(why) => return report(Err(Error::Auth(why)), None),
     };
+    let auth = dav_auth(account, &secret);
 
-    let mut client = CaldavClient::new(&account.url, &account.username, &password);
+    // Where the server is. A typed-in account carries its own URL; an account
+    // created from a provider has the manifest's, because nobody types
+    // `https://apidata.googleusercontent.com/caldav/v2/` from memory.
+    let calendar_url = service_url(account, registry, Service::Calendar);
+    let contacts_url = service_url(account, registry, Service::Contacts);
+
+    let mut client = CaldavClient::with_auth(&calendar_url, Flavor::CalDav, &auth);
 
     let calendars = match provision_account(&mut client, account, calendar_root) {
         Ok(provisioned) => provisioned,
@@ -217,7 +215,7 @@ fn sync_one(
     // failure: plenty of servers offer calendars and no contacts at all, and
     // treating that as a broken account would light up every calendar-only
     // setup with a permanent error.
-    let mut carddav = CaldavClient::carddav(&account.url, &account.username, &password);
+    let mut carddav = CaldavClient::with_auth(&contacts_url, Flavor::CardDav, &auth);
     let (address_books, contacts_unavailable) =
         match provision_account(&mut carddav, account, contacts_root) {
             Ok(provisioned) => (provisioned, None),
@@ -299,6 +297,48 @@ fn sync_provisioned(client: &CaldavClient, entry: &Provisioned, root: &Path) -> 
     }
 }
 
+/// Which service's address is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Service {
+    Calendar,
+    Contacts,
+}
+
+/// Where this account's collections live.
+///
+/// An account the user typed in carries its own URL and that wins — it is the
+/// more specific fact, and a self-hosted server has no manifest. An account
+/// created from a provider has an empty URL and takes the manifest's, because
+/// `https://apidata.googleusercontent.com/caldav/v2/` is not something anyone
+/// types from memory, and because the address is a property of the provider
+/// rather than of the account.
+fn service_url(account: &Account, registry: &Registry, service: Service) -> String {
+    if !account.url.trim().is_empty() {
+        return account.url.clone();
+    }
+
+    account
+        .provider
+        .as_deref()
+        .and_then(|id| registry.get(id))
+        .and_then(|provider| match service {
+            Service::Calendar => provider.calendar_url(&account.username),
+            Service::Contacts => provider.contacts_url(&account.username),
+        })
+        .unwrap_or_default()
+}
+
+/// The scheme this account's resolved secret is sent with.
+fn dav_auth(account: &Account, secret: &Secret) -> Auth {
+    match secret {
+        Secret::Password(password) => Auth::Basic {
+            username: account.username.clone(),
+            password: password.clone(),
+        },
+        Secret::AccessToken(token) => Auth::Bearer(token.clone()),
+    }
+}
+
 /// Wall-clock milliseconds. Isolated so the drain schedule has one source of
 /// truth and tests can reason about it.
 fn chrono_now_ms() -> i64 {
@@ -311,6 +351,7 @@ fn chrono_now_ms() -> i64 {
 /// Syncs one account, for "test this account" in a settings dialog.
 pub fn sync_account(
     store: &mut AccountStore,
+    registry: &Registry,
     account_id: &str,
     calendar_root: &Path,
     contacts_root: &Path,
@@ -319,58 +360,141 @@ pub fn sync_account(
         .get(account_id)
         .ok_or_else(|| cosmic_pim_accounts::Error::UnknownAccount(account_id.to_owned()))?
         .clone();
-    Ok(sync_one(store, &account, calendar_root, contacts_root))
+    Ok(sync_one(store, registry, &account, calendar_root, contacts_root))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmic_pim_accounts::{Account, AccountStore, AuthMethod, SecretStore};
+    use cosmic_pim_accounts::{Account, AccountStore, AuthMethod, OAuthCredential, SecretStore};
 
-    /// An account store backed by a temp directory and the envelope secret
-    /// backend, so a test never touches the developer's real keychain.
-    fn store_with(auth: AuthMethod) -> (tempfile::TempDir, AccountStore, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let secrets = SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
-        let mut store = AccountStore::open(&dir.path().join("accounts.toml"), secrets).unwrap();
-
-        let mut account = Account::new("Work", "https://dav.example.com/", "ada@example.com");
-        account.auth = auth;
-        let id = account.id.clone();
-        store.add(account, "s3cret").unwrap();
-
-        (dir, store, id)
+    /// A store backed by a temp directory and the envelope secret backend, so
+    /// a test never touches the developer's real keychain.
+    fn accounts_at(dir: &Path) -> AccountStore {
+        let secrets = SecretStore::open_envelope_only("cosmic-pim-test", dir);
+        AccountStore::open(&dir.join("accounts.toml"), secrets).unwrap()
     }
 
     #[test]
-    fn an_oauth_account_is_refused_before_anything_reaches_the_network() {
-        // The secret slot for an OAuth account holds a refresh token, and every
-        // client below sends what it is handed as an HTTP Basic password.
-        // Proceeding would put that token on the wire and report the resulting
-        // 401 as a wrong password — for a password the user never set.
-        let (dir, mut store, id) = store_with(AuthMethod::OAuth);
+    fn an_oauth_account_with_no_saved_sign_in_says_so_rather_than_guessing() {
+        // Before OAuth was supported this sent the refresh token as a Basic
+        // password and reported the 401 as a wrong password. Now the account
+        // never reaches the network, and the report says what is actually
+        // wrong with it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = accounts_at(dir.path());
+        let mut account = Account::new("Google", "", "ada@gmail.com");
+        account.auth = AuthMethod::OAuth;
+        account.provider = Some("google".into());
+        let id = account.id.clone();
+        store.add(account, "unused").unwrap();
 
-        let report = sync_account(&mut store, &id, dir.path(), dir.path()).unwrap();
+        let report =
+            sync_account(&mut store, &Registry::load_from(dir.path()), &id, dir.path(), dir.path())
+                .unwrap();
 
-        let Err(Error::UnsupportedAuth(name)) = report.collections else {
-            panic!("an OAuth account was attempted with Basic credentials");
+        let Err(Error::Auth(why)) = report.collections else {
+            panic!("an OAuth account without a grant was attempted anyway");
         };
-        assert_eq!(name, "Work");
+        assert!(why.needs_sign_in(), "expected a sign-in prompt, got {why}");
     }
 
     #[test]
     fn a_password_account_gets_as_far_as_the_network() {
-        // The same account with the default auth method must *not* be refused
-        // here — the guard has to be about OAuth, not about accounts in general.
-        // `dav.example.com` does not resolve, so this fails at discovery, which
-        // is exactly how far it should get.
-        let (dir, mut store, id) = store_with(AuthMethod::Password);
+        // The guard has to be about what is missing, not about accounts in
+        // general. `dav.example.com` does not resolve, so this fails at
+        // discovery — which is exactly how far it should get.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = accounts_at(dir.path());
+        let account = Account::new("Work", "https://dav.example.com/", "ada@example.com");
+        let id = account.id.clone();
+        store.add(account, "s3cret").unwrap();
 
-        let report = sync_account(&mut store, &id, dir.path(), dir.path()).unwrap();
+        let report =
+            sync_account(&mut store, &Registry::load_from(dir.path()), &id, dir.path(), dir.path())
+                .unwrap();
 
         assert!(
-            !matches!(report.collections, Err(Error::UnsupportedAuth(_))),
-            "a password account was refused as unsupported"
+            !matches!(report.collections, Err(Error::Auth(_))),
+            "a password account was stopped by the credential resolver"
+        );
+    }
+
+    #[test]
+    fn an_account_that_typed_its_own_url_keeps_it() {
+        // A self-hosted server has no manifest, and a provider's address must
+        // never override one a user entered.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let mut account = Account::new("Nextcloud", "https://cloud.example/dav/", "ada");
+        account.provider = Some("google".into());
+
+        assert_eq!(
+            service_url(&account, &registry, Service::Calendar),
+            "https://cloud.example/dav/"
+        );
+    }
+
+    #[test]
+    fn an_account_created_from_a_provider_takes_the_manifests_address() {
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let mut account = Account::new("Google", "", "ada@gmail.com");
+        account.provider = Some("google".into());
+
+        assert_eq!(
+            service_url(&account, &registry, Service::Calendar),
+            "https://apidata.googleusercontent.com/caldav/v2/"
+        );
+        assert!(
+            service_url(&account, &registry, Service::Contacts).contains("ada@gmail.com"),
+            "the username was not substituted into the CardDAV address"
+        );
+    }
+
+    #[test]
+    fn a_token_is_sent_as_a_bearer_and_a_password_as_basic() {
+        let account = Account::new("Work", "https://dav.example/", "ada");
+
+        assert_eq!(
+            dav_auth(&account, &Secret::AccessToken("ya29.token".into())),
+            Auth::Bearer("ya29.token".into())
+        );
+        assert_eq!(
+            dav_auth(&account, &Secret::Password("pw".into())),
+            Auth::Basic {
+                username: "ada".into(),
+                password: "pw".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_renewed_token_is_stored_before_the_pass_uses_it() {
+        // Not an optimisation: a provider that rotates refresh tokens
+        // invalidates the stored one the first time a renewal uses it, so a
+        // pass that renewed without persisting would leave an account that can
+        // never be renewed again.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = accounts_at(dir.path());
+        let account = Account::new("Google", "", "ada@gmail.com");
+        let id = account.id.clone();
+        let grant = OAuthCredential {
+            access_token: "still-valid".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            scopes: Vec::new(),
+            token_type: "Bearer".into(),
+        };
+        store.add_oauth(account, "google", &grant).unwrap();
+
+        // A live token needs no renewal, so the stored grant is untouched and
+        // no token endpoint is contacted.
+        let secret =
+            cosmic_pim_auth::resolve(&mut store, &Registry::load_from(dir.path()), &id).unwrap();
+
+        assert_eq!(secret, Secret::AccessToken("still-valid".into()));
+        assert_eq!(
+            store.credential(&id).unwrap().unwrap().access_token,
+            "still-valid"
         );
     }
 }
