@@ -21,7 +21,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 
-use cosmic_pim_mail::imap::{Endpoint, Security, Session, SyncOptions, sync_mailbox};
+use cosmic_pim_mail::imap::{Endpoint, Security, Session, SyncOptions, Watched, sync_mailbox};
 use cosmic_pim_mail::maildir::MaildirStore;
 use cosmic_pim_mail::model::{Flags, Message};
 use cosmic_pim_mail::push::{PushOp, PushQueue};
@@ -199,6 +199,18 @@ fn serve(stream: TcpStream, scenario: &Scenario, log: &mpsc::Sender<String>) {
                      {tag} OK LIST completed\r\n"
                 ),
             );
+        } else if verb_upper.starts_with("IDLE") {
+            reply(&mut out, "+ idling\r\n".to_string());
+            // A beat later, the server has news. This is the whole point of
+            // IDLE: the client is told, rather than asking.
+            thread::sleep(std::time::Duration::from_millis(120));
+            reply(&mut out, "* 1 EXISTS\r\n".to_string());
+            // The client answers DONE; consume it and close out the command.
+            let mut done = String::new();
+            if reader.read_line(&mut done).is_ok() {
+                let _ = log.send(done.trim_end().to_string());
+            }
+            reply(&mut out, format!("{tag} OK IDLE terminated\r\n"));
         } else if verb_upper.starts_with("LOGOUT") {
             reply(&mut out, format!("* BYE\r\n{tag} OK LOGOUT completed\r\n"));
             return;
@@ -593,5 +605,52 @@ fn a_second_cycle_with_nothing_new_fetches_nothing() {
         commands.get(&true),
         None,
         "a body was fetched with nothing new"
+    );
+}
+
+#[test]
+fn a_watch_returns_when_the_server_reports_news() {
+    // Push mail, end to end: the client parks in IDLE and the server's
+    // unsolicited EXISTS is what wakes it — no polling involved.
+    let server = FakeServer::start(Scenario {
+        capabilities: "IMAP4rev1 IDLE",
+        messages: vec![ServerMessage {
+            uid: 1,
+            flags: "",
+            body: HELLO,
+        }],
+        ..Scenario::default()
+    });
+    let mut session = connect(&server);
+    assert!(session.supports_idle(), "the capability was not read");
+
+    let outcome = session
+        .watch("INBOX", std::time::Duration::from_secs(10))
+        .expect("watch");
+    assert_eq!(
+        outcome,
+        Watched::Changed,
+        "the server said EXISTS and the watch did not wake"
+    );
+
+    let commands = server.commands();
+    assert!(
+        commands.iter().any(|c| c.to_ascii_uppercase().contains("IDLE")),
+        "no IDLE was ever issued: {commands:?}"
+    );
+    assert!(
+        commands.iter().any(|c| c.trim().eq_ignore_ascii_case("DONE")),
+        "the watch never terminated the IDLE cleanly: {commands:?}"
+    );
+}
+
+#[test]
+fn a_server_without_idle_says_so_up_front() {
+    // The caller's right response is the poll it already has — not a retry.
+    let server = FakeServer::start(Scenario::default());
+    let mut session = connect(&server);
+    assert!(
+        !session.supports_idle(),
+        "IDLE was claimed on a server that does not offer it"
     );
 }

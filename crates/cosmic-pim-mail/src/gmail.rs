@@ -496,6 +496,66 @@ impl Session {
         Ok(())
     }
 
+    /// Submits a message for delivery.
+    ///
+    /// `messages.send` with the raw RFC 5322, base64url-encoded — the same
+    /// verbatim-bytes rule in the outbound direction: the message Gmail sends
+    /// is byte-for-byte the one the composer built, not a reassembly.
+    ///
+    /// The message is built **with** its `Bcc` header, which looks wrong
+    /// against [`crate::compose::Draft::build`]'s own warning and is not: SMTP
+    /// carries recipients in a separate envelope, so the header must be
+    /// stripped there — but an API has no envelope. Recipients derive from the
+    /// headers, and Gmail, acting as the submission server, strips `Bcc` from
+    /// every delivered copy exactly as RFC 5322 §3.6.3 expects. Stripping it
+    /// ourselves would mean the blind-copied recipients never receive the
+    /// message at all.
+    ///
+    /// No Sent filing follows: Gmail files its own copy, and appending a
+    /// second would duplicate it on every device.
+    pub fn submit(&self, draft: &crate::compose::Draft) -> crate::smtp::Outcome {
+        use crate::smtp::Outcome;
+
+        let message = match draft.build(true) {
+            Ok(message) => message.formatted(),
+            Err(why) => return Outcome::NotSent(why),
+        };
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&message);
+
+        let url = format!("{}/messages/send", self.base);
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", &self.authorization)
+            .header("Content-Type", "application/json")
+            .body(json!({ "raw": encoded }).to_string())
+            .send();
+
+        let response = match response {
+            Ok(response) => response,
+            // A connection that never opened cannot have delivered anything;
+            // anything past that point may have.
+            Err(why) if why.is_connect() => {
+                return Outcome::NotSent(Error::Gmail(format!("messages.send: {why}")));
+            }
+            Err(why) => {
+                return Outcome::Ambiguous(Error::Gmail(format!("messages.send: {why}")));
+            }
+        };
+
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        match status {
+            // Gmail acknowledged the submission; its own Sent copy follows.
+            200..=299 => Outcome::Sent(message),
+            // The request itself was refused before acceptance.
+            400..=499 => Outcome::NotSent(Self::refuse(status, "messages.send", &body)),
+            // The server had the message when it failed; it may yet deliver.
+            _ => Outcome::Ambiguous(Self::refuse(status, "messages.send", &body)),
+        }
+    }
+
     /// Moves a message to the bin.
     ///
     /// Deliberately not `messages.delete`, which is permanent and irreversible

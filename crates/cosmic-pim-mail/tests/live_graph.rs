@@ -74,6 +74,10 @@ struct ServerState {
     token: u64,
     /// Cursors below this answer 410.
     floor: u64,
+    /// The MIME bytes `sendMail` accepted, decoded.
+    submitted: Vec<Vec<u8>>,
+    /// When set, `sendMail` refuses with a 400.
+    refuse_send: bool,
 }
 
 struct Server {
@@ -128,6 +132,14 @@ impl Server {
         inner.floor = inner.token + 1;
     }
 
+    fn submitted(&self) -> Vec<Vec<u8>> {
+        self.inner.lock().expect("state").submitted.clone()
+    }
+
+    fn refuse_sends(&self) {
+        self.inner.lock().expect("state").refuse_send = true;
+    }
+
     fn flags_of(&self, id: &str) -> Option<(bool, bool)> {
         self.inner
             .lock()
@@ -153,6 +165,8 @@ fn serve(messages: Vec<Message>) -> Server {
         pending: Vec::new(),
         token: 0,
         floor: 0,
+        submitted: Vec::new(),
+        refuse_send: false,
     }));
     let held = Arc::clone(&inner);
 
@@ -203,6 +217,20 @@ fn route(
 ) -> (u16, String, bool) {
     let note = |what: String| calls.lock().expect("calls").push(what);
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+    if path == "/me/sendMail" && method == "POST" {
+        note("sendMail".to_owned());
+        if state.refuse_send {
+            return (400, json!({ "error": { "code": "invalidRequest" } }).to_string(), false);
+        }
+        // The engine posts standard base64 of the MIME as text/plain.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(body.trim().as_bytes())
+            .unwrap_or_default();
+        state.submitted.push(bytes);
+        return (202, String::new(), false);
+    }
 
     // GET /me/messages/{id}/$value
     if let Some(rest) = path.strip_prefix("/me/messages/") {
@@ -592,4 +620,83 @@ fn a_folder_listing_keeps_the_users_own_language() {
         folders[0].display_name, "Posteingang",
         "the display name was replaced by a slug"
     );
+}
+
+fn draft() -> cosmic_pim_mail::Draft {
+    use cosmic_pim_mail::model::Mailbox;
+    let mut draft = cosmic_pim_mail::Draft::new(Mailbox {
+        name: Some("Ada".into()),
+        address: "ada@example.com".into(),
+    });
+    draft.to.push(Mailbox {
+        name: None,
+        address: "bob@example.com".into(),
+    });
+    draft.bcc.push(Mailbox {
+        name: None,
+        address: "hidden@example.com".into(),
+    });
+    draft.subject = "Outbound".into();
+    draft.body = "Hello over Graph.".into();
+    draft
+}
+
+fn queued_outbox(dir: &std::path::Path) -> cosmic_pim_mail::Outbox {
+    let outbox = cosmic_pim_mail::Outbox::open(dir.join("outbox")).expect("outbox");
+    outbox
+        .queue(
+            "ab12cd",
+            &draft(),
+            &cosmic_pim_mail::Outcome::NotSent(cosmic_pim_mail::Error::Smtp(
+                "first attempt failed".into(),
+            )),
+            0,
+        )
+        .expect("queue");
+    outbox
+}
+
+#[test]
+fn a_queued_send_leaves_through_send_mail_with_its_bcc_intact() {
+    // The path that still works when the tenant has SMTP AUTH switched off.
+    let server = serve(vec![]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = queued_outbox(dir.path());
+
+    let outcome = outbox
+        .drain_with(|draft| session(&server).submit(draft), i64::MAX / 2)
+        .expect("drain");
+
+    assert_eq!(outcome.sent.len(), 1);
+    assert_eq!(outbox.count(), 0, "the queue entry outlived its send");
+
+    let submitted = server.submitted();
+    assert_eq!(submitted.len(), 1);
+    let text = String::from_utf8_lossy(&submitted[0]);
+    assert!(text.contains("Subject: Outbound"));
+    // No envelope over an API: recipients derive from the headers, and
+    // Exchange strips Bcc on delivery. Stripping it ourselves means the
+    // blind-copied recipient never receives the message.
+    assert!(
+        text.contains("hidden@example.com"),
+        "the Bcc recipient was stripped from the submission: {text}"
+    );
+    assert_eq!(submitted[0], outcome.sent[0].1, "the wire copy differs from the accepted one");
+}
+
+#[test]
+fn a_refused_send_stays_queued_rather_than_vanishing() {
+    let server = serve(vec![]);
+    server.refuse_sends();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = queued_outbox(dir.path());
+
+    let outcome = outbox
+        .drain_with(|draft| session(&server).submit(draft), i64::MAX / 2)
+        .expect("drain");
+
+    assert!(outcome.sent.is_empty());
+    assert_eq!(outcome.deferred, 1, "a refused send was not rescheduled");
+    assert_eq!(outbox.count(), 1, "a refused send vanished from the queue");
+    assert!(server.submitted().is_empty());
 }

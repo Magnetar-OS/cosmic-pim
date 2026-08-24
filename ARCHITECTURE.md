@@ -257,6 +257,18 @@ for metadata plus `blobId` only, and the message itself comes from the download
 endpoint as the original octets. One extra request per message, and it is not
 optional.
 
+**Submission is verbatim too, and Bcc is the proof.** Every engine sends the
+composer's own bytes — SMTP, Gmail's `messages.send`, Graph's `sendMail` — and
+the difference between them is one header. SMTP carries recipients in a
+separate envelope, so the wire copy is built *without* `Bcc`; an API has no
+envelope, recipients derive from the headers, so the API copy is built *with*
+it and the provider strips it on delivery as the submission server (RFC 5322
+§3.6.3). Stripping it ourselves on the API path means the blind-copied
+recipient never receives the message at all. Filing differs the same way: the
+API providers file their own Sent copy, SMTP-over-IMAP appends one, and
+SMTP-over-JMAP uploads the accepted bytes and `Email/import`s them into the
+`sent`-role mailbox — never re-rendered.
+
 **A provider API is a change feed, not a message store.** Gmail and Graph both
 serve the original RFC 5322 octets — `messages.get?format=raw` and
 `GET /me/messages/{id}/$value` — so an engine built on either stays inside the
@@ -418,7 +430,7 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 ## Testing
 
-Roughly 740 tests in the substrate, `cargo test --workspace`.
+Roughly 760 tests in the substrate, `cargo test --workspace`.
 
 The one worth knowing about is `caldav/tests/live_sync.rs`: a real HTTP server
 answering PROPFIND and REPORT with canned multistatus XML, driving the real

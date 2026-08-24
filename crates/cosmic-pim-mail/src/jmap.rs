@@ -133,6 +133,10 @@ struct SessionResource {
     api_url: String,
     #[serde(rename = "downloadUrl")]
     download_url: String,
+    /// Absent on a server that does not offer uploads; filing to Sent is then
+    /// skipped with a warning rather than the whole session refused.
+    #[serde(rename = "uploadUrl", default)]
+    upload_url: Option<String>,
     #[serde(rename = "primaryAccounts", default)]
     primary_accounts: BTreeMap<String, String>,
     #[serde(default)]
@@ -170,6 +174,7 @@ pub struct Session {
     authorization: String,
     api_url: String,
     download_url: String,
+    upload_url: Option<String>,
     account_id: String,
 }
 
@@ -248,6 +253,7 @@ impl Session {
             authorization,
             api_url: session.api_url,
             download_url: session.download_url,
+            upload_url: session.upload_url,
             account_id,
         })
     }
@@ -646,6 +652,95 @@ impl Session {
             .bytes()
             .map(|bytes| bytes.to_vec())
             .map_err(|why| Error::Jmap(why.to_string()))
+    }
+
+    /// Uploads raw bytes and returns the blob id the server assigned.
+    ///
+    /// The upload endpoint is the write half of the download endpoint the
+    /// verbatim fetch uses: bytes in, bytes out, nothing parsed in between.
+    pub fn upload(&self, bytes: &[u8]) -> Result<String> {
+        let Some(template) = self.upload_url.as_deref() else {
+            return Err(Error::Jmap(
+                "this JMAP server offers no upload endpoint".to_owned(),
+            ));
+        };
+        let url = template.replace("{accountId}", &self.account_id);
+
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", &self.authorization)
+            .header("Content-Type", "message/rfc822")
+            .body(bytes.to_vec())
+            .send()
+            .map_err(|why| Error::Jmap(format!("uploading a blob: {why}")))?;
+
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .map_err(|why| Error::Jmap(why.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(Error::Jmap(format!("upload returned HTTP {status}")));
+        }
+
+        serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("blobId")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .ok_or_else(|| Error::Jmap("the upload response named no blobId".to_owned()))
+    }
+
+    /// Files an uploaded blob into a mailbox as a message.
+    ///
+    /// `Email/import` is the RFC 8621 §4.8 way to place existing RFC 5322
+    /// bytes into a mailbox without the server re-rendering them — which is
+    /// what filing a Sent copy is. Marked `$seen`, because the sender wrote it
+    /// and an unread badge for their own words is noise.
+    ///
+    /// Confirmation is positive, as with every `Email/set`: the id must appear
+    /// in `created`, not merely be absent from `notCreated`.
+    pub fn import(&self, blob_id: &str, mailbox_id: &str) -> Result<String> {
+        let responses = self.request(json!([[
+            "Email/import",
+            {
+                "accountId": self.account_id,
+                "emails": {
+                    "filed": {
+                        "blobId": blob_id,
+                        "mailboxIds": { mailbox_id: true },
+                        "keywords": { "$seen": true }
+                    }
+                }
+            },
+            "0"
+        ]]))?;
+
+        let args = responses
+            .first()
+            .and_then(|entry| entry.get(1))
+            .ok_or_else(|| Error::Jmap("Email/import returned nothing".to_owned()))?;
+
+        if let Some(reason) = args.get("notCreated").and_then(|not| not.get("filed")) {
+            return Err(Error::Jmap(format!(
+                "the server refused the import: {reason}"
+            )));
+        }
+
+        args.get("created")
+            .and_then(|created| created.get("filed"))
+            .and_then(|filed| filed.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                Error::Jmap(
+                    "the server acknowledged neither success nor failure for the import"
+                        .to_owned(),
+                )
+            })
     }
 
     /// Replaces the keywords on one email.

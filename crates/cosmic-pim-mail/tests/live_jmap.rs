@@ -85,6 +85,8 @@ enum ChangeKind {
 /// `Email/changes`.
 struct ServerState {
     emails: Vec<Email>,
+    /// Blobs the upload endpoint accepted, by id.
+    uploads: Vec<(String, Vec<u8>)>,
     /// Monotonic; its decimal form is the JMAP state string.
     state: u64,
     /// `(state after the change, id, what happened)`.
@@ -174,6 +176,7 @@ fn serve(emails: Vec<Email>) -> Server {
 
     let inner = Arc::new(Mutex::new(ServerState {
         emails,
+        uploads: Vec::new(),
         state: 1,
         history: Vec::new(),
         floor: 0,
@@ -185,6 +188,21 @@ fn serve(emails: Vec<Email>) -> Server {
             let path = request.url().to_owned();
             let mut body = String::new();
             let _ = request.as_reader().read_to_string(&mut body);
+
+            // A blob upload: bytes in, a blobId out.
+            if path.starts_with("/upload/") {
+                recorded.lock().expect("calls").push("upload".to_owned());
+                let mut inner = held.lock().expect("state");
+                let blob_id = format!("blob-up-{}", inner.uploads.len() + 1);
+                inner.uploads.push((blob_id.clone(), body.clone().into_bytes()));
+                drop(inner);
+                let response = tiny_http::Response::from_string(
+                    json!({ "blobId": blob_id, "size": body.len() }).to_string(),
+                )
+                .with_status_code(201);
+                let _ = request.respond(response);
+                continue;
+            }
 
             // A blob download: /download/<account>/<blobId>/<name>
             if let Some(rest) = path.strip_prefix("/download/") {
@@ -217,6 +235,7 @@ fn serve(emails: Vec<Email>) -> Server {
                 json!({
                     "apiUrl": format!("{base}/api"),
                     "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}"),
+                    "uploadUrl": format!("{base}/upload/{{accountId}}"),
                     "capabilities": {
                         "urn:ietf:params:jmap:core": {},
                         "urn:ietf:params:jmap:mail": {}
@@ -373,6 +392,48 @@ fn respond(name: &str, args: &Value, state: &mut ServerState) -> (String, Value)
                 "created": created,
                 "updated": updated,
                 "destroyed": destroyed
+            })
+        }
+        "Email/import" => {
+            let mut created = serde_json::Map::new();
+            let mut touched = Vec::new();
+
+            if let Some(emails) = args.get("emails").and_then(Value::as_object) {
+                for (cid, spec) in emails {
+                    let Some(blob_id) = spec.get("blobId").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some((_, bytes)) =
+                        state.uploads.iter().find(|(id, _)| id == blob_id).cloned()
+                    else {
+                        continue;
+                    };
+                    let id = format!("M-imported-{}", state.emails.len() + 1);
+                    let mailboxes: Vec<String> = spec
+                        .get("mailboxIds")
+                        .and_then(Value::as_object)
+                        .map(|set| set.keys().cloned().collect())
+                        .unwrap_or_default();
+                    state.emails.push(Email {
+                        id: id.clone(),
+                        blob_id: blob_id.to_owned(),
+                        raw: bytes,
+                        keywords: spec.get("keywords").cloned().unwrap_or(json!({})),
+                        mailboxes,
+                    });
+                    touched.push(id.clone());
+                    created.insert(cid.clone(), json!({ "id": id }));
+                }
+            }
+
+            for id in touched {
+                state.record(&id, ChangeKind::Created);
+            }
+
+            json!({
+                "accountId": "acct-1",
+                "created": created,
+                "notCreated": {}
             })
         }
         "Email/set" => {
@@ -826,4 +887,44 @@ fn a_queued_operation_for_an_unknown_message_asks_for_a_resync() {
 
     assert_eq!(outcome.pushed.needs_reconcile, 1);
     assert_eq!(outcome.pushed.succeeded, 0);
+}
+
+#[test]
+fn a_sent_copy_files_through_upload_and_import_and_the_next_pass_agrees() {
+    // The JMAP half of "sent messages visible on the phone": submission is
+    // SMTP, but the Sent copy is filed by uploading the accepted bytes and
+    // importing them — RFC 8621 §4.8 — so the server never re-renders them.
+    let server = serve(vec![]);
+    let session = connect(&server);
+
+    let blob = session.upload(RAW_ONE).expect("upload");
+    let id = session.import(&blob, "mbox-1").expect("import");
+    assert!(id.starts_with("M-imported-"));
+
+    // The filed copy is now an ordinary message: the next pass fetches it,
+    // byte for byte, already read.
+    let (dir, mut store) = maildir();
+    let mut state = jmap::state(dir.path());
+    let outcome = sync(&server, &mut store, &mut state);
+
+    assert_eq!(outcome.fetched, 1);
+    let uid = state.uid_of(&id).expect("a local uid");
+    assert_eq!(store.raw(uid).expect("read").expect("bytes"), RAW_ONE);
+    assert!(
+        store.state().expect("state").entries[&uid].seen,
+        "the sender's own message arrived unread"
+    );
+}
+
+#[test]
+fn an_import_of_an_unknown_blob_reports_rather_than_pretending() {
+    let server = serve(vec![]);
+    let session = connect(&server);
+
+    let error = session.import("blob-nobody-uploaded", "mbox-1").unwrap_err();
+
+    // Positive confirmation, as everywhere: an import the server did not
+    // acknowledge did not happen, and saying so beats a Sent folder that is
+    // silently missing messages.
+    assert!(error.to_string().contains("neither success nor failure"), "got {error}");
 }

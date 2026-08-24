@@ -190,6 +190,26 @@ fn sync_over_imap(
     Ok(report)
 }
 
+/// Drains an account's outbox through a caller-supplied submitter.
+///
+/// The API engines send through here — Gmail's `messages.send`, Graph's
+/// `sendMail` — and both file their own Sent copy server-side, so unlike the
+/// SMTP path there is nothing to append afterwards. Returns `(sent, given_up)`
+/// and the accepted copies, for the one caller (JMAP) whose server does not
+/// file for it.
+fn drain_outbox_with(
+    account: &Account,
+    mail_root: &Path,
+    now_ms: i64,
+    submit: impl FnMut(&cosmic_pim_mail::Draft) -> cosmic_pim_mail::Outcome,
+) -> Result<(usize, usize, Vec<(String, Vec<u8>)>)> {
+    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id).join("outbox"))
+        .map_err(Error::Mail)?;
+    let outcome = outbox.drain_with(submit, now_ms).map_err(Error::Mail)?;
+    let sent = outcome.sent.len();
+    Ok((sent, outcome.given_up, outcome.sent))
+}
+
 /// How much of a Gmail label one bootstrap brings down.
 ///
 /// A bound rather than everything: a twenty-year archive backfills over
@@ -213,6 +233,20 @@ fn sync_over_gmail(
 
     let session = gmail::Session::connect(credentials).map_err(Error::Mail)?;
     let mut report = MailReport::default();
+
+    // The outbox before the pull, as everywhere else. Gmail files its own
+    // Sent copy, so the accepted bytes are dropped rather than appended.
+    match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
+        Ok((sent, given_up, _filed)) => {
+            report.sent = sent;
+            report.given_up = given_up;
+        }
+        Err(why) => {
+            // Submission being down must not stop the pull: reading mail
+            // still works when sending does not.
+            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
+        }
+    }
 
     for folder in gmail::folders() {
         let slug = folder.wire_name.clone();
@@ -263,6 +297,19 @@ fn sync_over_graph(
 
     let session = graph::Session::connect(credentials).map_err(Error::Mail)?;
     let mut report = MailReport::default();
+
+    // The outbox before the pull. `sendMail` is the path that still works
+    // when a tenant has SMTP AUTH switched off, and Exchange files its own
+    // Sent copy (`saveToSentItems` defaults true).
+    match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
+        Ok((sent, given_up, _filed)) => {
+            report.sent = sent;
+            report.given_up = given_up;
+        }
+        Err(why) => {
+            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
+        }
+    }
 
     for remote in session.folders().map_err(Error::Mail)? {
         let folder = graph::folder_for(&remote);
@@ -319,8 +366,50 @@ fn sync_over_jmap(
         .map_err(Error::Mail)?;
 
     let mut report = MailReport::default();
+    let mailboxes = session.mailboxes().map_err(Error::Mail)?;
 
-    for mailbox in session.mailboxes().map_err(Error::Mail)? {
+    // The outbox before the pull. Submission is SMTP — the manifest fills the
+    // host in — but unlike the IMAP path there is no session to APPEND the
+    // Sent copy through, so it is filed over JMAP itself: upload the accepted
+    // bytes as a blob, then Email/import them into the mailbox whose role is
+    // `sent`. Filing failures warn rather than fail: the message is already
+    // delivered, and a retry that re-sends it is the one wrong answer.
+    match drain_outbox_with(account, mail_root, now_ms, |draft| {
+        cosmic_pim_mail::smtp::send(&smtp_endpoint(account, mail), credentials, draft)
+    }) {
+        Ok((sent, given_up, filed)) => {
+            report.sent = sent;
+            report.given_up = given_up;
+
+            let sent_mailbox = mailboxes
+                .iter()
+                .find(|m| m.role.as_deref() == Some("sent"))
+                .map(|m| m.id.clone());
+            for (id, bytes) in filed {
+                let Some(sent_id) = sent_mailbox.as_deref() else {
+                    tracing::warn!(
+                        account = account.display_name,
+                        "no mailbox with the sent role; a sent message was not filed"
+                    );
+                    break;
+                };
+                let outcome = session
+                    .upload(&bytes)
+                    .and_then(|blob_id| session.import(&blob_id, sent_id));
+                if let Err(why) = outcome {
+                    tracing::warn!(
+                        account = account.display_name, message = id, %why,
+                        "a message was sent but could not be filed to Sent"
+                    );
+                }
+            }
+        }
+        Err(why) => {
+            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
+        }
+    }
+
+    for mailbox in mailboxes {
         // JMAP has no wire/display distinction — a mailbox name is a name —
         // but the local directory still has to be a legal path, so it goes
         // through the same naming the IMAP path uses.

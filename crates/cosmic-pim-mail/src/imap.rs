@@ -226,6 +226,42 @@ impl Session {
             .map_err(imap_error)
     }
 
+    /// Does the server speak RFC 2177 IDLE?
+    ///
+    /// Worth asking before [`Self::watch`]: a server without it answers the
+    /// command with an error, and the caller's right response is to fall back
+    /// to polling rather than to retry.
+    pub fn supports_idle(&mut self) -> bool {
+        self.inner
+            .capabilities()
+            .is_ok_and(|caps| caps.has_str("IDLE"))
+    }
+
+    /// Selects `mailbox` and blocks until the server says it changed, or
+    /// `timeout` passes.
+    ///
+    /// This is push mail: the server tells us, instead of us asking every few
+    /// minutes. The connection carrying the watch should be a **dedicated
+    /// session** — IDLE monopolises it, and multiplexing it with a sync cycle
+    /// means the cycle waits half an hour for the watch to notice.
+    ///
+    /// A timeout is not a failure. RFC 2177 tells clients to re-issue IDLE at
+    /// least every 29 minutes anyway, and the `imap` crate refreshes the
+    /// connection underneath us on the same schedule; the caller just watches
+    /// again.
+    pub fn watch(&mut self, mailbox: &str, timeout: std::time::Duration) -> Result<Watched> {
+        use imap::extensions::idle::WaitOutcome;
+
+        self.select(mailbox)?;
+        let mut handle = self.inner.idle();
+        handle.timeout(timeout);
+        match handle.wait_while(imap::extensions::idle::stop_on_any) {
+            Ok(WaitOutcome::MailboxChanged) => Ok(Watched::Changed),
+            Ok(WaitOutcome::TimedOut) => Ok(Watched::TimedOut),
+            Err(why) => Err(imap_error(why)),
+        }
+    }
+
     pub fn logout(&mut self) -> Result<()> {
         self.inner.logout().map_err(imap_error)
     }
@@ -297,6 +333,17 @@ impl Session {
             Ok(())
         }
     }
+}
+
+/// What ended a [`Session::watch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watched {
+    /// The server reported the mailbox changed — new mail, an expunge, a flag.
+    /// The caller's next move is a sync cycle, not a guess about what changed:
+    /// the untagged responses IDLE delivers are not enough to act on directly.
+    Changed,
+    /// Nothing happened within the timeout. Watch again.
+    TimedOut,
 }
 
 /// What one cycle did.

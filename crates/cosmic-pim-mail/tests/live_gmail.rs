@@ -67,6 +67,10 @@ struct ServerState {
     history: Vec<HistoryRecord>,
     /// Below this, `history.list` answers 404 — Gmail's retention horizon.
     floor: u64,
+    /// The raw bytes `messages.send` accepted, decoded.
+    submitted: Vec<Vec<u8>>,
+    /// When set, `messages.send` refuses with a 400.
+    refuse_send: bool,
 }
 
 impl ServerState {
@@ -138,6 +142,14 @@ impl Server {
         inner.history.clear();
     }
 
+    fn submitted(&self) -> Vec<Vec<u8>> {
+        self.inner.lock().expect("state").submitted.clone()
+    }
+
+    fn refuse_sends(&self) {
+        self.inner.lock().expect("state").refuse_send = true;
+    }
+
     fn labels_of(&self, id: &str) -> Vec<String> {
         self.inner
             .lock()
@@ -168,6 +180,8 @@ fn serve(messages: Vec<Message>) -> Server {
         history_id: 100,
         history: Vec::new(),
         floor: 0,
+        submitted: Vec::new(),
+        refuse_send: false,
     }));
     let held = Arc::clone(&inner);
 
@@ -286,6 +300,29 @@ fn route(
             .collect();
 
         return (200, json!({ "messages": ids }).to_string());
+    }
+
+    if tail == "/messages/send" && method == "POST" {
+        note("send".to_owned());
+        if state.refuse_send {
+            return (400, json!({ "error": { "code": 400 } }).to_string());
+        }
+        let raw = serde_json::from_str::<Value>(_body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("raw")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_default();
+        // Decode as the engine encoded: url-safe, unpadded.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw.as_bytes())
+            .unwrap_or_default();
+        state.submitted.push(bytes);
+        return (200, json!({ "id": "sent-1" }).to_string());
     }
 
     if let Some(rest) = tail.strip_prefix("/messages/") {
@@ -601,4 +638,86 @@ fn a_local_archive_removes_the_inbox_label() {
         state.uid_of("M1").is_none(),
         "the id mapping survived an archive, so the next pass sees a message it thinks it holds"
     );
+}
+
+/// A draft carrying a Bcc, which is the interesting part of API submission.
+fn draft() -> cosmic_pim_mail::Draft {
+    use cosmic_pim_mail::model::Mailbox;
+    let mut draft = cosmic_pim_mail::Draft::new(Mailbox {
+        name: Some("Ada".into()),
+        address: "ada@example.com".into(),
+    });
+    draft.to.push(Mailbox {
+        name: None,
+        address: "bob@example.com".into(),
+    });
+    draft.bcc.push(Mailbox {
+        name: None,
+        address: "hidden@example.com".into(),
+    });
+    draft.subject = "Outbound".into();
+    draft.body = "Hello over the API.".into();
+    draft
+}
+
+/// An outbox holding that draft, one failed attempt in — how a queued send
+/// really arrives.
+fn queued_outbox(dir: &std::path::Path) -> cosmic_pim_mail::Outbox {
+    let outbox = cosmic_pim_mail::Outbox::open(dir.join("outbox")).expect("outbox");
+    outbox
+        .queue(
+            "ab12cd",
+            &draft(),
+            &cosmic_pim_mail::Outcome::NotSent(cosmic_pim_mail::Error::Smtp(
+                "first attempt failed".into(),
+            )),
+            0,
+        )
+        .expect("queue");
+    outbox
+}
+
+#[test]
+fn a_queued_send_leaves_through_the_api_with_its_bcc_intact() {
+    let server = serve(vec![]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = queued_outbox(dir.path());
+
+    let outcome = outbox
+        .drain_with(|draft| session(&server).submit(draft), i64::MAX / 2)
+        .expect("drain");
+
+    assert_eq!(outcome.sent.len(), 1);
+    assert_eq!(outbox.count(), 0, "the queue entry outlived its send");
+
+    let submitted = server.submitted();
+    assert_eq!(submitted.len(), 1);
+    let text = String::from_utf8_lossy(&submitted[0]);
+    assert!(text.contains("Subject: Outbound"));
+    // The API copy keeps Bcc: there is no envelope, recipients derive from
+    // the headers, and Gmail strips it on delivery as the submission server.
+    // Stripping it ourselves means the blind-copied recipient never gets it.
+    assert!(
+        text.contains("hidden@example.com"),
+        "the Bcc recipient was stripped from the API submission: {text}"
+    );
+    // Verbatim outbound: the accepted bytes are exactly what went on the wire.
+    assert_eq!(submitted[0], outcome.sent[0].1);
+}
+
+#[test]
+fn a_refused_send_stays_queued_rather_than_vanishing() {
+    let server = serve(vec![]);
+    server.refuse_sends();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = queued_outbox(dir.path());
+
+    let outcome = outbox
+        .drain_with(|draft| session(&server).submit(draft), i64::MAX / 2)
+        .expect("drain");
+
+    assert!(outcome.sent.is_empty());
+    assert_eq!(outcome.deferred, 1, "a refused send was not rescheduled");
+    assert_eq!(outbox.count(), 1, "a refused send vanished from the queue");
+    assert!(server.submitted().is_empty());
 }

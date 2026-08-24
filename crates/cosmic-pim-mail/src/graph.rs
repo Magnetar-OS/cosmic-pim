@@ -464,6 +464,61 @@ impl Session {
             .ok_or_else(|| Error::Graph("a move returned no new message id".to_owned()))
     }
 
+    /// Submits a message for delivery.
+    ///
+    /// `sendMail` with the MIME content base64-encoded and posted as
+    /// `text/plain` — Graph's documented shape for raw submission, and the
+    /// verbatim-bytes rule outbound: what Exchange sends is byte-for-byte what
+    /// the composer built. This is the path that works when a tenant has SMTP
+    /// AUTH switched off, which is the ordinary state of a managed tenant now.
+    ///
+    /// Built **with** the `Bcc` header, for the same reason as the Gmail
+    /// engine: an API has no envelope, recipients derive from the headers, and
+    /// Exchange strips `Bcc` from delivered copies as the submission server.
+    ///
+    /// No Sent filing follows: `saveToSentItems` defaults to true, so Exchange
+    /// files its own copy.
+    pub fn submit(&self, draft: &crate::compose::Draft) -> crate::smtp::Outcome {
+        use crate::smtp::Outcome;
+        use base64::Engine as _;
+
+        let message = match draft.build(true) {
+            Ok(message) => message.formatted(),
+            Err(why) => return Outcome::NotSent(why),
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&message);
+
+        let response = self
+            .http
+            .post(format!("{}/me/sendMail", self.base))
+            .header("Authorization", &self.authorization)
+            .header("Content-Type", "text/plain")
+            .body(encoded)
+            .send();
+
+        let response = match response {
+            Ok(response) => response,
+            // A connection that never opened cannot have delivered anything;
+            // anything past that point may have.
+            Err(why) if why.is_connect() => {
+                return Outcome::NotSent(Error::Graph(format!("sendMail: {why}")));
+            }
+            Err(why) => {
+                return Outcome::Ambiguous(Error::Graph(format!("sendMail: {why}")));
+            }
+        };
+
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        match status {
+            // 202 Accepted is the documented success.
+            200..=299 => Outcome::Sent(message),
+            400..=499 => Outcome::NotSent(Self::refuse(status, "sendMail", &body)),
+            // The server had the message when it failed; it may yet deliver.
+            _ => Outcome::Ambiguous(Self::refuse(status, "sendMail", &body)),
+        }
+    }
+
     /// Deletes a message. Graph's DELETE moves it to Deleted Items rather than
     /// destroying it, which is what a delete key should mean.
     pub fn delete_message(&self, id: &str) -> Result<()> {

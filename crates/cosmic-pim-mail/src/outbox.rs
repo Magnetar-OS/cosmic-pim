@@ -229,7 +229,7 @@ impl Outbox {
         self.write(&queued)
     }
 
-    /// Attempts every message that is due.
+    /// Attempts every message that is due, over SMTP.
     ///
     /// `now_ms` is a parameter rather than read from the clock so the backoff
     /// schedule is testable without sleeping.
@@ -237,6 +237,20 @@ impl Outbox {
         &self,
         endpoint: &SmtpEndpoint,
         credentials: &Credentials,
+        now_ms: i64,
+    ) -> Result<DrainOutcome> {
+        self.drain_with(|draft| smtp::send(endpoint, credentials, draft), now_ms)
+    }
+
+    /// As [`Self::drain`], with the submission step supplied by the caller.
+    ///
+    /// This is how the Gmail and Graph engines send: same queue, same backoff,
+    /// same never-retry-an-ambiguous-send rule, different wire. The
+    /// classification into [`Outcome`] is the submitter's job because only it
+    /// knows where its protocol's point of no return is.
+    pub fn drain_with(
+        &self,
+        mut send: impl FnMut(&crate::compose::Draft) -> Outcome,
         now_ms: i64,
     ) -> Result<DrainOutcome> {
         let mut outcome = DrainOutcome::default();
@@ -247,7 +261,7 @@ impl Outbox {
                 continue;
             }
 
-            match smtp::send(endpoint, credentials, &queued.draft) {
+            match send(&queued.draft) {
                 Outcome::Sent(filed) => {
                     self.remove(&queued.id)?;
                     outcome.sent.push((queued.id, filed));
