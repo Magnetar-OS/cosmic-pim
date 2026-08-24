@@ -59,6 +59,36 @@ const CAP_MAIL: &str = "urn:ietf:params:jmap:mail";
 /// from being tens of megabytes of metadata.
 const GET_BATCH: usize = 100;
 
+/// How many changes to ask for in one `Email/changes`. A server may return
+/// fewer and set `hasMoreChanges`, which the caller loops on.
+const CHANGES_BATCH: usize = 500;
+
+/// The `type` of a per-call error in a response list, if there is one.
+fn method_error(responses: &[Value]) -> Option<String> {
+    responses.iter().find_map(|entry| {
+        (entry.get(0).and_then(Value::as_str) == Some("error")).then(|| {
+            entry
+                .get(1)
+                .and_then(|args| args.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned()
+        })
+    })
+}
+
+/// What changed in an account since a given state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Changes {
+    pub created: Vec<String>,
+    pub updated: Vec<String>,
+    pub destroyed: Vec<String>,
+    /// The state these changes bring the client up to.
+    pub new_state: String,
+    /// The server truncated the answer; ask again from `new_state`.
+    pub has_more: bool,
+}
+
 /// The session resource, as the server describes itself (RFC 8620 §2).
 #[derive(Debug, Clone, Deserialize)]
 struct SessionResource {
@@ -198,6 +228,26 @@ impl Session {
     /// difference between one round trip and three, and on a mailbox sync it is
     /// most of the wall-clock time.
     fn request(&self, calls: Value) -> Result<Vec<Value>> {
+        let responses = self.request_raw(calls)?;
+
+        // An `error` in the *list* is a per-call failure, not a transport one,
+        // and it carries the reason. Returning the raw array and letting each
+        // caller guess would lose that.
+        if let Some(kind) = method_error(&responses) {
+            return Err(Error::Jmap(format!(
+                "the server refused the request: {kind}"
+            )));
+        }
+
+        Ok(responses)
+    }
+
+    /// As [`Self::request`], but a per-call error comes back as data.
+    ///
+    /// Exactly one caller wants that: `cannotCalculateChanges` is a routine
+    /// answer meaning "my history does not reach back that far", and the right
+    /// response is a full resync rather than a failed pass.
+    fn request_raw(&self, calls: Value) -> Result<Vec<Value>> {
         let body = json!({
             "using": [CAP_CORE, CAP_MAIL],
             "methodCalls": calls,
@@ -237,20 +287,6 @@ impl Session {
             .get("methodResponses")
             .and_then(Value::as_array)
             .ok_or_else(|| Error::Jmap("JMAP response carried no methodResponses".to_owned()))?;
-
-        // An `error` in the *list* is a per-call failure, not a transport one,
-        // and it carries the reason. Returning the raw array and letting each
-        // caller guess would lose that.
-        for entry in responses {
-            if entry.get(0).and_then(Value::as_str) == Some("error") {
-                let kind = entry
-                    .get(1)
-                    .and_then(|args| args.get("type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                return Err(Error::Jmap(format!("the server refused the request: {kind}")));
-            }
-        }
 
         Ok(responses.clone())
     }
@@ -326,6 +362,88 @@ impl Session {
             .collect())
     }
 
+    /// The account's current `Email` state string, without fetching anything.
+    ///
+    /// Used to open an incremental era: a full pass records the state it read
+    /// *at*, and the next pass asks what has changed since.
+    pub fn email_state(&self) -> Result<String> {
+        // `Email/get` with an empty id list is the cheapest call that returns a
+        // state string. There is no "give me only the state" method.
+        let responses = self.request(json!([[
+            "Email/get",
+            { "accountId": self.account_id, "ids": [] },
+            "0"
+        ]]))?;
+
+        responses
+            .first()
+            .and_then(|entry| entry.get(1))
+            .and_then(|args| args.get("state"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Error::Jmap("Email/get returned no state".to_owned()))
+    }
+
+    /// What has changed in the account since `since_state`.
+    ///
+    /// `Ok(None)` means the server cannot answer — its change history does not
+    /// reach back that far, which is a routine answer after a long offline
+    /// period and not a failure. The caller resyncs in full.
+    pub fn changes(&self, since_state: &str) -> Result<Option<Changes>> {
+        let responses = self.request_raw(json!([[
+            "Email/changes",
+            {
+                "accountId": self.account_id,
+                "sinceState": since_state,
+                "maxChanges": CHANGES_BATCH
+            },
+            "0"
+        ]]))?;
+
+        if let Some(kind) = method_error(&responses) {
+            if kind == "cannotCalculateChanges" {
+                tracing::info!(
+                    "the server cannot report changes since our state; resyncing in full"
+                );
+                return Ok(None);
+            }
+            return Err(Error::Jmap(format!(
+                "Email/changes was refused: {kind}"
+            )));
+        }
+
+        let args = responses
+            .first()
+            .and_then(|entry| entry.get(1))
+            .ok_or_else(|| Error::Jmap("Email/changes returned nothing".to_owned()))?;
+
+        let ids = |field: &str| -> Vec<String> {
+            args.get(field)
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|id| id.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        Ok(Some(Changes {
+            created: ids("created"),
+            updated: ids("updated"),
+            destroyed: ids("destroyed"),
+            new_state: args
+                .get("newState")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            has_more: args
+                .get("hasMoreChanges")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }))
+    }
+
     /// Metadata for a batch of emails. Never the body — see the module docs.
     pub fn get(&self, ids: &[String]) -> Result<Vec<JmapEmail>> {
         if ids.is_empty() {
@@ -353,6 +471,54 @@ impl Session {
             .ok_or_else(|| Error::Jmap("Email/get returned no list".to_owned()))?;
 
         Ok(list.iter().filter_map(parse_email).collect())
+    }
+
+    /// Metadata plus mailbox membership, for the incremental path.
+    ///
+    /// `Email/changes` is account-wide — it reports every email that changed,
+    /// in any mailbox — so the membership is what says whether a change is this
+    /// mailbox's business. Asking for it only here keeps it off the full-sync
+    /// path, where the query has already filtered.
+    pub fn get_with_mailboxes(&self, ids: &[String]) -> Result<Vec<(JmapEmail, Vec<String>)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let responses = self.request(json!([[
+            "Email/get",
+            {
+                "accountId": self.account_id,
+                "ids": ids,
+                "properties": ["id", "blobId", "keywords", "receivedAt", "size", "mailboxIds"]
+            },
+            "0"
+        ]]))?;
+
+        let list = responses
+            .first()
+            .and_then(|entry| entry.get(1))
+            .and_then(|args| args.get("list"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Jmap("Email/get returned no list".to_owned()))?;
+
+        Ok(list
+            .iter()
+            .filter_map(|item| {
+                let email = parse_email(item)?;
+                // `mailboxIds` is a set: `{ "mbox-1": true }`.
+                let mailboxes = item
+                    .get("mailboxIds")
+                    .and_then(Value::as_object)
+                    .map(|map| {
+                        map.iter()
+                            .filter(|(_, v)| v.as_bool().unwrap_or(false))
+                            .map(|(id, _)| id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some((email, mailboxes))
+            })
+            .collect())
     }
 
     /// Downloads the original RFC 5322 octets for a blob.
@@ -484,6 +650,19 @@ pub struct JmapState {
     seen: BTreeMap<String, u32>,
     #[serde(default = "one")]
     next_uid: u32,
+    /// The account `Email` state this mailbox has been brought up to.
+    ///
+    /// Absent means no incremental era has been opened yet, and the next pass
+    /// is a full one. Present means the next pass can ask the server what
+    /// changed rather than re-reading the mailbox — the difference between a
+    /// round trip proportional to the mailbox and one proportional to the news.
+    ///
+    /// Account-wide even though it is stored per mailbox, because that is what
+    /// `Email/changes` is scoped to. Each mailbox independently tracks the
+    /// state it has applied, which costs one extra `Email/changes` per mailbox
+    /// and keeps every mailbox recoverable on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email_state: Option<String>,
 }
 
 fn one() -> u32 {
@@ -544,6 +723,18 @@ impl JmapState {
     fn forget(&mut self, id: &str) {
         self.seen.remove(id);
     }
+
+    /// The state this mailbox has been brought up to, if any.
+    #[must_use]
+    pub fn email_state(&self) -> Option<&str> {
+        self.email_state.as_deref()
+    }
+
+    /// Discards the incremental era, so the next pass reads the mailbox in
+    /// full. What a `cannotCalculateChanges` answer amounts to.
+    pub fn reset_era(&mut self) {
+        self.email_state = None;
+    }
 }
 
 /// What one JMAP pass did.
@@ -558,11 +749,16 @@ pub struct JmapOutcome {
 /// UIDVALIDITY is a constant that exists to keep the shared shape honest.
 pub const JMAP_UID_VALIDITY: u32 = 1;
 
-/// Runs one pass over one mailbox.
+/// Runs one pass over one mailbox, incrementally where it can.
 ///
-/// Reads the mailbox as the server currently has it, fetches what is missing,
-/// updates the flags of what changed, and removes what has left. The bytes come
-/// from the download endpoint, never from `Email/get` — see the module docs.
+/// The first pass reads the mailbox in full and records the account state it
+/// read at. Every pass after that asks the server what has changed since —
+/// which is a round trip proportional to the news rather than to the mailbox,
+/// and is the difference between a five-second poll being affordable and not.
+///
+/// A server that cannot answer (`cannotCalculateChanges`, after a long enough
+/// gap) drops the client back to a full read, which is why the full path stays
+/// and is not an optimisation to be removed later.
 pub fn sync_mailbox(
     session: &Session,
     mailbox_id: &str,
@@ -570,7 +766,133 @@ pub fn sync_mailbox(
     state: &mut JmapState,
     limit: usize,
 ) -> Result<JmapOutcome> {
+    if let Some(since) = state.email_state().map(ToOwned::to_owned) {
+        match sync_incremental(session, mailbox_id, store, state, &since)? {
+            Some(outcome) => return Ok(outcome),
+            // The server's history does not reach back to our state. Fall
+            // through and read the mailbox as it is now.
+            None => state.reset_era(),
+        }
+    }
+
+    sync_full(session, mailbox_id, store, state, limit)
+}
+
+/// Applies everything that changed since `since`, or `None` if the server
+/// cannot say.
+fn sync_incremental(
+    session: &Session,
+    mailbox_id: &str,
+    store: &mut impl MailStore,
+    state: &mut JmapState,
+    since: &str,
+) -> Result<Option<JmapOutcome>> {
     let mut outcome = JmapOutcome::default();
+    let mut cursor = since.to_owned();
+
+    loop {
+        let Some(changes) = session.changes(&cursor)? else {
+            return Ok(None);
+        };
+
+        // `created` and `updated` are treated identically on purpose: an email
+        // moved *into* this mailbox is reported as updated, not created, and
+        // handling only `created` would leave it invisible until a full resync.
+        let touched: Vec<String> = changes
+            .created
+            .iter()
+            .chain(&changes.updated)
+            .cloned()
+            .collect();
+
+        let known = store.state()?;
+
+        for batch in touched.chunks(GET_BATCH) {
+            for (email, mailboxes) in session.get_with_mailboxes(batch)? {
+                let in_this_mailbox = mailboxes.iter().any(|id| id == mailbox_id);
+                let held = state.uid_of(&email.id);
+
+                match (in_this_mailbox, held) {
+                    // New here: fetch it.
+                    (true, None) => {
+                        let uid = state.uid_for(&email.id);
+                        let raw = session.download(&email.blob_id)?;
+                        store.upsert(&RemoteMessage {
+                            uid,
+                            flags: email.keywords,
+                            raw,
+                            internal_date_ms: email.received_at_ms,
+                        })?;
+                        outcome.fetched += 1;
+                    }
+                    // Still here, and something about it changed. The only
+                    // thing that can have is the flags — the bytes of a message
+                    // are immutable — so this must not re-download it.
+                    (true, Some(uid)) => {
+                        if known.entries.get(&uid) != Some(&email.keywords) {
+                            store.set_flags(uid, email.keywords)?;
+                            outcome.reflagged += 1;
+                        }
+                    }
+                    // Moved out of this mailbox, into another one.
+                    (false, Some(uid)) => {
+                        state.forget(&email.id);
+                        store.remove(uid)?;
+                        outcome.removed += 1;
+                    }
+                    // Another mailbox's business entirely.
+                    (false, None) => {}
+                }
+            }
+        }
+
+        // Deleted outright, rather than moved.
+        for id in &changes.destroyed {
+            if let Some(uid) = state.uid_of(id) {
+                state.forget(id);
+                store.remove(uid)?;
+                outcome.removed += 1;
+            }
+        }
+
+        // Only after everything in this window is applied. Advancing first and
+        // failing second would skip the window permanently — the same rule the
+        // IMAP MODSEQ cursor and the CalDAV ctag follow.
+        state.email_state = Some(changes.new_state.clone());
+        cursor = changes.new_state;
+
+        if !changes.has_more {
+            break;
+        }
+    }
+
+    store.commit_cursor(Cursor {
+        uid_validity: JMAP_UID_VALIDITY,
+        last_uid: state.next_uid.saturating_sub(1),
+        ..Default::default()
+    })?;
+
+    Ok(Some(outcome))
+}
+
+/// Reads the mailbox as the server currently has it.
+///
+/// Fetches what is missing, updates the flags of what changed, and removes what
+/// has left. The bytes come from the download endpoint, never from `Email/get`
+/// — see the module docs.
+fn sync_full(
+    session: &Session,
+    mailbox_id: &str,
+    store: &mut impl MailStore,
+    state: &mut JmapState,
+    limit: usize,
+) -> Result<JmapOutcome> {
+    let mut outcome = JmapOutcome::default();
+
+    // Read *before* the query, so a change landing during this pass is caught
+    // by the next one rather than skipped by a state that is newer than the
+    // data it was recorded with.
+    let opened_at = session.email_state()?;
 
     let ids = session.query(mailbox_id, limit)?;
     let known = store.state()?;
@@ -638,6 +960,8 @@ pub fn sync_mailbox(
         );
     }
 
+    state.email_state = Some(opened_at);
+
     store.commit_cursor(Cursor {
         uid_validity: JMAP_UID_VALIDITY,
         last_uid: state.next_uid.saturating_sub(1),
@@ -650,6 +974,56 @@ pub fn sync_mailbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_method_error_is_found_wherever_it_sits_in_the_batch() {
+        // A batch's second call can fail while its first succeeds, and reading
+        // only the first would report success over a refused request.
+        let responses = vec![
+            json!(["Email/get", { "list": [] }, "0"]),
+            json!(["error", { "type": "cannotCalculateChanges" }, "1"]),
+        ];
+
+        assert_eq!(
+            method_error(&responses).as_deref(),
+            Some("cannotCalculateChanges")
+        );
+        assert_eq!(method_error(&responses[..1]), None);
+    }
+
+    #[test]
+    fn an_error_with_no_type_still_reports_as_one() {
+        let responses = vec![json!(["error", {}, "0"])];
+        assert_eq!(method_error(&responses).as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn resetting_the_era_forces_the_next_pass_to_read_in_full() {
+        let mut state = JmapState {
+            email_state: Some("42".into()),
+            ..Default::default()
+        };
+        assert_eq!(state.email_state(), Some("42"));
+
+        state.reset_era();
+
+        assert_eq!(state.email_state(), None);
+    }
+
+    #[test]
+    fn the_era_survives_a_round_trip_through_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = JmapState::default();
+        state.uid_for("M1");
+        state.email_state = Some("state-7".into());
+        state.save(dir.path()).unwrap();
+
+        assert_eq!(
+            JmapState::load(dir.path()).email_state(),
+            Some("state-7"),
+            "a restart would re-read every mailbox in full"
+        );
+    }
 
     #[test]
     fn keywords_map_to_flags_both_ways() {
