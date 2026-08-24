@@ -239,8 +239,8 @@ fn serve(emails: Vec<Email>) -> Server {
                     let call_id = call.get(2).and_then(Value::as_str).unwrap_or("0").to_owned();
                     recorded.lock().expect("calls").push(name.clone());
 
-                    let state = held.lock().expect("state");
-                    let (reply_name, reply) = respond(&name, &args, &state);
+                    let mut state = held.lock().expect("state");
+                    let (reply_name, reply) = respond(&name, &args, &mut state);
                     drop(state);
 
                     responses.push(json!([reply_name, reply, call_id]));
@@ -268,7 +268,7 @@ fn serve(emails: Vec<Email>) -> Server {
 }
 
 /// Answers one method call. Returns `("error", …)` where a real server would.
-fn respond(name: &str, args: &Value, state: &ServerState) -> (String, Value) {
+fn respond(name: &str, args: &Value, state: &mut ServerState) -> (String, Value) {
     let in_mailbox = |email: &Email, id: &str| email.mailboxes.iter().any(|m| m == id);
 
     let reply = match name {
@@ -374,6 +374,67 @@ fn respond(name: &str, args: &Value, state: &ServerState) -> (String, Value) {
                 "destroyed": destroyed
             })
         }
+        "Email/set" => {
+            let mut updated = serde_json::Map::new();
+            let mut destroyed = Vec::new();
+            let mut touched = Vec::new();
+
+            if let Some(update) = args.get("update").and_then(Value::as_object) {
+                for (id, patch) in update {
+                    let Some(email) = state.emails.iter_mut().find(|e| &e.id == id) else {
+                        continue;
+                    };
+                    let Some(fields) = patch.as_object() else {
+                        continue;
+                    };
+                    for (property, value) in fields {
+                        let property = property.as_str();
+                        match property {
+                            "keywords" => email.keywords = value.clone(),
+                            // Patch form: `mailboxIds/<id>` = true, or null to
+                            // remove. A real server accepts both this and a
+                            // whole-set replacement.
+                            path if path.starts_with("mailboxIds/") => {
+                                let mailbox = path.trim_start_matches("mailboxIds/").to_owned();
+                                if value.is_null() {
+                                    email.mailboxes.retain(|m| m != &mailbox);
+                                } else if !email.mailboxes.contains(&mailbox) {
+                                    email.mailboxes.push(mailbox);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    updated.insert(id.clone(), Value::Null);
+                    touched.push(id.clone());
+                }
+            }
+
+            if let Some(list) = args.get("destroy").and_then(Value::as_array) {
+                for id in list.iter().filter_map(Value::as_str) {
+                    if state.emails.iter().any(|e| e.id == id) {
+                        state.emails.retain(|e| e.id != id);
+                        destroyed.push(id.to_owned());
+                    }
+                }
+            }
+
+            for id in touched {
+                state.record(&id, ChangeKind::Updated);
+            }
+            for id in &destroyed {
+                state.record(id, ChangeKind::Destroyed);
+            }
+
+            json!({
+                "accountId": "acct-1",
+                "newState": state.state.to_string(),
+                "updated": updated,
+                "destroyed": destroyed,
+                "notUpdated": {},
+                "notDestroyed": {}
+            })
+        }
         _ => json!({ "accountId": "acct-1" }),
     };
 
@@ -397,7 +458,7 @@ fn connect(server: &Server) -> Session {
 
 fn sync(server: &Server, store: &mut MaildirStore, state: &mut JmapState) -> cosmic_pim_mail::jmap::JmapOutcome {
     let session = connect(server);
-    sync_mailbox(&session, "mbox-1", store, state, 500).expect("sync")
+    sync_mailbox(&session, "mbox-1", store, state, 500, 1_000).expect("sync")
 }
 
 fn downloads(server: &Server) -> usize {
@@ -664,4 +725,104 @@ fn an_empty_listing_does_not_empty_the_maildir_on_a_full_read() {
 
     assert_eq!(outcome.removed, 0, "an empty listing wiped the mailbox");
     assert_eq!(store.state().expect("state").entries.len(), 1);
+}
+
+#[test]
+fn a_local_flag_change_reaches_the_server_before_the_pull_can_undo_it() {
+    // The bug this ordering prevents: the pull writes the server's older
+    // keywords over the local ones, and the queued push then sends the
+    // server's own state back to it. The star the user set disappears with
+    // every indicator reporting success.
+    use cosmic_pim_mail::push::{PushOp, PushQueue};
+    use cosmic_pim_mail::model::Flags;
+
+    let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
+    let (dir, mut store) = maildir();
+    let mut state = JmapState::load(dir.path());
+    sync(&server, &mut store, &mut state);
+
+    let uid = state.uid_of("M1").expect("a local uid");
+    store
+        .enqueue(PushOp::SetFlags {
+            uid,
+            flags: Flags {
+                flagged: true,
+                ..Default::default()
+            },
+        })
+        .expect("enqueue");
+
+    let outcome = sync(&server, &mut store, &mut state);
+
+    assert_eq!(outcome.pushed.succeeded, 1, "the flag change never went out");
+    assert!(store.pending().is_empty(), "the queue entry outlived its push");
+
+    // The server has it, so the pass that follows agrees rather than fighting.
+    let held = server.inner.lock().expect("state");
+    let email = held.emails.iter().find(|e| e.id == "M1").expect("M1");
+    assert_eq!(
+        email.keywords.get("$flagged").and_then(Value::as_bool),
+        Some(true),
+        "the server did not receive the flag"
+    );
+}
+
+#[test]
+fn a_local_move_leaves_the_mailbox_and_forgets_the_id() {
+    use cosmic_pim_mail::push::{PushOp, PushQueue};
+
+    let server = serve(vec![
+        Email::new("M1", RAW_ONE, json!({})),
+        Email::new("M2", RAW_TWO, json!({})),
+    ]);
+    let (dir, mut store) = maildir();
+    let mut state = JmapState::load(dir.path());
+    sync(&server, &mut store, &mut state);
+
+    let uid = state.uid_of("M1").expect("a local uid");
+    store
+        .enqueue(PushOp::Move {
+            uid,
+            destination: "mbox-archive".into(),
+        })
+        .expect("enqueue");
+
+    let outcome = sync(&server, &mut store, &mut state);
+
+    assert_eq!(outcome.pushed.succeeded, 1);
+    assert!(
+        state.uid_of("M1").is_none(),
+        "the id mapping survived a move, so the next pass sees a message it thinks it holds"
+    );
+
+    // On the server it is in the other mailbox, not gone.
+    let held = server.inner.lock().expect("state");
+    let email = held.emails.iter().find(|e| e.id == "M1").expect("M1 was destroyed");
+    assert_eq!(email.mailboxes, vec!["mbox-archive".to_owned()]);
+}
+
+#[test]
+fn a_queued_operation_for_an_unknown_message_asks_for_a_resync() {
+    // The sidecar and the maildir have diverged. Retrying forever would never
+    // fix it and dropping the entry would lose the user's change silently, so
+    // it is handed to a sync pass.
+    use cosmic_pim_mail::push::{PushOp, PushQueue};
+    use cosmic_pim_mail::model::Flags;
+
+    let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
+    let (dir, mut store) = maildir();
+    let mut state = JmapState::load(dir.path());
+    sync(&server, &mut store, &mut state);
+
+    store
+        .enqueue(PushOp::SetFlags {
+            uid: 9_999,
+            flags: Flags::default(),
+        })
+        .expect("enqueue");
+
+    let outcome = sync(&server, &mut store, &mut state);
+
+    assert_eq!(outcome.pushed.needs_reconcile, 1);
+    assert_eq!(outcome.pushed.succeeded, 0);
 }

@@ -130,7 +130,7 @@ pub fn sync_account_mail(
     // `MailEndpoint::protocol`.
     match mail.protocol {
         MailProtocol::Imap => sync_over_imap(account, mail, credentials, mail_root, options, now_ms),
-        MailProtocol::Jmap => sync_over_jmap(account, mail, credentials, mail_root),
+        MailProtocol::Jmap => sync_over_jmap(account, mail, credentials, mail_root, now_ms),
         MailProtocol::Pop3 => sync_over_pop3(account, mail, credentials, mail_root, now_ms),
     }
 }
@@ -199,6 +199,7 @@ fn sync_over_jmap(
     mail: &MailEndpoint,
     credentials: &Credentials,
     mail_root: &Path,
+    now_ms: i64,
 ) -> Result<MailReport> {
     use cosmic_pim_mail::jmap;
 
@@ -229,14 +230,21 @@ fn sync_over_jmap(
             let path = mailbox_path(mail_root, &account.id, &folder);
             let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
             let mut state = jmap::JmapState::load(&path);
-            let outcome =
-                jmap::sync_mailbox(&session, &mailbox.id, &mut store, &mut state, JMAP_WINDOW)
-                    .map_err(Error::Mail)?;
+            let outcome = jmap::sync_mailbox(
+                &session,
+                &mailbox.id,
+                &mut store,
+                &mut state,
+                JMAP_WINDOW,
+                now_ms,
+            )
+            .map_err(Error::Mail)?;
             state.save(&path).map_err(Error::Mail)?;
             Ok(SyncOutcome {
                 fetched: outcome.fetched,
                 reflagged: outcome.reflagged,
                 removed: outcome.removed,
+                pushed: outcome.pushed,
                 ..Default::default()
             })
         })();

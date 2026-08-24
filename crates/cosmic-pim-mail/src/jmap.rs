@@ -63,6 +63,42 @@ const GET_BATCH: usize = 100;
 /// fewer and set `hasMoreChanges`, which the caller loops on.
 const CHANGES_BATCH: usize = 500;
 
+/// Checks that an `Email/set` actually did what it was asked, for one object.
+///
+/// Positive confirmation, not absence of an error. JMAP reports per-object
+/// failures in `notUpdated` rather than as a method error, and it names each
+/// success in `updated` — so a response that mentions the id in *neither* did
+/// nothing at all. Reading that as success drops the queue entry with the
+/// user's change unmade and nothing anywhere to say so, which is the exact
+/// shape of failure the durable queue exists to prevent.
+fn check_updated(responses: &[Value], id: &str) -> Result<()> {
+    let args = responses
+        .first()
+        .and_then(|entry| entry.get(1))
+        .ok_or_else(|| Error::Jmap("Email/set returned nothing".to_owned()))?;
+
+    if let Some(reason) = args.get("notUpdated").and_then(|not| not.get(id)) {
+        return Err(Error::Jmap(format!(
+            "the server refused the change to {id}: {reason}"
+        )));
+    }
+
+    // `updated` maps id → null (or an object of server-set properties), so the
+    // key being present is the confirmation, whatever its value.
+    let confirmed = args
+        .get("updated")
+        .and_then(Value::as_object)
+        .is_some_and(|updated| updated.contains_key(id));
+
+    if confirmed {
+        Ok(())
+    } else {
+        Err(Error::Jmap(format!(
+            "the server acknowledged neither success nor failure for {id}"
+        )))
+    }
+}
+
 /// The `type` of a per-call error in a response list, if there is one.
 fn method_error(responses: &[Value]) -> Option<String> {
     responses.iter().find_map(|entry| {
@@ -521,6 +557,67 @@ impl Session {
             .collect())
     }
 
+    /// Moves an email from one mailbox to another.
+    ///
+    /// A JMAP move is a `mailboxIds` patch, not a copy and a delete: the
+    /// message keeps its id, its blob, and its keywords, so nothing has to be
+    /// re-downloaded anywhere and no other client sees it vanish and reappear.
+    /// The patch form is used rather than a whole replacement `mailboxIds` set,
+    /// because a message can legitimately be in more than one mailbox and
+    /// replacing the set would silently remove it from the others.
+    pub fn move_email(&self, id: &str, from_mailbox: &str, to_mailbox: &str) -> Result<()> {
+        let responses = self.request(json!([[
+            "Email/set",
+            {
+                "accountId": self.account_id,
+                "update": {
+                    id: {
+                        format!("mailboxIds/{from_mailbox}"): null,
+                        format!("mailboxIds/{to_mailbox}"): true
+                    }
+                }
+            },
+            "0"
+        ]]))?;
+
+        check_updated(&responses, id)
+    }
+
+    /// Destroys an email outright. There is no undo and no Trash.
+    pub fn destroy_email(&self, id: &str) -> Result<()> {
+        let responses = self.request(json!([[
+            "Email/set",
+            { "accountId": self.account_id, "destroy": [id] },
+            "0"
+        ]]))?;
+
+        let args = responses
+            .first()
+            .and_then(|entry| entry.get(1))
+            .ok_or_else(|| Error::Jmap("Email/set returned nothing".to_owned()))?;
+
+        if let Some(reason) = args.get("notDestroyed").and_then(|not| not.get(id)) {
+            return Err(Error::Jmap(format!(
+                "the server refused to destroy {id}: {reason}"
+            )));
+        }
+
+        // As with an update: the id has to appear in `destroyed` for this to
+        // have happened.
+        let confirmed = args
+            .get("destroyed")
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|d| d.as_str() == Some(id)));
+
+        if confirmed {
+            Ok(())
+        } else {
+            Err(Error::Jmap(format!(
+                "the server acknowledged neither success nor failure for destroying {id}"
+            )))
+        }
+    }
+
     /// Downloads the original RFC 5322 octets for a blob.
     pub fn download(&self, blob_id: &str) -> Result<Vec<u8>> {
         let url = self
@@ -565,19 +662,69 @@ impl Session {
             "0"
         ]]))?;
 
-        // A per-object failure lands in `notUpdated`, not in the method error,
-        // so a set that silently did nothing would otherwise look like success.
-        if let Some(reason) = responses
-            .first()
-            .and_then(|entry| entry.get(1))
-            .and_then(|args| args.get("notUpdated"))
-            .and_then(|not| not.get(id))
-        {
-            return Err(Error::Jmap(format!(
-                "the server refused a flag change for {id}: {reason}"
-            )));
-        }
+        check_updated(&responses, id)
+    }
+}
 
+/// Writeback over JMAP: a [`crate::push::Writeback`] bound to one mailbox.
+///
+/// The queue is keyed by local UID and JMAP is keyed by opaque id, so
+/// something has to hold the mapping while a drain runs — that is this. It
+/// borrows the state rather than owning a copy, because a `Move` has to forget
+/// the id it just sent away and the next pull must not then re-download it
+/// under a stale UID.
+pub struct JmapWriteback<'a> {
+    session: &'a Session,
+    mailbox_id: &'a str,
+    state: &'a mut JmapState,
+}
+
+impl<'a> JmapWriteback<'a> {
+    #[must_use]
+    pub fn new(session: &'a Session, mailbox_id: &'a str, state: &'a mut JmapState) -> Self {
+        Self {
+            session,
+            mailbox_id,
+            state,
+        }
+    }
+
+    /// The server id for a local UID, or an error naming what is missing.
+    ///
+    /// A queued operation for a UID with no id means the sidecar and the
+    /// maildir have diverged — recoverable, but only by a full read, so it is
+    /// reported as needing reconciliation rather than retried forever.
+    fn id_for(&self, uid: u32) -> Result<String> {
+        self.state.id_of(uid).map(ToOwned::to_owned).ok_or_else(|| {
+            Error::UidValidityChanged {
+                mailbox: self.mailbox_id.to_owned(),
+                had: uid,
+                now: 0,
+            }
+        })
+    }
+}
+
+impl crate::push::Writeback for JmapWriteback<'_> {
+    fn store_flags(&mut self, uid: u32, flags: Flags) -> Result<()> {
+        let id = self.id_for(uid)?;
+        self.session.set_keywords(&id, flags)
+    }
+
+    fn move_message(&mut self, uid: u32, destination: &str) -> Result<()> {
+        let id = self.id_for(uid)?;
+        self.session
+            .move_email(&id, self.mailbox_id, destination)?;
+        // It is no longer this mailbox's message. Keeping the mapping would
+        // have the next incremental pass see an id it still believes it holds.
+        self.state.forget(&id);
+        Ok(())
+    }
+
+    fn delete_message(&mut self, uid: u32) -> Result<()> {
+        let id = self.id_for(uid)?;
+        self.session.destroy_email(&id)?;
+        self.state.forget(&id);
         Ok(())
     }
 }
@@ -743,6 +890,8 @@ pub struct JmapOutcome {
     pub fetched: usize,
     pub reflagged: usize,
     pub removed: usize,
+    /// What the local writeback queue did before the pull ran.
+    pub pushed: crate::push::DrainOutcome,
 }
 
 /// JMAP mailboxes are identified by string, and never renumber, so the store's
@@ -760,6 +909,28 @@ pub const JMAP_UID_VALIDITY: u32 = 1;
 /// gap) drops the client back to a full read, which is why the full path stays
 /// and is not an optimisation to be removed later.
 pub fn sync_mailbox(
+    session: &Session,
+    mailbox_id: &str,
+    store: &mut (impl MailStore + crate::push::PushQueue),
+    state: &mut JmapState,
+    limit: usize,
+    now_ms: i64,
+) -> Result<JmapOutcome> {
+    // Push before pull, for the reason it is done everywhere else in this
+    // suite: the other order lets the pull overwrite a local flag change with
+    // the server's older copy, after which the queued push re-sends what was
+    // just clobbered. It presents as read marks flickering back.
+    let pushed = {
+        let mut writeback = JmapWriteback::new(session, mailbox_id, state);
+        crate::push::drain(&mut writeback, store, now_ms)
+    };
+
+    let mut outcome = sync_after_push(session, mailbox_id, store, state, limit)?;
+    outcome.pushed = pushed;
+    Ok(outcome)
+}
+
+fn sync_after_push(
     session: &Session,
     mailbox_id: &str,
     store: &mut impl MailStore,
@@ -995,6 +1166,36 @@ mod tests {
     fn an_error_with_no_type_still_reports_as_one() {
         let responses = vec![json!(["error", {}, "0"])];
         assert_eq!(method_error(&responses).as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn a_set_that_says_nothing_is_not_a_success() {
+        // The failure this catches is silent: the queue entry is dropped, the
+        // UI reports the change saved, and the server never made it. Absence
+        // of an error is not confirmation.
+        let responses = vec![json!(["Email/set", { "accountId": "a" }, "0"])];
+        assert!(check_updated(&responses, "M1").is_err());
+    }
+
+    #[test]
+    fn a_set_confirms_by_naming_the_object_it_changed() {
+        let responses = vec![json!(["Email/set", { "updated": { "M1": null } }, "0"])];
+        assert!(check_updated(&responses, "M1").is_ok());
+        // …and confirming a *different* object is not confirming this one.
+        assert!(check_updated(&responses, "M2").is_err());
+    }
+
+    #[test]
+    fn a_refusal_carries_the_servers_reason() {
+        let responses = vec![json!([
+            "Email/set",
+            { "notUpdated": { "M1": { "type": "forbidden" } } },
+            "0"
+        ])];
+
+        let error = check_updated(&responses, "M1").unwrap_err();
+
+        assert!(error.to_string().contains("forbidden"), "got {error}");
     }
 
     #[test]

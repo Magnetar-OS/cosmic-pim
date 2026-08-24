@@ -83,7 +83,7 @@ in one place and all three apps get it.
 | Where a service lives | `accounts::provider` | Manifests, not a match arm. A new provider is a file. |
 | Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
 | IMAP | `mail::imap` | Session, cycle, and durable writeback. Not a DAV flavour. |
-| JMAP | `mail::jmap` | RFC 8620/8621. Metadata by API, bytes by blob download — see below. |
+| JMAP | `mail::jmap` | RFC 8620/8621. Metadata by API, bytes by blob download; incremental via `Email/changes`. |
 | POP3 | `mail::pop3` | RFC 1939, for accounts that offer nothing else. |
 | SMTP | `mail::smtp` | Sending, and the one failure that must never be auto-retried. |
 | Conversation lists | `mail::index` | A rebuildable SQLite cache, same standing as the calendar's. |
@@ -254,6 +254,14 @@ for metadata plus `blobId` only, and the message itself comes from the download
 endpoint as the original octets. One extra request per message, and it is not
 optional.
 
+**A JMAP write is confirmed, not merely unrefused.** `Email/set` reports
+per-object failures in `notUpdated` rather than as a method error, and names
+each success in `updated` — so a response mentioning an object in neither did
+nothing at all. Treating absence of an error as success drops the queue entry
+with the user's change unmade and nothing anywhere to say so, which is the
+exact shape of loss the durable queue exists to prevent. The client requires
+the positive acknowledgement.
+
 **POP3 is not a small IMAP, and is not pretended to be.** One mailbox, no
 folders, no server-side flags, nothing visible to a second device. Flags are
 local facts; the writeback queue is not involved because there is nowhere to
@@ -357,7 +365,7 @@ the moment the model existed, because the engine never parses what it stores.
 
 ## Testing
 
-Roughly 680 tests in the substrate, `cargo test --workspace`.
+Roughly 690 tests in the substrate, `cargo test --workspace`.
 
 The one worth knowing about is `caldav/tests/live_sync.rs`: a real HTTP server
 answering PROPFIND and REPORT with canned multistatus XML, driving the real
