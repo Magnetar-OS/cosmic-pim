@@ -1,0 +1,178 @@
+// Copyright 2026 Dominikos Pritis
+// SPDX-License-Identifier: MPL-2.0
+
+//! The sync engine against a real CalDAV server — no canned XML anywhere.
+//!
+//! Every other test in this crate scripts the server, which proves the client
+//! against what we *believe* servers say. This one is the beginning of the
+//! server matrix 00-suite.md asks for: it proves the client against what a
+//! server actually says, which is where the quirks table's entries will come
+//! from. CI runs it against Radicale; Baïkal and Nextcloud can join as
+//! containers later, and Fastmail/Google/iCloud stay a manual checklist.
+//!
+//! Ignored by default and gated on the environment, so `cargo test` stays
+//! offline and deterministic:
+//!
+//! ```sh
+//! COSMIC_PIM_LIVE_CALDAV_URL=http://127.0.0.1:5232/ci/ \
+//! COSMIC_PIM_LIVE_CALDAV_USER=ci COSMIC_PIM_LIVE_CALDAV_PASS=ci \
+//! cargo test -p cosmic-pim-caldav --test live_server -- --ignored
+//! ```
+
+use cosmic_pim_caldav::push::drain;
+use cosmic_pim_caldav::{CalDavStore, CaldavClient, Disposition, VdirStore, sync_collection};
+use cosmic_pim_core::model::Rgb;
+use cosmic_pim_core::store::vdir;
+
+struct Live {
+    base: String,
+    user: String,
+    pass: String,
+}
+
+/// The server to test against, or `None` — in which case the test announces
+/// it is skipping rather than failing, so `--ignored` without a server is a
+/// no-op instead of a red herring.
+fn live() -> Option<Live> {
+    let base = std::env::var("COSMIC_PIM_LIVE_CALDAV_URL").ok()?;
+    Some(Live {
+        base: if base.ends_with('/') { base } else { format!("{base}/") },
+        user: std::env::var("COSMIC_PIM_LIVE_CALDAV_USER").unwrap_or_default(),
+        pass: std::env::var("COSMIC_PIM_LIVE_CALDAV_PASS").unwrap_or_default(),
+    })
+}
+
+fn event(uid: &str, summary: &str) -> String {
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//cosmic-pim//live//EN\r\n\
+         BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART:20270104T090000Z\r\nDTEND:20270104T100000Z\r\n\
+         SUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+}
+
+/// One deliberately sequential journey: create, discover, sync down, edit,
+/// push back, hit the 412, delete. Sequential because each step is the next
+/// one's fixture, and a real server's state does not reset between tests.
+#[test]
+#[ignore = "needs a live CalDAV server; see the module docs"]
+fn a_full_round_trip_against_a_real_server() {
+    let Some(live) = live() else {
+        eprintln!("COSMIC_PIM_LIVE_CALDAV_URL is not set; skipping");
+        return;
+    };
+
+    let client = CaldavClient::new(&live.base, &live.user, &live.pass);
+    let event_url = format!("{}calendar/ci-round-trip.ics", live.base);
+
+    // --- create -----------------------------------------------------------
+    // Radicale creates the parent collection on first PUT, which is also the
+    // cheapest way to make the rest of the journey self-provisioning.
+    let etag = client
+        .put_event(&event_url, &event("ci-1@cosmic-pim", "Created live"), None)
+        .expect("PUT a new event");
+
+    // --- discover ---------------------------------------------------------
+    let mut discovering = CaldavClient::new(&live.base, &live.user, &live.pass);
+    discovering.discover().expect("discovery");
+    let calendars = discovering.list_calendars().expect("list calendars");
+    let calendar = calendars
+        .iter()
+        .find(|c| c.href.trim_end_matches('/').ends_with("calendar"))
+        .unwrap_or_else(|| panic!("the created calendar was not discovered: {calendars:?}"));
+
+    // --- sync down --------------------------------------------------------
+    let dir = tempfile::tempdir().expect("tempdir");
+    let meta = vdir::create_collection(dir.path(), "Live", Rgb(1, 2, 3)).expect("collection");
+    let mut store = VdirStore::open(meta).expect("store");
+    store.set_remote(&calendar.href, false).expect("bind");
+
+    let calendar_url = resolve(&live.base, &calendar.href);
+    let outcome = sync_collection(&client, &calendar_url, &mut store).expect("first sync");
+    assert!(outcome.fetched >= 1, "the created event never came down");
+
+    let events = vdir::read_collection(store.collection());
+    let mine = events
+        .iter()
+        .find(|e| e.summary == "Created live")
+        .expect("the event is not readable from the vdir");
+    let _ = mine;
+
+    // --- edit locally, push back ------------------------------------------
+    let (file, _etag) = store
+        .entry_for(&event_url)
+        .or_else(|| {
+            // Servers are free to rewrite the href; find ours by content.
+            store.state().ok().and_then(|s| {
+                s.entries.keys().find_map(|href| {
+                    href.contains("ci-round-trip").then(|| store.entry_for(href)).flatten()
+                })
+            })
+        })
+        .expect("the synced event has no sidecar entry");
+
+    std::fs::write(
+        store.collection().path.join(&file),
+        event("ci-1@cosmic-pim", "Edited live"),
+    )
+    .expect("local edit");
+    let href = store.href_for_file(&file).expect("an href for the file");
+    store.queue_put(&href).expect("queue");
+
+    let pushed = drain(&client, &mut store, 0);
+    assert_eq!(pushed.succeeded, 1, "the edit did not reach the server: {pushed:?}");
+
+    // And the server agrees: a fresh sync into a fresh store sees the edit.
+    let meta = vdir::create_collection(dir.path(), "Verify", Rgb(1, 2, 3)).expect("collection");
+    let mut verify = VdirStore::open(meta).expect("store");
+    verify.set_remote(&calendar.href, false).expect("bind");
+    sync_collection(&client, &calendar_url, &mut verify).expect("verify sync");
+    assert!(
+        vdir::read_collection(verify.collection())
+            .iter()
+            .any(|e| e.summary == "Edited live"),
+        "the server kept the old copy"
+    );
+
+    // --- the 412 path ------------------------------------------------------
+    // A stale If-Match must be refused by the server and classified as
+    // Reconcile by us — the whole push-error taxonomy in one live exchange.
+    let stale = client.put_event(
+        &event_url,
+        &event("ci-1@cosmic-pim", "Must not land"),
+        Some("\"nothing-has-this-etag\""),
+    );
+    let why = stale.expect_err("a stale etag was accepted");
+    assert_eq!(
+        why.disposition(),
+        Disposition::Reconcile,
+        "a 412 was classified as {:?} ({why})",
+        why.disposition()
+    );
+
+    // --- delete, idempotently ---------------------------------------------
+    client
+        .delete_event(&event_url, etag.as_deref())
+        .expect("DELETE");
+    client
+        .delete_event(&event_url, None)
+        .expect("a second DELETE must be tolerated, not wedged on a 404");
+
+    // And a final sync sees the removal.
+    let outcome = sync_collection(&client, &calendar_url, &mut store).expect("final sync");
+    assert!(
+        outcome.deleted >= 1 || vdir::read_collection(store.collection()).is_empty(),
+        "the deletion never propagated"
+    );
+}
+
+/// Hrefs come back server-relative; the request URL needs them absolute.
+fn resolve(base: &str, href: &str) -> String {
+    if href.starts_with("http") {
+        return href.to_owned();
+    }
+    let origin = base
+        .find("//")
+        .and_then(|scheme| base[scheme + 2..].find('/').map(|slash| &base[..scheme + 2 + slash]))
+        .unwrap_or(base);
+    format!("{}{}", origin, href)
+}

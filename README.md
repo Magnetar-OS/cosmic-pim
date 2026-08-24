@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
 | [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
-| **cosmic-pim** | — | This substrate | 760 tests |
+| **cosmic-pim** | — | This substrate | 784 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
@@ -152,6 +152,28 @@ both versions intact rather than guessed at:
 for (collection, conflict) in cosmic_pim_sync::conflicts(&calendar_root) {
     // conflict.local and conflict.remote are both here; the user chooses.
     cosmic_pim_sync::conflict::take_remote(&calendar_root, &collection, &conflict.href)?;
+}
+```
+
+An ICS subscription — a holiday calendar, a timetable, anything published as a
+`webcal://` URL — becomes an ordinary read-only collection, refreshed with
+conditional requests and split into one file per event so every vdir reader
+sees it:
+
+```rust
+use cosmic_pim_caldav::feed;
+
+let meta = feed::subscribe(&calendar_root, "Holidays", url, color, None)?;
+feed::refresh(&meta.path, now_ms)?;
+```
+
+And mail can be *pushed* rather than polled, where the server offers it — IMAP
+IDLE, or JMAP's event source — with one blocking primitive on each session:
+
+```rust
+match imap_session.watch("INBOX", Duration::from_secs(25 * 60))? {
+    Watched::Changed => { /* run a sync pass */ }
+    Watched::TimedOut => { /* watch again */ }
 }
 ```
 

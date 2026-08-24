@@ -87,6 +87,8 @@ struct ServerState {
     emails: Vec<Email>,
     /// Blobs the upload endpoint accepted, by id.
     uploads: Vec<(String, Vec<u8>)>,
+    /// When set, the event source never reports a change.
+    event_source_quiet: bool,
     /// Monotonic; its decimal form is the JMAP state string.
     state: u64,
     /// `(state after the change, id, what happened)`.
@@ -177,6 +179,7 @@ fn serve(emails: Vec<Email>) -> Server {
     let inner = Arc::new(Mutex::new(ServerState {
         emails,
         uploads: Vec::new(),
+        event_source_quiet: false,
         state: 1,
         history: Vec::new(),
         floor: 0,
@@ -188,6 +191,33 @@ fn serve(emails: Vec<Email>) -> Server {
             let path = request.url().to_owned();
             let mut body = String::new();
             let _ = request.as_reader().read_to_string(&mut body);
+
+            // The event source: hold the connection briefly, then either
+            // report a state change and close (closeafter=state), or say
+            // nothing until the client gives up.
+            if path.starts_with("/events") {
+                recorded.lock().expect("calls").push("events".to_owned());
+                let quiet = held.lock().expect("state").event_source_quiet;
+                if quiet {
+                    // Longer than any client timeout the tests use.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let _ = request.respond(
+                        tiny_http::Response::from_string("event: ping\ndata: {}\n\n"),
+                    );
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let body = "event: state\ndata: {\"changed\":{}}\n\n";
+                let response = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/event-stream"[..],
+                    )
+                    .expect("header"),
+                );
+                let _ = request.respond(response);
+                continue;
+            }
 
             // A blob upload: bytes in, a blobId out.
             if path.starts_with("/upload/") {
@@ -236,6 +266,8 @@ fn serve(emails: Vec<Email>) -> Server {
                     "apiUrl": format!("{base}/api"),
                     "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}"),
                     "uploadUrl": format!("{base}/upload/{{accountId}}"),
+                    "eventSourceUrl":
+                        format!("{base}/events?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
                     "capabilities": {
                         "urn:ietf:params:jmap:core": {},
                         "urn:ietf:params:jmap:mail": {}
@@ -964,4 +996,32 @@ fn an_import_of_an_unknown_blob_reports_rather_than_pretending() {
         error.to_string().contains("neither success nor failure"),
         "got {error}"
     );
+}
+
+#[test]
+fn a_watch_wakes_when_the_server_reports_a_state_change() {
+    // Push mail over JMAP, end to end: the client parks on the event source
+    // and the server's `state` event is what wakes it — no polling involved.
+    let server = serve(vec![]);
+    let session = connect(&server);
+
+    let outcome = session
+        .watch(std::time::Duration::from_secs(10))
+        .expect("watch");
+
+    assert_eq!(outcome, cosmic_pim_mail::imap::Watched::Changed);
+    assert!(server.calls().iter().any(|call| call == "events"));
+}
+
+#[test]
+fn a_quiet_watch_times_out_rather_than_failing() {
+    let server = serve(vec![]);
+    server.inner.lock().expect("state").event_source_quiet = true;
+    let session = connect(&server);
+
+    let outcome = session
+        .watch(std::time::Duration::from_millis(300))
+        .expect("a timeout is the turn of the loop, not an error");
+
+    assert_eq!(outcome, cosmic_pim_mail::imap::Watched::TimedOut);
 }

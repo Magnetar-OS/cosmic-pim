@@ -78,12 +78,13 @@ in one place and all three apps get it.
 | Files on disk | `core::store` | vdir: a directory per collection, one file per item. |
 | Durable writes | `core::atomic` | Temp file → fsync it → rename → **fsync the parent directory**; optimistic concurrency. |
 | CalDAV / CardDAV | `caldav` | One engine, two flavours. |
+| ICS subscriptions | `caldav::feed` | A URL fetched on an interval, split into ordinary vdir files. Read-only by construction. |
 | RFC 5322 messages | `mail::model` | Extract-only. Nothing ever writes a message back through the parser. |
 | Signing in | `auth` | OAuth 2.0 with PKCE, a loopback redirect, and renewal. One flow for every provider. |
 | Where a service lives | `accounts::provider` | Manifests, not a match arm. A new provider is a file. |
 | Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
-| IMAP | `mail::imap` | Session, cycle, and durable writeback. Not a DAV flavour. |
-| JMAP | `mail::jmap` | RFC 8620/8621. Metadata by API, bytes by blob download; incremental via `Email/changes`. |
+| IMAP | `mail::imap` | Session, cycle, durable writeback, and `watch` over IDLE. |
+| JMAP | `mail::jmap` | RFC 8620/8621. Metadata by API, bytes by blob download; incremental via `Email/changes`; `watch` over the EventSource. |
 | Gmail | `mail::gmail` | The Gmail API. Labels are the folder model; bytes by `format=raw`. |
 | Microsoft Graph | `mail::graph` | Delta queries per folder; bytes by `$value`. |
 | Id and cursor bookkeeping | `mail::store::RemoteIds` | Shared by all three: string id → local UID, plus a change-feed cursor that can expire. |
@@ -430,7 +431,14 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 ## Testing
 
-Roughly 760 tests in the substrate, `cargo test --workspace`.
+Roughly 780 tests in the substrate, `cargo test --workspace`.
+
+`caldav/tests/live_server.rs` is the odd one out: it scripts nothing. Gated on
+`COSMIC_PIM_LIVE_CALDAV_URL` and ignored by default, it drives the real engine
+through a full round trip — create, discover, sync, edit, push, the 412, delete
+— against whatever CalDAV server the environment names. CI points it at
+Radicale; it is the beginning of the server matrix, and the place the quirks
+table's entries will come from.
 
 The one worth knowing about is `caldav/tests/live_sync.rs`: a real HTTP server
 answering PROPFIND and REPORT with canned multistatus XML, driving the real

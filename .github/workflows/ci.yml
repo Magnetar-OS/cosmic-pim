@@ -1,0 +1,79 @@
+# The gate the justfile's recipes imply, run on shared runners. The toolchain
+# comes from rust-toolchain.toml — the workflow deliberately passes none, per
+# the ecosystem convention, so a bump there is a bump everywhere at once.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml on the first cargo invocation and
+      # installs the pinned channel with its components. No toolchain action
+      # needed, and none wanted: an action pinning its own default would
+      # silently override the file.
+      - name: Show the pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # Warnings as-is (the workspace's own lint tables gate the build);
+      # pedantic stays advisory, as everywhere in the COSMIC ecosystem.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  # The server-matrix job 00-suite.md asks for: the real sync engine against a
+  # real CalDAV server, exercising discovery, listing, multiget, writeback and
+  # the 412 path against something nobody canned. Radicale because it installs
+  # in seconds; Baïkal and Nextcloud can join as containers later.
+  radicale:
+    name: live CalDAV (Radicale)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Radicale
+        run: |
+          pipx install radicale
+          mkdir -p /tmp/radicale
+          cat > /tmp/radicale.conf <<'EOF'
+          [server]
+          hosts = 127.0.0.1:5232
+          [auth]
+          type = none
+          [storage]
+          filesystem_folder = /tmp/radicale
+          [rights]
+          type = owner_only
+          EOF
+          radicale --config /tmp/radicale.conf &
+          for _ in $(seq 1 50); do
+            curl -sf http://127.0.0.1:5232/.web/ >/dev/null && break
+            sleep 0.2
+          done
+
+      - name: Live tests
+        env:
+          COSMIC_PIM_LIVE_CALDAV_URL: http://127.0.0.1:5232/ci/
+          COSMIC_PIM_LIVE_CALDAV_USER: ci
+          COSMIC_PIM_LIVE_CALDAV_PASS: ci
+        run: cargo test -p cosmic-pim-caldav --test live_server -- --ignored

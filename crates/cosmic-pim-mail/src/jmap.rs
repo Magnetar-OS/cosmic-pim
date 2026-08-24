@@ -137,6 +137,9 @@ struct SessionResource {
     /// skipped with a warning rather than the whole session refused.
     #[serde(rename = "uploadUrl", default)]
     upload_url: Option<String>,
+    /// The push channel. Absent on a server that offers none.
+    #[serde(rename = "eventSourceUrl", default)]
+    event_source_url: Option<String>,
     #[serde(rename = "primaryAccounts", default)]
     primary_accounts: BTreeMap<String, String>,
     #[serde(default)]
@@ -175,6 +178,7 @@ pub struct Session {
     api_url: String,
     download_url: String,
     upload_url: Option<String>,
+    event_source_url: Option<String>,
     account_id: String,
 }
 
@@ -254,6 +258,7 @@ impl Session {
             api_url: session.api_url,
             download_url: session.download_url,
             upload_url: session.upload_url,
+            event_source_url: session.event_source_url,
             account_id,
         })
     }
@@ -650,6 +655,84 @@ impl Session {
             .bytes()
             .map(|bytes| bytes.to_vec())
             .map_err(|why| Error::Jmap(why.to_string()))
+    }
+
+    /// Blocks until the account's `Email` state changes, or `timeout` passes.
+    ///
+    /// The JMAP counterpart of [`crate::imap::Session::watch`], with the same
+    /// contract and the same outcome type: `Changed` means run a pass, and a
+    /// timeout is the turn of the loop rather than a failure.
+    ///
+    /// JMAP's push channel that needs no infrastructure is the EventSource
+    /// (RFC 8620 §7.3): an ordinary GET the server holds open and writes
+    /// server-sent events into. `closeafter=state` asks it to close the
+    /// stream after the first state event, which turns a streaming protocol
+    /// into a blocking one-shot — exactly the shape a watch loop wants, and it
+    /// needs no incremental SSE parser to get wrong.
+    ///
+    /// A server with no event source at all is an error, so the caller knows
+    /// to poll instead.
+    pub fn watch(&self, timeout: Duration) -> Result<crate::imap::Watched> {
+        use crate::imap::Watched;
+        let Some(template) = self.event_source_url.as_deref() else {
+            return Err(Error::Jmap(
+                "this server offers no event source; poll instead".to_owned(),
+            ));
+        };
+
+        let url = template
+            .replace("{types}", "Email")
+            .replace("{closeafter}", "state")
+            // The server pings to keep intermediaries from dropping the
+            // connection; half the wait is often enough and never more than
+            // thirty seconds.
+            .replace("{ping}", &timeout.as_secs().clamp(1, 30).to_string());
+
+        // A dedicated client: the session's own has a request timeout sized
+        // for API calls, and a long poll held open that long is the point
+        // here, not a fault.
+        let http = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|why| Error::Jmap(why.to_string()))?;
+
+        let response = http
+            .get(&url)
+            .header("Authorization", &self.authorization)
+            .header("Accept", "text/event-stream")
+            .send();
+
+        let response = match response {
+            Ok(response) => response,
+            // The timeout elapsing mid-stream is the quiet outcome, not a
+            // failure.
+            Err(why) if why.is_timeout() => return Ok(Watched::TimedOut),
+            Err(why) => return Err(Error::Jmap(format!("event source: {why}"))),
+        };
+
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(Error::Jmap(format!(
+                "the event source returned HTTP {status}"
+            )));
+        }
+
+        // With closeafter=state the server closes after the first state
+        // event, so reading to the end is reading until news or timeout.
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(why) if why.is_timeout() => return Ok(Watched::TimedOut),
+            Err(why) => return Err(Error::Jmap(format!("event source: {why}"))),
+        };
+
+        let changed = body
+            .lines()
+            .any(|line| line.trim() == "event: state" || line.trim() == "event:state");
+        Ok(if changed {
+            Watched::Changed
+        } else {
+            Watched::TimedOut
+        })
     }
 
     /// Uploads raw bytes and returns the blob id the server assigned.

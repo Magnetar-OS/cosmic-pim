@@ -205,20 +205,29 @@ fn sync_over_imap(
 ///
 /// The API engines send through here — Gmail's `messages.send`, Graph's
 /// `sendMail` — and both file their own Sent copy server-side, so unlike the
-/// SMTP path there is nothing to append afterwards. Returns `(sent, given_up)`
-/// and the accepted copies, for the one caller (JMAP) whose server does not
-/// file for it.
+/// SMTP path there is nothing to append afterwards. The accepted copies come
+/// back for the one caller (JMAP) whose server does not file for it.
+struct Drained {
+    sent: usize,
+    given_up: usize,
+    /// `(queue id, accepted bytes)`, in the order they went.
+    accepted: Vec<(String, Vec<u8>)>,
+}
+
 fn drain_outbox_with(
     account: &Account,
     mail_root: &Path,
     now_ms: i64,
     submit: impl FnMut(&cosmic_pim_mail::Draft) -> cosmic_pim_mail::Outcome,
-) -> Result<(usize, usize, Vec<(String, Vec<u8>)>)> {
+) -> Result<Drained> {
     let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id).join("outbox"))
         .map_err(Error::Mail)?;
     let outcome = outbox.drain_with(submit, now_ms).map_err(Error::Mail)?;
-    let sent = outcome.sent.len();
-    Ok((sent, outcome.given_up, outcome.sent))
+    Ok(Drained {
+        sent: outcome.sent.len(),
+        given_up: outcome.given_up,
+        accepted: outcome.sent,
+    })
 }
 
 /// How much of a Gmail label one bootstrap brings down.
@@ -248,9 +257,9 @@ fn sync_over_gmail(
     // The outbox before the pull, as everywhere else. Gmail files its own
     // Sent copy, so the accepted bytes are dropped rather than appended.
     match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
-        Ok((sent, given_up, _filed)) => {
-            report.sent = sent;
-            report.given_up = given_up;
+        Ok(drained) => {
+            report.sent = drained.sent;
+            report.given_up = drained.given_up;
         }
         Err(why) => {
             // Submission being down must not stop the pull: reading mail
@@ -314,9 +323,9 @@ fn sync_over_graph(
     // when a tenant has SMTP AUTH switched off, and Exchange files its own
     // Sent copy (`saveToSentItems` defaults true).
     match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
-        Ok((sent, given_up, _filed)) => {
-            report.sent = sent;
-            report.given_up = given_up;
+        Ok(drained) => {
+            report.sent = drained.sent;
+            report.given_up = drained.given_up;
         }
         Err(why) => {
             tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
@@ -389,15 +398,15 @@ fn sync_over_jmap(
     match drain_outbox_with(account, mail_root, now_ms, |draft| {
         cosmic_pim_mail::smtp::send(&smtp_endpoint(account, mail), credentials, draft)
     }) {
-        Ok((sent, given_up, filed)) => {
-            report.sent = sent;
-            report.given_up = given_up;
+        Ok(drained) => {
+            report.sent = drained.sent;
+            report.given_up = drained.given_up;
 
             let sent_mailbox = mailboxes
                 .iter()
                 .find(|m| m.role.as_deref() == Some("sent"))
                 .map(|m| m.id.clone());
-            for (id, bytes) in filed {
+            for (id, bytes) in drained.accepted {
                 let Some(sent_id) = sent_mailbox.as_deref() else {
                     tracing::warn!(
                         account = account.display_name,

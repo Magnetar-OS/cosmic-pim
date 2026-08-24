@@ -459,7 +459,7 @@ impl VdirStore {
 /// Hrefs are server-controlled text and routinely contain `/`, `@`, and
 /// percent-escapes; without this a hostile or merely careless server could
 /// place a file outside the collection directory.
-fn sanitise_stem(raw: &str) -> String {
+pub(crate) fn sanitise_stem(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
         .map(|c| {
