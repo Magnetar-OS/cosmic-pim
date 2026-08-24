@@ -37,6 +37,14 @@ pub enum Error {
     #[error("SMTP: {0}")]
     Smtp(String),
 
+    /// A Gmail API request failed, or answered with something unusable.
+    #[error("Gmail: {0}")]
+    Gmail(String),
+
+    /// A Microsoft Graph request failed, or answered with something unusable.
+    #[error("Graph: {0}")]
+    Graph(String),
+
     /// A JMAP request failed, or the server answered with something unusable.
     #[error("JMAP: {0}")]
     Jmap(String),

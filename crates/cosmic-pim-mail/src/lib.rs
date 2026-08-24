@@ -80,6 +80,7 @@ pub mod discovery;
 pub mod drafts;
 pub mod error;
 pub mod folder;
+pub mod gmail;
 pub mod imap;
 pub mod index;
 pub mod jmap;

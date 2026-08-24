@@ -16,7 +16,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::Result;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
 use crate::model::Flags;
 
 /// One message as the server holds it.
@@ -120,6 +122,165 @@ pub trait MailStore {
     /// and a crash inside that window is unrecoverable — nothing left on disk
     /// says which numbering each message belonged to.
     fn reset(&mut self, uid_validity: u32) -> Result<()>;
+}
+
+/// The identity and cursor bookkeeping every id-keyed protocol needs.
+///
+/// # Why this is shared
+///
+/// IMAP hands out numeric UIDs and the store is keyed by them. JMAP, the Gmail
+/// API and Microsoft Graph all hand out opaque strings instead, and all three
+/// therefore need exactly the same two things: a durable string → UID map, so
+/// the maildir and everything reading it stay unchanged, and a cursor into the
+/// server's change feed. Three copies of that would be three places to get the
+/// same subtle thing wrong.
+///
+/// # The cursor can expire, and that is not an error
+///
+/// Every one of these protocols has a change feed with a horizon —
+/// `cannotCalculateChanges` in JMAP, a 404 or 410 from Gmail's `history.list`,
+/// a 410 from a Graph delta link. All three mean the same thing: *I cannot
+/// tell you what changed*. They never mean "nothing changed", and they never
+/// mean "everything was deleted". Reading them as the first freezes the account
+/// forever; reading them as the second empties the user's mailbox. The only
+/// correct answer is to drop the cursor and read the mailbox again, which is
+/// what [`Self::reset_cursor`] exists to make explicit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteIds {
+    /// Server id → the local UID it was assigned.
+    #[serde(default)]
+    seen: BTreeMap<String, u32>,
+    #[serde(default = "first_uid")]
+    next_uid: u32,
+    /// Where the change feed was last read to: a JMAP state string, a Gmail
+    /// `historyId`, a Graph `deltaLink`. Opaque here on purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+    /// Which sidecar this came from, so [`Self::save`] needs no reminding.
+    #[serde(skip)]
+    file: &'static str,
+}
+
+fn first_uid() -> u32 {
+    1
+}
+
+impl Default for RemoteIds {
+    fn default() -> Self {
+        Self {
+            seen: BTreeMap::new(),
+            next_uid: first_uid(),
+            cursor: None,
+            file: "",
+        }
+    }
+}
+
+impl RemoteIds {
+    /// Reads the sidecar `file` beside a maildir, or starts empty.
+    ///
+    /// An unreadable sidecar is treated as absent. The cost is re-reading the
+    /// mailbox; the alternative is being unable to open it at all because a
+    /// JSON file got truncated.
+    #[must_use]
+    pub fn load(maildir: &std::path::Path, file: &'static str) -> Self {
+        let mut state = match std::fs::read_to_string(maildir.join(file)) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|why| {
+                tracing::warn!(
+                    path = %maildir.display(), %why,
+                    "unreadable sidecar; treating the mailbox as new"
+                );
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        };
+        state.file = file;
+        state
+    }
+
+    /// Writes the sidecar atomically — a torn one costs a full re-read.
+    pub fn save(&self, maildir: &std::path::Path) -> Result<()> {
+        debug_assert!(!self.file.is_empty(), "saving a RemoteIds that was never loaded");
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|why| Error::Index(format!("serialising sync state: {why}")))?;
+        cosmic_pim_core::atomic::write(&maildir.join(self.file), &json, None)
+            .map(|_| ())
+            .map_err(|why| Error::Index(format!("writing sync state: {why}")))
+    }
+
+    /// The local UID for a server id, if it has one.
+    #[must_use]
+    pub fn uid_of(&self, id: &str) -> Option<u32> {
+        self.seen.get(id).copied()
+    }
+
+    /// The server id behind a local UID.
+    #[must_use]
+    pub fn id_of(&self, uid: u32) -> Option<&str> {
+        self.seen
+            .iter()
+            .find(|(_, value)| **value == uid)
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// The local UID for a server id, assigning one if it is new.
+    ///
+    /// Assigning once and never again is what keeps a message that moved, or
+    /// arrived twice in a listing, from being stored twice.
+    pub fn uid_for(&mut self, id: &str) -> u32 {
+        if let Some(uid) = self.seen.get(id) {
+            return *uid;
+        }
+        let uid = self.next_uid;
+        self.next_uid = self.next_uid.saturating_add(1);
+        self.seen.insert(id.to_owned(), uid);
+        uid
+    }
+
+    /// Drops a mapping — the message left this mailbox, or was destroyed.
+    pub fn forget(&mut self, id: &str) {
+        self.seen.remove(id);
+    }
+
+    /// How many messages this mailbox believes it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// The highest UID assigned so far, for the store's cursor.
+    #[must_use]
+    pub fn highest_uid(&self) -> u32 {
+        self.next_uid.saturating_sub(1)
+    }
+
+    /// Where the change feed was last read to.
+    #[must_use]
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
+
+    /// Records a new position in the change feed.
+    ///
+    /// Called **only** after everything the previous position described has
+    /// been applied. Advancing first and failing second skips that window
+    /// permanently — the same rule the IMAP MODSEQ cursor and the CalDAV ctag
+    /// follow.
+    pub fn set_cursor(&mut self, cursor: impl Into<String>) {
+        self.cursor = Some(cursor.into());
+    }
+
+    /// Drops the cursor, so the next pass reads the mailbox in full.
+    ///
+    /// What an expired change feed amounts to. See the type's docs.
+    pub fn reset_cursor(&mut self) {
+        self.cursor = None;
+    }
 }
 
 /// An in-memory [`MailStore`] for tests.

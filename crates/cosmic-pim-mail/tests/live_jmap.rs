@@ -22,7 +22,7 @@
 use std::sync::{Arc, Mutex};
 
 use cosmic_pim_mail::Credentials;
-use cosmic_pim_mail::jmap::{JmapState, Session, sync_mailbox};
+use cosmic_pim_mail::jmap::{self, JmapState, Session, sync_mailbox};
 use cosmic_pim_mail::maildir::MaildirStore;
 use cosmic_pim_mail::store::MailStore;
 use serde_json::{Value, json};
@@ -499,14 +499,14 @@ fn a_first_pass_downloads_every_message_into_the_maildir() {
         Email::new("M2", RAW_TWO, json!({})),
     ]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
 
     let outcome = sync(&server, &mut store, &mut state);
 
     assert_eq!(outcome.fetched, 2);
     assert_eq!(store.state().expect("state").entries.len(), 2);
     assert!(
-        state.email_state().is_some(),
+        state.cursor().is_some(),
         "the first pass did not open an incremental era, so every later pass re-reads the mailbox"
     );
 }
@@ -518,7 +518,7 @@ fn the_bytes_stored_are_the_ones_the_server_served() {
     // an invalid DKIM signature, and nothing notices until it is forwarded.
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({ "$seen": true }))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
 
     sync(&server, &mut store, &mut state);
 
@@ -541,7 +541,7 @@ fn keywords_arrive_as_flags() {
         json!({ "$seen": true, "$flagged": true }),
     )]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
 
     sync(&server, &mut store, &mut state);
 
@@ -563,7 +563,7 @@ fn a_quiet_pass_costs_one_request_and_no_downloads() {
         Email::new("M2", RAW_TWO, json!({})),
     ]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     server.forget_calls();
@@ -583,7 +583,7 @@ fn a_quiet_pass_costs_one_request_and_no_downloads() {
 fn a_new_message_arrives_incrementally() {
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     server.add(Email::new("M3", RAW_THREE, json!({})));
@@ -604,7 +604,7 @@ fn a_flag_changed_on_the_server_costs_no_download() {
     // re-fetch it.
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({ "$seen": true }))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     server.set_keywords("M1", json!({ "$seen": true, "$flagged": true }));
@@ -630,7 +630,7 @@ fn a_message_moved_to_another_mailbox_leaves_this_one() {
         Email::new("M2", RAW_TWO, json!({})),
     ]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     server.move_out("M1");
@@ -648,7 +648,7 @@ fn a_deleted_message_is_removed_incrementally() {
         Email::new("M2", RAW_TWO, json!({})),
     ]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     server.destroy("M2");
@@ -665,7 +665,7 @@ fn a_server_that_cannot_report_changes_falls_back_to_a_full_read() {
     // the client has to be able to start again from the mailbox as it is.
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     server.add(Email::new("M3", RAW_THREE, json!({})));
@@ -682,7 +682,7 @@ fn a_server_that_cannot_report_changes_falls_back_to_a_full_read() {
     assert_eq!(outcome.fetched, 1, "the message added while offline never arrived");
     assert_eq!(store.state().expect("state").entries.len(), 2);
     assert!(
-        state.email_state().is_some(),
+        state.cursor().is_some(),
         "the fallback did not re-open an incremental era"
     );
 }
@@ -693,11 +693,11 @@ fn the_incremental_era_survives_a_reopen() {
     // second pass.
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
     state.save(dir.path()).expect("save");
 
-    let mut reloaded = JmapState::load(dir.path());
+    let mut reloaded = jmap::state(dir.path());
     server.forget_calls();
     sync(&server, &mut store, &mut reloaded);
 
@@ -713,13 +713,13 @@ fn an_empty_listing_does_not_empty_the_maildir_on_a_full_read() {
     // having a moment must not cost the user their mailbox.
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     // Drop the message without recording it, so a full read sees an empty
     // mailbox with no explanation — which is what a broken server looks like.
     server.inner.lock().expect("state").emails.clear();
-    state.reset_era();
+    state.reset_cursor();
 
     let outcome = sync(&server, &mut store, &mut state);
 
@@ -738,7 +738,7 @@ fn a_local_flag_change_reaches_the_server_before_the_pull_can_undo_it() {
 
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     let uid = state.uid_of("M1").expect("a local uid");
@@ -776,7 +776,7 @@ fn a_local_move_leaves_the_mailbox_and_forgets_the_id() {
         Email::new("M2", RAW_TWO, json!({})),
     ]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     let uid = state.uid_of("M1").expect("a local uid");
@@ -811,7 +811,7 @@ fn a_queued_operation_for_an_unknown_message_asks_for_a_resync() {
 
     let server = serve(vec![Email::new("M1", RAW_ONE, json!({}))]);
     let (dir, mut store) = maildir();
-    let mut state = JmapState::load(dir.path());
+    let mut state = jmap::state(dir.path());
     sync(&server, &mut store, &mut state);
 
     store

@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
@@ -789,99 +789,20 @@ fn parse_email(item: &Value) -> Option<JmapEmail> {
     })
 }
 
-/// What JMAP has to remember between passes.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct JmapState {
-    /// Server email id → the local UID it was assigned.
-    #[serde(default)]
-    seen: BTreeMap<String, u32>,
-    #[serde(default = "one")]
-    next_uid: u32,
-    /// The account `Email` state this mailbox has been brought up to.
-    ///
-    /// Absent means no incremental era has been opened yet, and the next pass
-    /// is a full one. Present means the next pass can ask the server what
-    /// changed rather than re-reading the mailbox — the difference between a
-    /// round trip proportional to the mailbox and one proportional to the news.
-    ///
-    /// Account-wide even though it is stored per mailbox, because that is what
-    /// `Email/changes` is scoped to. Each mailbox independently tracks the
-    /// state it has applied, which costs one extra `Email/changes` per mailbox
-    /// and keeps every mailbox recoverable on its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    email_state: Option<String>,
-}
+/// What JMAP has to remember between passes: the id map and the `Email` state.
+///
+/// The shape is shared with the Gmail and Graph engines — see
+/// [`crate::store::RemoteIds`], which is also where the reasoning about an
+/// expired cursor lives.
+pub type JmapState = crate::store::RemoteIds;
 
-fn one() -> u32 {
-    1
-}
+/// The sidecar JMAP keeps beside a maildir.
+pub const STATE_FILE: &str = ".jmap-state.json";
 
-const STATE_FILE: &str = ".jmap-state.json";
-
-impl JmapState {
-    /// Reads the sidecar beside a maildir, or starts empty.
-    pub fn load(maildir: &Path) -> Self {
-        match std::fs::read_to_string(maildir.join(STATE_FILE)) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|why| {
-                tracing::warn!(
-                    path = %maildir.display(), %why,
-                    "unreadable JMAP sidecar; treating the mailbox as new"
-                );
-                Self::default()
-            }),
-            Err(_) => Self::default(),
-        }
-    }
-
-    /// Writes the sidecar atomically — a torn one costs a full re-download.
-    pub fn save(&self, maildir: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|why| Error::Jmap(format!("serialising JMAP state: {why}")))?;
-        cosmic_pim_core::atomic::write(&maildir.join(STATE_FILE), &json, None)
-            .map(|_| ())
-            .map_err(|why| Error::Jmap(format!("writing JMAP state: {why}")))
-    }
-
-    /// The local UID for a server id, if it has one.
-    #[must_use]
-    pub fn uid_of(&self, id: &str) -> Option<u32> {
-        self.seen.get(id).copied()
-    }
-
-    /// The server id behind a local UID.
-    #[must_use]
-    pub fn id_of(&self, uid: u32) -> Option<&str> {
-        self.seen
-            .iter()
-            .find(|(_, value)| **value == uid)
-            .map(|(id, _)| id.as_str())
-    }
-
-    fn uid_for(&mut self, id: &str) -> u32 {
-        if let Some(uid) = self.seen.get(id) {
-            return *uid;
-        }
-        let uid = self.next_uid;
-        self.next_uid = self.next_uid.saturating_add(1);
-        self.seen.insert(id.to_owned(), uid);
-        uid
-    }
-
-    fn forget(&mut self, id: &str) {
-        self.seen.remove(id);
-    }
-
-    /// The state this mailbox has been brought up to, if any.
-    #[must_use]
-    pub fn email_state(&self) -> Option<&str> {
-        self.email_state.as_deref()
-    }
-
-    /// Discards the incremental era, so the next pass reads the mailbox in
-    /// full. What a `cannotCalculateChanges` answer amounts to.
-    pub fn reset_era(&mut self) {
-        self.email_state = None;
-    }
+/// Reads this mailbox's JMAP state, or starts empty.
+#[must_use]
+pub fn state(maildir: &Path) -> JmapState {
+    JmapState::load(maildir, STATE_FILE)
 }
 
 /// What one JMAP pass did.
@@ -937,12 +858,12 @@ fn sync_after_push(
     state: &mut JmapState,
     limit: usize,
 ) -> Result<JmapOutcome> {
-    if let Some(since) = state.email_state().map(ToOwned::to_owned) {
+    if let Some(since) = state.cursor().map(ToOwned::to_owned) {
         match sync_incremental(session, mailbox_id, store, state, &since)? {
             Some(outcome) => return Ok(outcome),
             // The server's history does not reach back to our state. Fall
             // through and read the mailbox as it is now.
-            None => state.reset_era(),
+            None => state.reset_cursor(),
         }
     }
 
@@ -1029,7 +950,7 @@ fn sync_incremental(
         // Only after everything in this window is applied. Advancing first and
         // failing second would skip the window permanently — the same rule the
         // IMAP MODSEQ cursor and the CalDAV ctag follow.
-        state.email_state = Some(changes.new_state.clone());
+        state.set_cursor(changes.new_state.clone());
         cursor = changes.new_state;
 
         if !changes.has_more {
@@ -1039,7 +960,7 @@ fn sync_incremental(
 
     store.commit_cursor(Cursor {
         uid_validity: JMAP_UID_VALIDITY,
-        last_uid: state.next_uid.saturating_sub(1),
+        last_uid: state.highest_uid(),
         ..Default::default()
     })?;
 
@@ -1131,11 +1052,11 @@ fn sync_full(
         );
     }
 
-    state.email_state = Some(opened_at);
+    state.set_cursor(opened_at);
 
     store.commit_cursor(Cursor {
         uid_validity: JMAP_UID_VALIDITY,
-        last_uid: state.next_uid.saturating_sub(1),
+        last_uid: state.highest_uid(),
         ..Default::default()
     })?;
 
@@ -1199,28 +1120,26 @@ mod tests {
     }
 
     #[test]
-    fn resetting_the_era_forces_the_next_pass_to_read_in_full() {
-        let mut state = JmapState {
-            email_state: Some("42".into()),
-            ..Default::default()
-        };
-        assert_eq!(state.email_state(), Some("42"));
+    fn resetting_the_cursor_forces_the_next_pass_to_read_in_full() {
+        let mut held = state(std::path::Path::new("/nonexistent"));
+        held.set_cursor("42");
+        assert_eq!(held.cursor(), Some("42"));
 
-        state.reset_era();
+        held.reset_cursor();
 
-        assert_eq!(state.email_state(), None);
+        assert_eq!(held.cursor(), None);
     }
 
     #[test]
-    fn the_era_survives_a_round_trip_through_the_sidecar() {
+    fn the_cursor_survives_a_round_trip_through_the_sidecar() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = JmapState::default();
-        state.uid_for("M1");
-        state.email_state = Some("state-7".into());
-        state.save(dir.path()).unwrap();
+        let mut held = state(dir.path());
+        held.uid_for("M1");
+        held.set_cursor("state-7");
+        held.save(dir.path()).unwrap();
 
         assert_eq!(
-            JmapState::load(dir.path()).email_state(),
+            state(dir.path()).cursor(),
             Some("state-7"),
             "a restart would re-read every mailbox in full"
         );
@@ -1296,21 +1215,21 @@ mod tests {
 
     #[test]
     fn a_local_uid_is_assigned_once_per_server_id() {
-        let mut state = JmapState::default();
-        let first = state.uid_for("M1");
+        let mut held = state(std::path::Path::new("/nonexistent"));
+        let first = held.uid_for("M1");
 
-        assert_eq!(state.uid_for("M1"), first);
-        assert_ne!(state.uid_for("M2"), first);
-        assert_eq!(state.id_of(first), Some("M1"));
+        assert_eq!(held.uid_for("M1"), first);
+        assert_ne!(held.uid_for("M2"), first);
+        assert_eq!(held.id_of(first), Some("M1"));
     }
 
     #[test]
     fn the_sidecar_survives_a_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = JmapState::default();
-        let uid = state.uid_for("M1");
-        state.save(dir.path()).unwrap();
+        let mut held = state(dir.path());
+        let uid = held.uid_for("M1");
+        held.save(dir.path()).unwrap();
 
-        assert_eq!(JmapState::load(dir.path()).uid_of("M1"), Some(uid));
+        assert_eq!(state(dir.path()).uid_of("M1"), Some(uid));
     }
 }

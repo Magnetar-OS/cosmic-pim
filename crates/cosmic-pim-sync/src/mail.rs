@@ -229,7 +229,7 @@ fn sync_over_jmap(
         let outcome = (|| {
             let path = mailbox_path(mail_root, &account.id, &folder);
             let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
-            let mut state = jmap::JmapState::load(&path);
+            let mut state = jmap::state(&path);
             let outcome = jmap::sync_mailbox(
                 &session,
                 &mailbox.id,
