@@ -169,6 +169,20 @@ pub struct Contact {
     pub categories: Vec<String>,
     /// `REV` — the contact's own last-modified stamp.
     pub rev: Option<DateTime<Utc>>,
+    /// Whether this card is a group (vCard 4.0 `KIND:group`, or Apple's
+    /// `X-ADDRESSBOOKSERVER-KIND:group` on 3.0 cards).
+    ///
+    /// A group card is not a person: address-book UIs list it among groups,
+    /// not contacts, and its `MEMBER` URIs point at the cards it contains.
+    pub is_group: bool,
+    /// `MEMBER` / `X-ADDRESSBOOKSERVER-MEMBER` values, **verbatim**.
+    ///
+    /// Kept as the URIs the card carries (`urn:uuid:…`, occasionally
+    /// `mailto:…`) rather than parsed down to UIDs, because writing back
+    /// anything but the original bytes for an untouched member would be the
+    /// same silent-rewrite bug the patcher exists to prevent. Use
+    /// [`member_uid`](crate::vcard::member_uid) to compare against a UID.
+    pub members: Vec<String>,
     /// Whether the source carried a `PHOTO`.
     ///
     /// The bytes are not loaded: a photo can be hundreds of kilobytes and an
@@ -206,6 +220,8 @@ impl Contact {
             urls: Vec::new(),
             categories: Vec::new(),
             rev: None,
+            is_group: false,
+            members: Vec::new(),
             has_photo: false,
             raw: String::new(),
             file_name: format!("{}.vcf", uuid::Uuid::new_v4()),

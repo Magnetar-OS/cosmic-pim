@@ -20,7 +20,7 @@
 
 use calcard::Parser;
 use calcard::vcard::{
-    VCard, VCardEntry, VCardParameterName, VCardProperty, VCardValue, VCardVersion,
+    VCard, VCardEntry, VCardKind, VCardParameterName, VCardProperty, VCardValue, VCardVersion,
 };
 use chrono::NaiveDate;
 
@@ -70,6 +70,8 @@ fn convert(card: &VCard, raw: &str, addressbook_id: &str, file_name: &str) -> Co
         birthday: birthday(card),
         urls: typed_list(card, &VCardProperty::Url),
         categories: list_of(card, &VCardProperty::Categories),
+        is_group: is_group(card),
+        members: members(card),
         rev: card
             .property(&VCardProperty::Rev)
             .and_then(|e| e.values.first())
@@ -261,6 +263,149 @@ fn birthday(card: &VCard) -> Option<NaiveDate> {
     )
 }
 
+/// Whether a card is a group, in either spelling.
+///
+/// vCard 4.0 says `KIND:group` (RFC 6350 §6.1.4). Apple — and therefore most
+/// CardDAV servers holding cards Apple clients wrote — says
+/// `X-ADDRESSBOOKSERVER-KIND:group` on 3.0 cards, where KIND does not exist.
+/// Both mean the same thing, and a client that reads only one of them shows
+/// half the user's groups.
+fn is_group(card: &VCard) -> bool {
+    if let Some(entry) = card.property(&VCardProperty::Kind)
+        && entry
+            .values
+            .iter()
+            .any(|v| matches!(v, VCardValue::Kind(VCardKind::Group)))
+    {
+        return true;
+    }
+    card.property(&VCardProperty::Other("X-ADDRESSBOOKSERVER-KIND".to_owned()))
+        .and_then(|e| e.values.first())
+        .and_then(VCardValue::as_text)
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("group"))
+}
+
+/// A group card's member URIs, verbatim, in either spelling.
+fn members(card: &VCard) -> Vec<String> {
+    let mut out: Vec<String> = card
+        .properties(&VCardProperty::Member)
+        .filter_map(|e| e.values.first())
+        .filter_map(VCardValue::as_text)
+        .map(|s| s.trim().to_owned())
+        .collect();
+    out.extend(
+        card.properties(&VCardProperty::Other(
+            "X-ADDRESSBOOKSERVER-MEMBER".to_owned(),
+        ))
+        .filter_map(|e| e.values.first())
+        .filter_map(VCardValue::as_text)
+        .map(|s| s.trim().to_owned()),
+    );
+    out
+}
+
+/// The UID a member URI names: `urn:uuid:abc` → `abc`, a bare value stays
+/// itself. `mailto:` members name an address rather than a card and yield
+/// `None` — matching them to a contact is an application decision.
+#[must_use]
+pub fn member_uid(uri: &str) -> Option<&str> {
+    let trimmed = uri.trim();
+    if let Some(uid) = trimmed
+        .strip_prefix("urn:uuid:")
+        .or_else(|| trimmed.strip_prefix("URN:UUID:"))
+    {
+        return Some(uid);
+    }
+    if trimmed.contains(':') {
+        // Some other URI scheme — not a card reference we can resolve.
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// The member URI for a contact's UID, in the form servers write.
+#[must_use]
+pub fn member_uri(uid: &str) -> String {
+    format!("urn:uuid:{uid}")
+}
+
+/// Rewrites a group card's member list, leaving every other byte alone.
+///
+/// Existing member lines are replaced wholesale by `members` (verbatim URIs —
+/// pass through what was parsed, plus [`member_uri`] forms for additions), in
+/// **the spelling the card already uses**: a card carrying
+/// `X-ADDRESSBOOKSERVER-MEMBER` keeps that spelling, a 4.0 card gets `MEMBER`.
+/// Writing RFC 6350 `MEMBER` into an Apple-style 3.0 group is the data-loss
+/// site 03 warns about — Apple clients ignore it and the membership diverges.
+///
+/// Returns `None` if `raw` contains no VCARD.
+#[must_use]
+pub fn set_members(raw: &str, members: &[String]) -> Option<String> {
+    use crate::patch::{Edit, patch_component};
+    use std::collections::BTreeMap;
+
+    // The card's own spelling wins; only a card with no member lines at all
+    // falls back to its version's native form.
+    let apple_spelling = raw
+        .to_ascii_uppercase()
+        .contains("X-ADDRESSBOOKSERVER-MEMBER")
+        || (!raw.to_ascii_uppercase().contains("\nMEMBER")
+            && declared_version(raw) == WriteVersion::V3);
+
+    let property = if apple_spelling {
+        "X-ADDRESSBOOKSERVER-MEMBER"
+    } else {
+        "MEMBER"
+    };
+
+    let mut edits: BTreeMap<String, Edit> = BTreeMap::new();
+    let lines: Vec<String> = members
+        .iter()
+        .map(|uri| format!("{property}:{uri}"))
+        .collect();
+    edits.insert(property.to_owned(), Edit::set(lines));
+    // Clear the other spelling too, or a rename from one client and a member
+    // change from another leaves both lists on the card, disagreeing.
+    let other = if apple_spelling {
+        "MEMBER"
+    } else {
+        "X-ADDRESSBOOKSERVER-MEMBER"
+    };
+    edits.insert(other.to_owned(), Edit::remove());
+
+    patch_component(raw, "VCARD", &edits)
+}
+
+/// Serialises a brand-new group card.
+///
+/// 4.0 gets `KIND:group`; 3.0 gets `X-ADDRESSBOOKSERVER-KIND:group`, the
+/// spelling Apple defined and 3.0-first servers expect — RFC 2426 has no KIND.
+#[must_use]
+pub fn group_vcard(name: &str, uid: &str, version: WriteVersion) -> String {
+    let mut out = String::new();
+    fold_line("BEGIN:VCARD", &mut out);
+    match version {
+        WriteVersion::V3 => {
+            fold_line("VERSION:3.0", &mut out);
+            fold_line("X-ADDRESSBOOKSERVER-KIND:group", &mut out);
+        }
+        WriteVersion::V4 => {
+            fold_line("VERSION:4.0", &mut out);
+            fold_line("KIND:group", &mut out);
+        }
+    }
+    fold_line(&format!("UID:{}", escape_text(uid)), &mut out);
+    fold_line(&format!("FN:{}", escape_text(name)), &mut out);
+    // Apple's own group cards carry N as well; harmless on 4.0.
+    fold_line(&format!("N:{};;;;", escape_text(name)), &mut out);
+    fold_line(
+        &format!("REV:{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ")),
+        &mut out,
+    );
+    fold_line("END:VCARD", &mut out);
+    out
+}
+
 /// Splits a document into one verbatim text segment per card.
 ///
 /// [`parse_vcards`] hands every contact the *whole* file as its `raw`, which is
@@ -370,7 +515,10 @@ fn looks_like_uri(s: &str) -> bool {
     };
     let scheme = &s[..colon];
     !scheme.is_empty()
-        && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
         && scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
@@ -514,7 +662,10 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         "EMAIL".to_owned(),
         split_typed("EMAIL", &contact.emails, version),
     );
-    edits.insert("TEL".to_owned(), split_typed("TEL", &contact.phones, version));
+    edits.insert(
+        "TEL".to_owned(),
+        split_typed("TEL", &contact.phones, version),
+    );
     edits.insert("URL".to_owned(), split_typed("URL", &contact.urls, version));
     set(
         &mut edits,
@@ -1164,7 +1315,10 @@ PHOTO:https://example.com/ada.jpeg\r\nEND:VCARD\r\n";
 PHOTO:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\r\nEND:VCARD\r\n";
         match photo(raw) {
             Some(Photo::Bytes { data, content_type }) => {
-                assert!(data.starts_with(&[0x89, b'P', b'N', b'G']), "not decoded to PNG bytes");
+                assert!(
+                    data.starts_with(&[0x89, b'P', b'N', b'G']),
+                    "not decoded to PNG bytes"
+                );
                 assert_eq!(content_type.as_deref(), Some("image/png"));
             }
             other => panic!("expected decoded bytes, got {other:?}"),
@@ -1225,7 +1379,10 @@ mod version_tests {
         let v3 = to_vcard_versioned(&ada(), WriteVersion::V3);
         assert!(v3.contains("VERSION:3.0"), "{v3}");
         assert!(v3.contains("EMAIL;TYPE=work,pref:ada@example.com"), "{v3}");
-        assert!(!v3.contains("PREF=1"), "a 3.0 card carries no PREF parameter: {v3}");
+        assert!(
+            !v3.contains("PREF=1"),
+            "a 3.0 card carries no PREF parameter: {v3}"
+        );
         assert!(v3.contains("BDAY:1815-12-10"), "{v3}");
 
         let v4 = to_vcard_versioned(&ada(), WriteVersion::V4);
@@ -1266,7 +1423,10 @@ EMAIL;TYPE=work:old@example.com\r\nEND:VCARD\r\n";
 
         let patched = patch_vcard(original, &contact).unwrap();
         assert!(patched.contains("VERSION:3.0"), "{patched}");
-        assert!(!patched.contains("PREF="), "4.0 syntax in a 3.0 card: {patched}");
+        assert!(
+            !patched.contains("PREF="),
+            "4.0 syntax in a 3.0 card: {patched}"
+        );
         assert!(patched.contains("TYPE=work,pref"), "{patched}");
     }
 
@@ -1280,7 +1440,10 @@ EMAIL;TYPE=work:old@example.com\r\nEND:VCARD\r\n";
             declared_version("BEGIN:VCARD\r\nVERSION:3.0\r\nEND:VCARD\r\n"),
             WriteVersion::V3
         );
-        assert_eq!(declared_version("BEGIN:VCARD\r\nEND:VCARD\r\n"), WriteVersion::V3);
+        assert_eq!(
+            declared_version("BEGIN:VCARD\r\nEND:VCARD\r\n"),
+            WriteVersion::V3
+        );
     }
 }
 
@@ -1332,5 +1495,115 @@ PHOTO;ENCODING=b;TYPE=JPEG:OLDOLD==\r\nEND:VCARD\r\n";
     fn garbage_yields_none() {
         assert!(set_photo("", &[1], "image/png").is_none());
         assert!(remove_photo("no card here").is_none());
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    const APPLE_GROUP: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:g1\r\n\
+N:Friends;;;;\r\nFN:Friends\r\nX-ADDRESSBOOKSERVER-KIND:group\r\n\
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server\r\n\
+X-CUSTOM:keep-me\r\nEND:VCARD\r\n";
+
+    const V4_GROUP: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:g2\r\nFN:Work\r\n\
+KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
+
+    #[test]
+    fn both_group_spellings_parse_as_groups_with_their_members() {
+        let apple = parse_vcards(APPLE_GROUP, "d", "g.vcf").remove(0);
+        assert!(apple.is_group);
+        assert_eq!(apple.members, vec!["urn:uuid:ada@server"]);
+
+        let v4 = parse_vcards(V4_GROUP, "d", "g.vcf").remove(0);
+        assert!(v4.is_group);
+        assert_eq!(v4.members, vec!["urn:uuid:bob@server"]);
+
+        let person = parse_vcards(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:p\r\nFN:Ada\r\nEND:VCARD\r\n",
+            "d",
+            "p.vcf",
+        )
+        .remove(0);
+        assert!(!person.is_group);
+    }
+
+    #[test]
+    fn member_uris_resolve_to_uids_where_they_can() {
+        assert_eq!(member_uid("urn:uuid:abc@x"), Some("abc@x"));
+        assert_eq!(member_uid("URN:UUID:ABC"), Some("ABC"));
+        assert_eq!(member_uid("bare-uid"), Some("bare-uid"));
+        assert_eq!(member_uid("mailto:a@b"), None, "an address is not a card");
+        assert_eq!(member_uri("abc"), "urn:uuid:abc");
+    }
+
+    /// The data-loss site: an Apple-style group must keep the Apple spelling,
+    /// or Apple clients stop seeing the membership.
+    #[test]
+    fn membership_edits_keep_the_cards_own_spelling() {
+        let more = vec![
+            "urn:uuid:ada@server".to_owned(),
+            "urn:uuid:new@server".to_owned(),
+        ];
+        let apple = set_members(APPLE_GROUP, &more).unwrap();
+        assert_eq!(apple.matches("X-ADDRESSBOOKSERVER-MEMBER:").count(), 2, "{apple}");
+        assert!(!apple.contains("\nMEMBER:"), "RFC spelling in an Apple group: {apple}");
+        assert!(apple.contains("X-CUSTOM:keep-me"), "{apple}");
+        assert!(apple.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{apple}");
+
+        let v4 = set_members(V4_GROUP, &more).unwrap();
+        assert_eq!(v4.matches("\nMEMBER:").count(), 2, "{v4}");
+        assert!(!v4.contains("X-ADDRESSBOOKSERVER"), "{v4}");
+    }
+
+    #[test]
+    fn removing_the_last_member_leaves_a_valid_empty_group() {
+        let emptied = set_members(V4_GROUP, &[]).unwrap();
+        assert!(!emptied.contains("MEMBER"), "{emptied}");
+        assert!(emptied.contains("KIND:group"), "{emptied}");
+        let back = parse_vcards(&emptied, "d", "g.vcf").remove(0);
+        assert!(back.is_group);
+        assert!(back.members.is_empty());
+    }
+
+    #[test]
+    fn a_new_group_speaks_its_versions_dialect_and_round_trips() {
+        let v3 = group_vcard("Friends", "g-new", WriteVersion::V3);
+        assert!(v3.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{v3}");
+        assert!(!v3.contains("KIND:group\r\n") || !v3.contains("VERSION:3.0") || v3.contains("X-ADDRESSBOOKSERVER"), "{v3}");
+        let back = parse_vcards(&v3, "d", "g.vcf").remove(0);
+        assert!(back.is_group, "the 3.0 spelling did not parse back");
+        assert_eq!(back.label(), "Friends");
+
+        let v4 = group_vcard("Work", "g2-new", WriteVersion::V4);
+        assert!(v4.contains("KIND:group"), "{v4}");
+        assert!(parse_vcards(&v4, "d", "g.vcf").remove(0).is_group);
+    }
+
+    /// A member added to a fresh 3.0 group gets the Apple spelling — the group
+    /// was created for a 3.0-first server, so its members must be visible to
+    /// the clients that server serves.
+    #[test]
+    fn a_fresh_v3_group_gains_members_in_the_apple_spelling() {
+        let card = group_vcard("Friends", "g", WriteVersion::V3);
+        let with = set_members(&card, &[member_uri("ada@server")]).unwrap();
+        assert!(with.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"), "{with}");
+        let back = parse_vcards(&with, "d", "g.vcf").remove(0);
+        assert_eq!(back.members, vec!["urn:uuid:ada@server"]);
+    }
+
+    /// Editing a group's name through the ordinary contact save must not
+    /// touch its kind or members — they are unmodelled on purpose.
+    #[test]
+    fn renaming_a_group_through_patch_vcard_keeps_kind_and_members() {
+        let mut group = parse_vcards(APPLE_GROUP, "d", "g.vcf").remove(0);
+        group.display_name = "Best Friends".into();
+        group.name.family = "Best Friends".into();
+
+        let patched = patch_vcard(APPLE_GROUP, &group).unwrap();
+        assert!(patched.contains("FN:Best Friends"), "{patched}");
+        assert!(patched.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{patched}");
+        assert!(patched.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"), "{patched}");
     }
 }

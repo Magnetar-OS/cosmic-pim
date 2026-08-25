@@ -13,7 +13,7 @@ pub mod index;
 pub mod vdir;
 pub mod watcher;
 
-use crate::model::{CalendarMeta, Event, Occurrence, Rgb, Todo, expand, local_timezone};
+use crate::model::{CalendarMeta, Event, Occurrence, Rgb, Todo, expand_merged, local_timezone};
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use std::collections::HashSet;
@@ -44,6 +44,9 @@ pub enum StoreError {
 
     #[error("no calendar named “{0}”")]
     UnknownCalendar(String),
+
+    #[error("no contact with UID “{0}”")]
+    UnknownContact(String),
 
     #[error("no calendars available")]
     NoCalendars,
@@ -226,10 +229,11 @@ impl Store {
         let from_utc = self.day_start_utc(from);
         let to_utc = self.day_start_utc(to);
 
-        let mut out = Vec::new();
-        for event in self.index.candidates(&visible, from_utc, to_utc)? {
-            out.extend(expand(&event, from_utc, to_utc, self.local));
-        }
+        // Expanded as one set rather than event-by-event: a RECURRENCE-ID
+        // override and its master are separate components, and suppressing the
+        // replaced instance requires seeing both.
+        let candidates = self.index.candidates(&visible, from_utc, to_utc)?;
+        let mut out = expand_merged(&candidates, from_utc, to_utc, self.local);
 
         out.sort_by_key(Occurrence::sort_key);
         Ok(out)
@@ -292,7 +296,39 @@ impl Store {
         Ok(())
     }
 
+    /// The component behind one occurrence: the override for that instance if
+    /// one exists, otherwise the series master (or the one-off event itself).
+    ///
+    /// `instant` is [`Occurrence::recurrence_id`] — `None` for a one-off,
+    /// the instance's UTC instant for a series member. This is what an editor
+    /// must open when the user clicks an occurrence: opening the master when
+    /// an override exists would show, and then rewrite, the wrong component.
+    pub fn event_instance(
+        &self,
+        calendar_id: &str,
+        uid: &str,
+        instant: Option<DateTime<Utc>>,
+    ) -> Result<Option<Event>, StoreError> {
+        let components = self.index.events_with_uid(calendar_id, uid)?;
+
+        if let Some(instant) = instant
+            && let Some(hit) = components.iter().find(|e| {
+                e.recurrence_id.is_some_and(|rid| {
+                    crate::model::recur::instant_of(rid, self.local) == Some(instant)
+                })
+            })
+        {
+            return Ok(Some(hit.clone()));
+        }
+
+        Ok(components.into_iter().find(|e| e.recurrence_id.is_none()))
+    }
+
     /// Deletes an event and re-indexes its calendar.
+    ///
+    /// For a series this removes the whole file — master and overrides
+    /// together, which is what deleting the series means. Removing a single
+    /// override goes through [`Self::delete_override`].
     pub fn delete(&mut self, calendar_id: &str, uid: &str) -> Result<(), StoreError> {
         let meta = self
             .calendar(calendar_id)
@@ -301,6 +337,134 @@ impl Store {
 
         if let Some(event) = self.index.event(calendar_id, uid)? {
             vdir::delete_event(&meta, &event.file_name)?;
+        }
+        self.index.sync_calendar(&meta)?;
+        Ok(())
+    }
+
+    /// Deletes one instance of a series: an `EXDATE` on the master, plus the
+    /// removal of any override component that had modified the same instance.
+    ///
+    /// This is "delete this event" on a repeating event. It differs from
+    /// [`Self::delete_override`], which un-modifies an instance so the
+    /// master's generated copy comes back.
+    pub fn exclude_occurrence(
+        &mut self,
+        calendar_id: &str,
+        uid: &str,
+        instant: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let Some(mut master) = self.index.event(calendar_id, uid)? else {
+            // Deleting an instance of something already gone is not an error a
+            // user can act on.
+            tracing::warn!(uid, "no master to exclude an occurrence from");
+            return Ok(());
+        };
+
+        let naive = crate::model::naive_in_series_zone(master.start, instant, self.local);
+        if !master.exdates.contains(&naive) {
+            master.exdates.push(naive);
+        }
+        master.sequence = master.sequence.saturating_add(1);
+        master.last_modified = Some(Utc::now());
+        self.save(&master)?;
+
+        // If the instance had been overridden, the override describes an
+        // instance that no longer exists.
+        let stale: Option<Event> = self
+            .index
+            .events_with_uid(calendar_id, uid)?
+            .into_iter()
+            .find(|e| {
+                e.recurrence_id
+                    .is_some_and(|rid| crate::model::instant_of(rid, self.local) == Some(instant))
+            });
+        if let Some(over) = stale {
+            self.delete_override(&over)?;
+        }
+        Ok(())
+    }
+
+    /// Ends a series before the instance at `instant` — "delete this and all
+    /// following". Overrides and exclusions at or past the cut are removed
+    /// with it; they describe instances that no longer exist.
+    ///
+    /// Returns `true` when the cut lands on or before the first instance, in
+    /// which case nothing of the series would remain and the whole event is
+    /// deleted instead.
+    pub fn truncate_series(
+        &mut self,
+        calendar_id: &str,
+        uid: &str,
+        instant: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let Some(mut master) = self.index.event(calendar_id, uid)? else {
+            tracing::warn!(uid, "no master to truncate");
+            return Ok(false);
+        };
+
+        if instant <= master.start.to_utc(self.local) {
+            self.delete(calendar_id, uid)?;
+            return Ok(true);
+        }
+
+        if let Some(rule) = master.rrule.as_deref() {
+            let until = crate::model::until_before(master.start, instant, self.local);
+            master.rrule = Some(crate::model::truncate_rule(rule, &until));
+        }
+
+        let cut = crate::model::naive_in_series_zone(master.start, instant, self.local);
+        master.exdates.retain(|exdate| *exdate < cut);
+        master.sequence = master.sequence.saturating_add(1);
+        master.last_modified = Some(Utc::now());
+        self.save(&master)?;
+
+        let stale: Vec<Event> = self
+            .index
+            .events_with_uid(calendar_id, uid)?
+            .into_iter()
+            .filter(|e| {
+                e.recurrence_id
+                    .and_then(|rid| crate::model::instant_of(rid, self.local))
+                    .is_some_and(|rid| rid >= instant)
+            })
+            .collect();
+        for over in stale {
+            self.delete_override(&over)?;
+        }
+        Ok(false)
+    }
+
+    /// Removes one override component, restoring the master's generated
+    /// instance for that slot.
+    ///
+    /// Deliberately *not* "delete this occurrence": that is an EXDATE on the
+    /// master, a different operation. This one undoes the override, so the
+    /// series shows the instance the master generates again.
+    pub fn delete_override(&mut self, event: &Event) -> Result<(), StoreError> {
+        if event.recurrence_id.is_none() {
+            return self.delete(&event.calendar_id, &event.uid);
+        }
+
+        let meta = self
+            .calendar(&event.calendar_id)
+            .ok_or_else(|| StoreError::UnknownCalendar(event.calendar_id.clone()))?
+            .clone();
+
+        let path = meta.path.join(&event.file_name);
+        let text = std::fs::read_to_string(&path)?;
+        match vdir::remove_vevent(
+            &text,
+            &event.calendar_id,
+            &event.file_name,
+            event.recurrence_id,
+        ) {
+            Some(rest) => {
+                crate::atomic::write(&path, &rest, None)?;
+            }
+            // The override was the only component left; an empty calendar
+            // document is not worth keeping.
+            None => vdir::delete_event(&meta, &event.file_name)?,
         }
         self.index.sync_calendar(&meta)?;
         Ok(())
@@ -466,6 +630,89 @@ mod tests {
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// The store-level round trip of a series with one overridden instance:
+    /// what any other CalDAV client writes, read back and queried the way the
+    /// month view queries it.
+    #[test]
+    fn an_override_shows_once_and_survives_editing_the_master() {
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        // A weekly 09:00 series whose 11 Aug instance was moved to 14:00 —
+        // master and override in one file, as a foreign client would write it.
+        let mut master = Event::draft(
+            &cal.id,
+            day(2026, 8, 4).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        );
+        master.summary = "Standup".into();
+        master.rrule = Some("FREQ=WEEKLY".into());
+        store.save(&master).unwrap();
+
+        let mut over = master.clone();
+        over.rrule = None;
+        over.summary = "Standup (moved)".into();
+        over.start = EventTime::Zoned(day(2026, 8, 11).and_hms_opt(14, 0, 0).unwrap(), store.local);
+        over.end = EventTime::Zoned(day(2026, 8, 11).and_hms_opt(15, 0, 0).unwrap(), store.local);
+        over.recurrence_id = Some(EventTime::Zoned(
+            day(2026, 8, 11).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        ));
+        store.save(&over).unwrap();
+
+        let got = store
+            .occurrences(day(2026, 8, 1), day(2026, 9, 1), &HashSet::new())
+            .unwrap();
+
+        // Four Tuesdays; 11 Aug appears exactly once, at its moved time.
+        assert_eq!(got.len(), 4);
+        let eleventh: Vec<_> = got
+            .iter()
+            .filter(|o| o.start.date() == day(2026, 8, 11))
+            .collect();
+        assert_eq!(
+            eleventh.len(),
+            1,
+            "the replaced instance must not double up"
+        );
+        assert_eq!(eleventh[0].summary, "Standup (moved)");
+
+        // Clicking that occurrence must reach the override, not the master.
+        let opened = store
+            .event_instance(&cal.id, &master.uid, eleventh[0].recurrence_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.summary, "Standup (moved)");
+
+        // Editing the master must not eat the override.
+        let mut renamed = store.event(&cal.id, &master.uid).unwrap().unwrap();
+        renamed.summary = "Renamed".into();
+        store.save(&renamed).unwrap();
+
+        let after = store
+            .occurrences(day(2026, 8, 1), day(2026, 9, 1), &HashSet::new())
+            .unwrap();
+        assert_eq!(after.len(), 4);
+        assert!(after.iter().any(|o| o.summary == "Standup (moved)"));
+        assert_eq!(after.iter().filter(|o| o.summary == "Renamed").count(), 3);
+
+        // And removing the override restores the generated 09:00 instance.
+        let over = store
+            .event_instance(&cal.id, &master.uid, eleventh[0].recurrence_id)
+            .unwrap()
+            .unwrap();
+        store.delete_override(&over).unwrap();
+
+        let restored = store
+            .occurrences(day(2026, 8, 1), day(2026, 9, 1), &HashSet::new())
+            .unwrap();
+        assert_eq!(restored.len(), 4);
+        assert!(
+            restored.iter().all(|o| o.summary == "Renamed"),
+            "the generated instance should be back: {restored:?}"
+        );
     }
 
     #[test]

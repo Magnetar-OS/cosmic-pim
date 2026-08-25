@@ -182,25 +182,89 @@ impl ContactStore {
         self.books = books(&self.root);
     }
 
-    /// Every contact, sorted for display.
+    /// Every contact, sorted for display. Group cards are excluded — they are
+    /// not people, and a row named "Friends" between Franklin and Gauss reads
+    /// as a bug; [`Self::groups`] lists them.
     #[must_use]
     pub fn contacts(&self) -> Vec<Contact> {
-        let mut out: Vec<Contact> = self.books.iter().flat_map(read_book).collect();
+        let mut out: Vec<Contact> = self
+            .books
+            .iter()
+            .flat_map(read_book)
+            .filter(|c| !c.is_group)
+            .collect();
         out.sort_by_key(Contact::sort_key);
         out
     }
 
-    /// Contacts matching a search string, sorted.
+    /// Contacts matching a search string, sorted. Group cards excluded, as in
+    /// [`Self::contacts`].
     #[must_use]
     pub fn search(&self, needle: &str) -> Vec<Contact> {
         let mut out: Vec<Contact> = self
             .books
             .iter()
             .flat_map(read_book)
-            .filter(|c| c.matches(needle))
+            .filter(|c| !c.is_group && c.matches(needle))
             .collect();
         out.sort_by_key(Contact::sort_key);
         out
+    }
+
+    /// Every group card, sorted by name.
+    #[must_use]
+    pub fn groups(&self) -> Vec<Contact> {
+        let mut out: Vec<Contact> = self
+            .books
+            .iter()
+            .flat_map(read_book)
+            .filter(|c| c.is_group)
+            .collect();
+        out.sort_by_key(Contact::sort_key);
+        out
+    }
+
+    /// Creates a group card in `book_id`, returning it.
+    pub fn create_group(
+        &mut self,
+        name: &str,
+        book_id: &str,
+        version: crate::vcard::WriteVersion,
+    ) -> Result<Contact, StoreError> {
+        let meta = self
+            .book(book_id)
+            .ok_or_else(|| StoreError::UnknownCalendar(book_id.to_owned()))?
+            .clone();
+
+        let uid = format!("{}@cosmic-pim", uuid::Uuid::new_v4());
+        let card = crate::vcard::group_vcard(name, &uid, version);
+        let file_name = format!("{}.vcf", super::sanitise_file_stem(&uid));
+        write_contact_raw(&meta, &file_name, &card)?;
+
+        self.contact(book_id, &uid)
+            .ok_or_else(|| StoreError::UnknownContact(uid))
+    }
+
+    /// Rewrites a group's member list, byte-preservingly, in the card's own
+    /// member spelling — see [`crate::vcard::set_members`].
+    pub fn set_group_members(
+        &mut self,
+        book_id: &str,
+        uid: &str,
+        members: &[String],
+    ) -> Result<(), StoreError> {
+        let meta = self
+            .book(book_id)
+            .ok_or_else(|| StoreError::UnknownCalendar(book_id.to_owned()))?
+            .clone();
+
+        let Some(group) = read_book(&meta).into_iter().find(|c| c.uid == uid) else {
+            return Err(StoreError::UnknownContact(uid.to_owned()));
+        };
+        let Some(patched) = crate::vcard::set_members(&group.raw, members) else {
+            return Err(StoreError::UnknownContact(uid.to_owned()));
+        };
+        write_contact_raw(&meta, &group.file_name, &patched)
     }
 
     #[must_use]
@@ -216,11 +280,7 @@ impl ContactStore {
     /// [`Self::save`], choosing the version a **new** card serialises as.
     /// Existing cards keep their own version regardless — see
     /// [`write_contact_versioned`].
-    pub fn save_as(
-        &mut self,
-        contact: &Contact,
-        version: WriteVersion,
-    ) -> Result<(), StoreError> {
+    pub fn save_as(&mut self, contact: &Contact, version: WriteVersion) -> Result<(), StoreError> {
         let meta = self
             .book(&contact.addressbook_id)
             .ok_or_else(|| StoreError::UnknownCalendar(contact.addressbook_id.clone()))?
@@ -641,7 +701,11 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a-b\r\nFN:Dash\r\nEND:VCARD\r\n";
         assert_eq!((summary.added, summary.updated), (2, 0));
 
         let names: Vec<String> = store.contacts().iter().map(Contact::label).collect();
-        assert_eq!(store.contacts().len(), 2, "one card overwrote the other: {names:?}");
+        assert_eq!(
+            store.contacts().len(),
+            2,
+            "one card overwrote the other: {names:?}"
+        );
 
         // And a re-import still updates both rather than growing a third file.
         let again = store.import_vcf(colliding, &meta.id).unwrap();
@@ -654,5 +718,67 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a-b\r\nFN:Dash\r\nEND:VCARD\r\n";
         let (_dir, mut store, meta) = store();
         let summary = store.import_vcf("not a vcard at all", &meta.id).unwrap();
         assert_eq!(summary.total(), 0);
+    }
+}
+
+#[cfg(test)]
+mod group_store_tests {
+    use super::*;
+    use crate::model::Rgb;
+    use crate::vcard::{WriteVersion, member_uri};
+
+    fn store() -> (tempfile::TempDir, ContactStore, CalendarMeta) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ContactStore::open(&dir.path().join("contacts")).unwrap();
+        let meta = store.create_book("Personal", Rgb(1, 2, 3)).unwrap();
+        (dir, store, meta)
+    }
+
+    #[test]
+    fn a_group_is_created_listed_and_kept_out_of_the_contact_list() {
+        let (_dir, mut store, meta) = store();
+        let mut ada = Contact::draft(&meta.id);
+        ada.display_name = "Ada".into();
+        store.save(&ada).unwrap();
+
+        let group = store
+            .create_group("Friends", &meta.id, WriteVersion::V3)
+            .unwrap();
+        assert!(group.is_group);
+
+        assert_eq!(store.contacts().len(), 1, "the group leaked into the people list");
+        assert_eq!(store.groups().len(), 1);
+        assert!(store.search("Friends").is_empty(), "search returned a group as a person");
+    }
+
+    #[test]
+    fn membership_round_trips_through_the_store() {
+        let (_dir, mut store, meta) = store();
+        let mut ada = Contact::draft(&meta.id);
+        ada.display_name = "Ada".into();
+        store.save(&ada).unwrap();
+
+        let group = store
+            .create_group("Friends", &meta.id, WriteVersion::V3)
+            .unwrap();
+        store
+            .set_group_members(&meta.id, &group.uid, &[member_uri(&ada.uid)])
+            .unwrap();
+
+        let back = store.groups().remove(0);
+        assert_eq!(back.members, vec![member_uri(&ada.uid)]);
+
+        // And emptied again.
+        store.set_group_members(&meta.id, &group.uid, &[]).unwrap();
+        assert!(store.groups().remove(0).members.is_empty());
+    }
+
+    #[test]
+    fn membership_on_a_missing_group_is_a_named_error() {
+        let (_dir, mut store, meta) = store();
+        assert!(matches!(
+            store.set_group_members(&meta.id, "nope", &[]),
+            Err(StoreError::UnknownContact(_))
+        ));
     }
 }
