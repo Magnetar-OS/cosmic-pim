@@ -245,6 +245,17 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     /// `Authentication-Results`, newest hop first.
     pub auth: Vec<crate::auth::AuthHop>,
+    /// The `List-Unsubscribe` targets, in the order the sender offered them —
+    /// `mailto:` and `https:` URLs, angle brackets stripped.
+    ///
+    /// Only schemes something can safely be done with are kept. `http:` in
+    /// particular is dropped: an unsubscribe that sends the request in the
+    /// clear identifies the recipient of a mailing to anyone listening.
+    pub unsubscribe: Vec<String>,
+    /// RFC 8058: the sender supports one-click unsubscribe — an empty POST to
+    /// the `https:` target with `List-Unsubscribe=One-Click`, no page, no
+    /// confirmation maze.
+    pub one_click_unsubscribe: bool,
 }
 
 impl Message {
@@ -294,6 +305,11 @@ impl Message {
             body,
             attachments: attachments(msg),
             auth: crate::auth::from_message(msg),
+            unsubscribe: unsubscribe_targets(msg),
+            one_click_unsubscribe: msg.header_raw("List-Unsubscribe-Post").is_some_and(|text| {
+                text.to_ascii_lowercase()
+                    .contains("list-unsubscribe=one-click")
+            }),
         }
     }
 
@@ -360,6 +376,31 @@ fn header_id_list(value: &mail_parser::HeaderValue<'_>) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     })
+}
+
+/// The angle-bracketed URLs of a `List-Unsubscribe` header, kept only where
+/// something safe can be done with them.
+fn unsubscribe_targets(msg: &ParsedMessage<'_>) -> Vec<String> {
+    // The raw header, not the parsed value: mail-parser reads the
+    // angle-bracketed URLs as an address list, and a `https:` URL is not an
+    // address it can represent.
+    let Some(value) = msg.header_raw("List-Unsubscribe") else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('<') {
+        let Some(end) = rest[start..].find('>') else {
+            break;
+        };
+        let url = rest[start + 1..start + end].trim();
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("https://") || lower.starts_with("mailto:") {
+            targets.push(url.to_owned());
+        }
+        rest = &rest[start + end + 1..];
+    }
+    targets
 }
 
 fn attachments(msg: &ParsedMessage<'_>) -> Vec<Attachment> {
@@ -441,6 +482,28 @@ Body text.\r\n";
         assert!(msg.from.is_empty());
         assert_eq!(msg.subject, "");
         assert!(msg.date.is_none());
+    }
+
+    #[test]
+    fn unsubscribe_targets_are_extracted_and_unsafe_schemes_dropped() {
+        let raw = b"From: news@example.com\r\n\
+List-Unsubscribe: <mailto:leave@example.com>, <http://sniffable.example/u>, <https://example.com/u?id=42>\r\n\
+List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+Subject: Weekly\r\n\r\nbody\r\n";
+        let msg = Message::parse(raw).unwrap();
+        assert_eq!(
+            msg.unsubscribe,
+            vec!["mailto:leave@example.com", "https://example.com/u?id=42"],
+            "the cleartext http target must not survive"
+        );
+        assert!(msg.one_click_unsubscribe);
+    }
+
+    #[test]
+    fn ordinary_mail_offers_no_unsubscribe() {
+        let msg = Message::parse(SIMPLE).unwrap();
+        assert!(msg.unsubscribe.is_empty());
+        assert!(!msg.one_click_unsubscribe);
     }
 
     #[test]

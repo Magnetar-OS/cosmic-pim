@@ -98,6 +98,7 @@ pub mod smtp;
 pub mod store;
 pub mod text;
 pub mod threading;
+pub mod unsubscribe;
 
 pub use compose::Draft;
 pub use discovery::Discovered;
