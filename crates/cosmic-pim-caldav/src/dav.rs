@@ -1170,6 +1170,10 @@ pub struct CaldavClient {
     auth_header: String,
     principal_url: Option<String>,
     calendar_home_url: Option<String>,
+    /// The first `Server` response header seen, for quirks detection. A cell
+    /// rather than `&mut self` on every read path: the capture is a side
+    /// effect of requests that are otherwise immutable borrows.
+    server_header: std::cell::RefCell<Option<String>>,
 }
 
 impl CaldavClient {
@@ -1216,7 +1220,24 @@ impl CaldavClient {
             auth_header: auth.header(),
             principal_url: None,
             calendar_home_url: None,
+            server_header: std::cell::RefCell::new(None),
         }
+    }
+
+    /// The server this client turned out to be talking to.
+    ///
+    /// Best-effort, from the `Server` header captured during earlier requests
+    /// plus the base URL's host; [`crate::quirks::Server::Unknown`] before any
+    /// request has been made or when nothing identifiable was volunteered.
+    #[must_use]
+    pub fn detected_server(&self) -> crate::quirks::Server {
+        let header = self.server_header.borrow();
+        let host = self
+            .base_url
+            .split("//")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next());
+        crate::quirks::detect(header.as_deref(), host)
     }
 
     /// The same client, speaking CardDAV.
@@ -1320,6 +1341,17 @@ impl CaldavClient {
                 }
                 current = next;
                 continue;
+            }
+
+            // Captured once for quirks detection; later responses through
+            // proxies sometimes scrub it, so first-seen wins.
+            if self.server_header.borrow().is_none()
+                && let Some(server) = resp
+                    .headers()
+                    .get("server")
+                    .and_then(|value| value.to_str().ok())
+            {
+                *self.server_header.borrow_mut() = Some(server.to_owned());
             }
 
             let content_type = resp

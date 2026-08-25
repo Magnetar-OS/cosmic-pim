@@ -156,10 +156,22 @@ fn typed_list(card: &VCard, prop: &VCardProperty) -> Vec<Typed> {
                 .and_then(VCardValue::as_text)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())?;
+
+            // vCard 3.0 has no PREF parameter — it spells preference as
+            // `TYPE=PREF` (RFC 2426 §3.3). Fold that spelling into the same
+            // model field, and keep it out of `types` so the UI does not show
+            // a label reading "pref" next to a home number.
+            let mut types = types_of(entry);
+            let mut pref = pref_of(entry);
+            if let Some(index) = types.iter().position(|t| t == "pref") {
+                types.remove(index);
+                pref = pref.or(Some(1));
+            }
+
             Some(Typed {
                 value: value.to_owned(),
-                types: types_of(entry),
-                pref: pref_of(entry),
+                types,
+                pref,
                 group: entry.group.clone(),
             })
         })
@@ -364,6 +376,52 @@ fn looks_like_uri(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
+/// Replaces (or sets) a card's photo, in the card's own dialect, leaving every
+/// other byte alone.
+///
+/// - 4.0 cards get `PHOTO:data:<mime>;base64,…` (RFC 6350 §6.2.4 via RFC 2397).
+/// - 3.0 cards get `PHOTO;ENCODING=b;TYPE=<subtype>:…` (RFC 2426 §3.1.4).
+///
+/// Returns `None` if `raw` contains no VCARD.
+#[must_use]
+pub fn set_photo(raw: &str, data: &[u8], mime: &str) -> Option<String> {
+    use crate::patch::{Edit, patch_component};
+    use base64::Engine as _;
+    use std::collections::BTreeMap;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    let line = match declared_version(raw) {
+        WriteVersion::V4 => format!("PHOTO:data:{mime};base64,{encoded}"),
+        WriteVersion::V3 => {
+            // 3.0's TYPE names the image subtype, uppercased by convention:
+            // TYPE=JPEG, not TYPE=image/jpeg.
+            let subtype = mime
+                .rsplit('/')
+                .next()
+                .unwrap_or("JPEG")
+                .to_ascii_uppercase();
+            format!("PHOTO;ENCODING=b;TYPE={subtype}:{encoded}")
+        }
+    };
+
+    let mut edits = BTreeMap::new();
+    edits.insert("PHOTO".to_owned(), Edit::set(vec![line]));
+    patch_component(raw, "VCARD", &edits)
+}
+
+/// Removes a card's photo, leaving every other byte alone.
+///
+/// Returns `None` if `raw` contains no VCARD.
+#[must_use]
+pub fn remove_photo(raw: &str) -> Option<String> {
+    use crate::patch::{Edit, patch_component};
+    use std::collections::BTreeMap;
+
+    let mut edits = BTreeMap::new();
+    edits.insert("PHOTO".to_owned(), Edit::remove());
+    patch_component(raw, "VCARD", &edits)
+}
+
 /* ------------------------------------------------------------------ */
 /* Patching an existing card                                          */
 
@@ -388,6 +446,12 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
 
     let mut edits: BTreeMap<String, Edit> = BTreeMap::new();
 
+    // Rewritten lines must speak the card's own dialect: `PREF=1` written into
+    // a 3.0 card is quiet non-conformance a strict server strips, and the
+    // preference is then lost remotely. The version comes from the card, not
+    // from a caller preference — a patch never converts.
+    let version = declared_version(original);
+
     let set = |edits: &mut BTreeMap<String, Edit>, name: &str, lines: Vec<String>| {
         edits.insert(name.to_owned(), Edit::set(lines));
     };
@@ -398,12 +462,12 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     /// Without this split, an entry parsed from `item1.EMAIL` would be written
     /// back as a plain `EMAIL` line *in addition to* the untouched grouped one
     /// — the contact would gain a duplicate address on every save.
-    fn split_typed(name: &str, values: &[Typed]) -> Edit {
+    fn split_typed(name: &str, values: &[Typed], version: WriteVersion) -> Edit {
         let mut edit = Edit::set(
             values
                 .iter()
                 .filter(|v| !v.is_grouped())
-                .map(|v| typed_line(name, v))
+                .map(|v| typed_line_versioned(name, v, version))
                 .collect(),
         );
         for value in values.iter().filter(|v| v.is_grouped()) {
@@ -446,9 +510,12 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
             .map(|n| format!("NICKNAME:{}", escape_text(n)))
             .collect(),
     );
-    edits.insert("EMAIL".to_owned(), split_typed("EMAIL", &contact.emails));
-    edits.insert("TEL".to_owned(), split_typed("TEL", &contact.phones));
-    edits.insert("URL".to_owned(), split_typed("URL", &contact.urls));
+    edits.insert(
+        "EMAIL".to_owned(),
+        split_typed("EMAIL", &contact.emails, version),
+    );
+    edits.insert("TEL".to_owned(), split_typed("TEL", &contact.phones, version));
+    edits.insert("URL".to_owned(), split_typed("URL", &contact.urls, version));
     set(
         &mut edits,
         "ADR",
@@ -488,7 +555,10 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         contact
             .birthday
             .iter()
-            .map(|b| format!("BDAY:{}", b.format("%Y%m%d")))
+            .map(|b| match version {
+                WriteVersion::V3 => format!("BDAY:{}", b.format("%Y-%m-%d")),
+                WriteVersion::V4 => format!("BDAY:{}", b.format("%Y%m%d")),
+            })
             .collect(),
     );
 
@@ -544,15 +614,67 @@ fn address_line(address: &Address) -> String {
 /* ------------------------------------------------------------------ */
 /* Serialisation                                                      */
 
+/// Which vCard version [`to_vcard_versioned`] writes.
+///
+/// The suite's default for **new** cards is 3.0: Nextcloud, Radicale, and most
+/// CardDAV servers are 3.0-first, and a 4.0 card handed to a 3.0-only peer is
+/// the interop failure users actually hit. 4.0 is the explicit choice, never a
+/// silent conversion — an existing card keeps whatever version its bytes carry,
+/// because editing goes through the patcher, not through this writer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WriteVersion {
+    #[default]
+    V3,
+    V4,
+}
+
+/// The version a stored card declares, for writing patched lines in its own
+/// dialect. An absent or unrecognised `VERSION` reads as 3.0 — the permissive
+/// reading, since 4.0-only syntax in a card that never claimed 4.0 is the
+/// riskier guess.
+#[must_use]
+pub fn declared_version(raw: &str) -> WriteVersion {
+    for line in crate::patch::logical_lines(raw) {
+        if line.name() == "VERSION" {
+            return if line.value().trim() == "4.0" {
+                WriteVersion::V4
+            } else {
+                WriteVersion::V3
+            };
+        }
+    }
+    WriteVersion::V3
+}
+
 /// Serialises a contact as a vCard 4.0 document.
 ///
 /// Lossy for anything this crate does not model — see the module docs. Use it
 /// for contacts the app created, not to rewrite one that came from a server.
 #[must_use]
 pub fn to_vcard(contact: &Contact) -> String {
+    to_vcard_versioned(contact, WriteVersion::V4)
+}
+
+/// Serialises a contact in the requested version.
+///
+/// The differences that matter for the fields this crate models:
+/// - `VERSION` line, obviously.
+/// - **Preference**: 4.0 writes `PREF=1`; 3.0 has no PREF parameter and spells
+///   it `TYPE=PREF` (RFC 2426 §3.3). Writing `PREF=1` into a 3.0 card is the
+///   kind of quiet non-conformance that works until a strict server strips it.
+/// - **BDAY**: 4.0 uses the basic form (`18151210`), 3.0 the extended
+///   (`1815-12-10`) — RFC 2426 shows only the extended form.
+#[must_use]
+pub fn to_vcard_versioned(contact: &Contact, version: WriteVersion) -> String {
     let mut out = String::new();
     fold_line("BEGIN:VCARD", &mut out);
-    fold_line("VERSION:4.0", &mut out);
+    fold_line(
+        match version {
+            WriteVersion::V3 => "VERSION:3.0",
+            WriteVersion::V4 => "VERSION:4.0",
+        },
+        &mut out,
+    );
     fold_line(&format!("UID:{}", escape_text(&contact.uid)), &mut out);
 
     // FN is REQUIRED by RFC 6350 §6.2.1 — a card without one is rejected by
@@ -577,13 +699,13 @@ pub fn to_vcard(contact: &Contact) -> String {
         fold_line(&format!("NICKNAME:{}", escape_text(nickname)), &mut out);
     }
     for email in &contact.emails {
-        fold_line(&typed_line("EMAIL", email), &mut out);
+        fold_line(&typed_line_versioned("EMAIL", email, version), &mut out);
     }
     for phone in &contact.phones {
-        fold_line(&typed_line("TEL", phone), &mut out);
+        fold_line(&typed_line_versioned("TEL", phone, version), &mut out);
     }
     for url in &contact.urls {
-        fold_line(&typed_line("URL", url), &mut out);
+        fold_line(&typed_line_versioned("URL", url, version), &mut out);
     }
 
     for address in &contact.addresses {
@@ -600,7 +722,11 @@ pub fn to_vcard(contact: &Contact) -> String {
         fold_line(&format!("NOTE:{}", escape_text(note)), &mut out);
     }
     if let Some(birthday) = contact.birthday {
-        fold_line(&format!("BDAY:{}", birthday.format("%Y%m%d")), &mut out);
+        let formatted = match version {
+            WriteVersion::V3 => birthday.format("%Y-%m-%d"),
+            WriteVersion::V4 => birthday.format("%Y%m%d"),
+        };
+        fold_line(&format!("BDAY:{formatted}"), &mut out);
     }
     if !contact.categories.is_empty() {
         let list = contact
@@ -620,12 +746,20 @@ pub fn to_vcard(contact: &Contact) -> String {
     out
 }
 
-fn typed_line(property: &str, value: &Typed) -> String {
+fn typed_line_versioned(property: &str, value: &Typed, version: WriteVersion) -> String {
     let mut params = String::new();
-    if !value.types.is_empty() {
-        params.push_str(&format!(";TYPE={}", value.types.join(",")));
+
+    // 3.0 folds preference into TYPE; 4.0 has a parameter for it.
+    let mut types = value.types.clone();
+    if value.pref.is_some() && version == WriteVersion::V3 {
+        types.push("pref".to_owned());
     }
-    if let Some(pref) = value.pref {
+    if !types.is_empty() {
+        params.push_str(&format!(";TYPE={}", types.join(",")));
+    }
+    if let Some(pref) = value.pref
+        && version == WriteVersion::V4
+    {
         params.push_str(&format!(";PREF={pref}"));
     }
     format!("{property}{params}:{}", escape_text(&value.value))
@@ -1064,5 +1198,139 @@ BEGIN:VCARD\r\nUID:b\r\nFN:Bob\r\nEND:VCARD\r\n";
     #[test]
     fn empty_input_yields_nothing() {
         assert!(split_vcards("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    use crate::model::Typed;
+
+    fn ada() -> Contact {
+        let mut c = Contact::draft("d");
+        c.display_name = "Ada".into();
+        c.emails = vec![Typed {
+            value: "ada@example.com".into(),
+            types: vec!["work".into()],
+            pref: Some(1),
+            group: None,
+        }];
+        c.birthday = chrono::NaiveDate::from_ymd_opt(1815, 12, 10);
+        c
+    }
+
+    /// 3.0 has no PREF parameter — preference is TYPE=PREF (RFC 2426 §3.3).
+    #[test]
+    fn v3_spells_preference_as_type_pref_and_v4_as_a_parameter() {
+        let v3 = to_vcard_versioned(&ada(), WriteVersion::V3);
+        assert!(v3.contains("VERSION:3.0"), "{v3}");
+        assert!(v3.contains("EMAIL;TYPE=work,pref:ada@example.com"), "{v3}");
+        assert!(!v3.contains("PREF=1"), "a 3.0 card carries no PREF parameter: {v3}");
+        assert!(v3.contains("BDAY:1815-12-10"), "{v3}");
+
+        let v4 = to_vcard_versioned(&ada(), WriteVersion::V4);
+        assert!(v4.contains("VERSION:4.0"), "{v4}");
+        assert!(v4.contains("PREF=1"), "{v4}");
+        assert!(v4.contains("BDAY:18151210"), "{v4}");
+    }
+
+    /// Both spellings must parse back to the same model, or the two versions
+    /// would disagree about who the preferred address is.
+    #[test]
+    fn both_preference_spellings_parse_to_the_same_model() {
+        for version in [WriteVersion::V3, WriteVersion::V4] {
+            let text = to_vcard_versioned(&ada(), version);
+            let back = parse_vcards(&text, "d", "a.vcf").remove(0);
+            assert_eq!(
+                back.emails[0].pref,
+                Some(1),
+                "preference lost through {version:?}"
+            );
+            assert_eq!(
+                back.emails[0].types,
+                vec!["work"],
+                "TYPE=PREF leaked into the visible labels for {version:?}"
+            );
+            assert_eq!(back.birthday, ada().birthday, "{version:?}");
+        }
+    }
+
+    /// A patch speaks the card's own dialect — editing a 3.0 card must not
+    /// plant 4.0 syntax in it.
+    #[test]
+    fn patching_a_v3_card_writes_v3_preference() {
+        let original = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:x\r\nFN:Ada\r\n\
+EMAIL;TYPE=work:old@example.com\r\nEND:VCARD\r\n";
+        let mut contact = parse_vcards(original, "d", "a.vcf").remove(0);
+        contact.emails[0].pref = Some(1);
+
+        let patched = patch_vcard(original, &contact).unwrap();
+        assert!(patched.contains("VERSION:3.0"), "{patched}");
+        assert!(!patched.contains("PREF="), "4.0 syntax in a 3.0 card: {patched}");
+        assert!(patched.contains("TYPE=work,pref"), "{patched}");
+    }
+
+    #[test]
+    fn the_declared_version_is_read_and_absent_means_v3() {
+        assert_eq!(
+            declared_version("BEGIN:VCARD\r\nVERSION:4.0\r\nEND:VCARD\r\n"),
+            WriteVersion::V4
+        );
+        assert_eq!(
+            declared_version("BEGIN:VCARD\r\nVERSION:3.0\r\nEND:VCARD\r\n"),
+            WriteVersion::V3
+        );
+        assert_eq!(declared_version("BEGIN:VCARD\r\nEND:VCARD\r\n"), WriteVersion::V3);
+    }
+}
+
+#[cfg(test)]
+mod photo_write_tests {
+    use super::*;
+
+    const V4: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:x\r\nFN:Ada\r\n\
+X-KEEP:me\r\nEND:VCARD\r\n";
+    const V3: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:x\r\nFN:Ada\r\n\
+PHOTO;ENCODING=b;TYPE=JPEG:OLDOLD==\r\nEND:VCARD\r\n";
+
+    #[test]
+    fn setting_a_photo_speaks_the_cards_dialect() {
+        let png = [0x89, b'P', b'N', b'G'];
+
+        let v4 = set_photo(V4, &png, "image/png").unwrap();
+        assert!(v4.contains("PHOTO:data:image/png;base64,"), "{v4}");
+        assert!(v4.contains("X-KEEP:me"), "{v4}");
+
+        let v3 = set_photo(V3, &png, "image/png").unwrap();
+        assert!(v3.contains("PHOTO;ENCODING=b;TYPE=PNG:"), "{v3}");
+        assert!(!v3.contains("OLDOLD"), "the old photo survived: {v3}");
+        assert!(!v3.contains("data:"), "4.0 syntax in a 3.0 card: {v3}");
+    }
+
+    #[test]
+    fn a_set_photo_reads_back_through_the_photo_accessor() {
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a];
+        let card = set_photo(V4, &png, "image/png").unwrap();
+        match photo(&card) {
+            Some(Photo::Bytes { data, .. }) => assert_eq!(data, png),
+            other => panic!("round trip failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removing_a_photo_removes_only_the_photo() {
+        let stripped = remove_photo(V3).unwrap();
+        assert!(!stripped.contains("PHOTO"), "{stripped}");
+        assert!(stripped.contains("FN:Ada"), "{stripped}");
+
+        // Removing from a card with no photo is a no-op, not an error.
+        let unchanged = remove_photo(V4).unwrap();
+        assert!(unchanged.contains("X-KEEP:me"));
+    }
+
+    #[test]
+    fn garbage_yields_none() {
+        assert!(set_photo("", &[1], "image/png").is_none());
+        assert!(remove_photo("no card here").is_none());
     }
 }

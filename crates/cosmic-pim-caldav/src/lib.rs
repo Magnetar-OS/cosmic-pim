@@ -33,6 +33,8 @@
 pub mod dav;
 pub mod error;
 pub mod feed;
+pub mod itip;
+pub mod quirks;
 pub mod patch;
 pub mod plan;
 pub mod push;
@@ -46,4 +48,4 @@ pub use feed::{FeedOutcome, FeedState};
 pub use plan::{SyncPlan, plan_sync};
 pub use store::{CalDavStore, CollectionState, Conflict, RemoteEvent};
 pub use sync::{SyncOutcome, sync_collection};
-pub use vdir::VdirStore;
+pub use vdir::{VdirStore, is_local_only, mark_local_only, unmark_local_only};

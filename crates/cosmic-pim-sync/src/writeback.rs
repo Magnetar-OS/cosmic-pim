@@ -32,6 +32,14 @@ pub fn queue_save(root: &Path, collection_id: &str, file_name: &str) -> Result<b
     let Some(meta) = crate::provision::open_collection(root, collection_id) else {
         return Ok(false);
     };
+
+    // A collection the user disconnected keeps its binding but must not
+    // queue: the queue is durable, and an entry accepted now would push the
+    // moment the marker came off — hours or months later, unasked.
+    if cosmic_pim_caldav::is_local_only(&meta.path) {
+        return Ok(false);
+    }
+
     let mut store = VdirStore::open(meta)?;
 
     if store.is_read_only() {
@@ -60,6 +68,9 @@ pub fn queue_delete(root: &Path, collection_id: &str, file_name: &str) -> Result
     let Some(meta) = crate::provision::open_collection(root, collection_id) else {
         return Ok(false);
     };
+    if cosmic_pim_caldav::is_local_only(&meta.path) {
+        return Ok(false);
+    }
     let mut store = VdirStore::open(meta)?;
 
     if store.is_read_only() {
@@ -196,5 +207,28 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         let dir = tempfile::tempdir().unwrap();
         assert!(!queue_save(dir.path(), "no-such-collection", "a.ics").unwrap());
         assert!(!queue_delete(dir.path(), "no-such-collection", "a.ics").unwrap());
+    }
+
+    #[test]
+    fn a_disconnected_collection_queues_nothing_despite_its_binding() {
+        // The marker's whole reason: bound + synced once + marked local-only
+        // must behave like a local calendar, not like a paused one whose
+        // queue silently fills.
+        let (dir, id) = collection(true);
+        {
+            let meta = crate::provision::open_collection(dir.path(), &id).unwrap();
+            cosmic_pim_caldav::mark_local_only(&meta.path).unwrap();
+        }
+
+        assert!(!queue_save(dir.path(), &id, "a.ics").unwrap());
+        assert!(!queue_delete(dir.path(), &id, "a.ics").unwrap());
+        assert!(pending(dir.path(), &id).is_empty());
+
+        // Unmarking reconnects, with the binding intact.
+        {
+            let meta = crate::provision::open_collection(dir.path(), &id).unwrap();
+            cosmic_pim_caldav::unmark_local_only(&meta.path).unwrap();
+        }
+        assert!(queue_save(dir.path(), &id, "a.ics").unwrap());
     }
 }

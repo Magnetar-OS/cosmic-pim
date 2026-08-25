@@ -60,8 +60,12 @@ the wire protocol and folder-alias table, and records two design ideas taken
 from ravn as ideas only, with no code reproduced. Both attributions carry
 forward here.
 
+`crates/cosmic-pim-caldav/src/itip.rs` takes its METHOD dispatch, attendee
+gate, SEQUENCE rule, and single-instance CANCEL behaviour from
+`src-tauri/src/itip.rs`.
+
 In every case the storage half is new rather than ported: the donor drove
-SQLite, these drive a maildir.
+SQLite, these drive a maildir or a vdir.
 
 NOTE: at the time of extraction the Meltemi repository carried no licence
 declaration. Both projects share a copyright holder, so redistribution here

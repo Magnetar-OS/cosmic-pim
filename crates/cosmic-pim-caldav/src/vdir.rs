@@ -47,6 +47,41 @@ const STATE_FILE: &str = ".caldav-state.json";
 /// synchronising this directory.
 const FOREIGN_SYNC_PREFIX: &str = ".vdirsyncer";
 
+/// The marker naming a collection as local-only: on this device by choice,
+/// never to be adopted, bound, or pushed by any sync engine.
+///
+/// # Why an explicit marker when unbound already means unsynced
+///
+/// An unbound collection is *not yet* synced; a marked one is *not to be*
+/// synced — and only the user can tell the two apart. The difference bites in
+/// exactly one place: a collection that was synced once and then marked (the
+/// user "disconnected" it) still carries its binding in `accounts.toml` and
+/// its href in the sidecar, and without the marker the next pass would
+/// cheerfully resume pushing a calendar the user decided was private. It is
+/// also what Circle's on-device notes need before a CRM sidecar can exist at
+/// all. The file's content is ignored; its presence is the fact.
+const LOCAL_ONLY_MARKER: &str = ".local-only";
+
+/// Marks a collection directory as local-only.
+pub fn mark_local_only(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(path.join(LOCAL_ONLY_MARKER), b"")
+}
+
+/// Removes the marker, making the collection eligible for sync again.
+pub fn unmark_local_only(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path.join(LOCAL_ONLY_MARKER)) {
+        Ok(()) => Ok(()),
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(why) => Err(why),
+    }
+}
+
+/// Whether a collection directory is marked local-only.
+#[must_use]
+pub fn is_local_only(path: &std::path::Path) -> bool {
+    path.join(LOCAL_ONLY_MARKER).is_file()
+}
+
 /// The name of a foreign sync engine's file in `path`, if there is one.
 ///
 /// # Why this check exists

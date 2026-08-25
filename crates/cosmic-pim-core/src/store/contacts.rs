@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use super::{ImportSummary, StoreError};
 use crate::model::{CalendarMeta, Contact};
-use crate::vcard::{parse_vcards, split_vcards, to_vcard};
+use crate::vcard::{WriteVersion, parse_vcards, split_vcards, to_vcard_versioned};
 
 /// Where address books live: `$XDG_DATA_HOME/contacts`.
 ///
@@ -76,6 +76,20 @@ pub fn read_book(meta: &CalendarMeta) -> Vec<Contact> {
 /// whatever the model does not represent, and the loss would only become
 /// visible after the next push, on every device the user owns.
 pub fn write_contact(meta: &CalendarMeta, contact: &Contact) -> Result<(), StoreError> {
+    write_contact_versioned(meta, contact, WriteVersion::default())
+}
+
+/// [`write_contact`], with the version a **new** card serialises as.
+///
+/// The version only applies when there is nothing to patch: an existing card
+/// keeps the version its own bytes declare, because the patcher rewrites lines
+/// in the card's dialect and never converts. The default is 3.0 — Nextcloud
+/// and most CardDAV peers are 3.0-first, and conversion is never silent.
+pub fn write_contact_versioned(
+    meta: &CalendarMeta,
+    contact: &Contact,
+    version: WriteVersion,
+) -> Result<(), StoreError> {
     if meta.read_only {
         return Err(StoreError::ReadOnly(meta.name.clone()));
     }
@@ -92,7 +106,7 @@ pub fn write_contact(meta: &CalendarMeta, contact: &Contact) -> Result<(), Store
                     "stored vCard could not be patched; rebuilding from the model"
                 );
             }
-            to_vcard(contact)
+            to_vcard_versioned(contact, version)
         }
     };
 
@@ -196,11 +210,22 @@ impl ContactStore {
     }
 
     pub fn save(&mut self, contact: &Contact) -> Result<(), StoreError> {
+        self.save_as(contact, WriteVersion::default())
+    }
+
+    /// [`Self::save`], choosing the version a **new** card serialises as.
+    /// Existing cards keep their own version regardless — see
+    /// [`write_contact_versioned`].
+    pub fn save_as(
+        &mut self,
+        contact: &Contact,
+        version: WriteVersion,
+    ) -> Result<(), StoreError> {
         let meta = self
             .book(&contact.addressbook_id)
             .ok_or_else(|| StoreError::UnknownCalendar(contact.addressbook_id.clone()))?
             .clone();
-        write_contact(&meta, contact)
+        write_contact_versioned(&meta, contact, version)
     }
 
     pub fn delete(&mut self, book_id: &str, uid: &str) -> Result<(), StoreError> {
@@ -241,6 +266,13 @@ impl ContactStore {
         let existing: Vec<Contact> = read_book(&meta);
         let mut summary = ImportSummary::default();
 
+        // File names already spoken for — by cards on disk, and by cards
+        // earlier in this same import. Sanitising a UID is lossy (`a@b` and
+        // `a-b` both become `a-b`), so without this a colliding *new* card
+        // would silently overwrite a different contact's file.
+        let mut taken: std::collections::HashSet<String> =
+            existing.iter().map(|c| c.file_name.clone()).collect();
+
         for segment in split_vcards(text) {
             let Some(card) = parse_vcards(&segment, book_id, "").into_iter().next() else {
                 // A segment calcard cannot parse would be written as a file no
@@ -256,10 +288,18 @@ impl ContactStore {
                 }
                 None => {
                     summary.added += 1;
-                    format!("{}.vcf", super::sanitise_file_stem(&card.uid))
+                    let stem = super::sanitise_file_stem(&card.uid);
+                    let mut candidate = format!("{stem}.vcf");
+                    let mut counter = 1u32;
+                    while taken.contains(&candidate) {
+                        candidate = format!("{stem}-{counter}.vcf");
+                        counter += 1;
+                    }
+                    candidate
                 }
             };
 
+            taken.insert(file_name.clone());
             write_contact_raw(&meta, &file_name, &segment)?;
         }
         Ok(summary)
@@ -277,7 +317,7 @@ impl ContactStore {
             // `raw` is the file's verbatim text; a card this app created and
             // never re-read is serialised from the model instead.
             if contact.raw.trim().is_empty() {
-                out.push_str(&to_vcard(&contact));
+                out.push_str(&to_vcard_versioned(&contact, WriteVersion::default()));
             } else {
                 out.push_str(&contact.raw);
                 if !contact.raw.ends_with('\n') {
@@ -586,6 +626,27 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob@x\r\nFN:Bob\r\nEND:VCARD\r\n";
         let book2 = store.create_book("Second", Rgb(4, 5, 6)).unwrap();
         let summary = store.import_vcf(&exported, &book2.id).unwrap();
         assert_eq!((summary.added, summary.updated), (2, 0));
+    }
+
+    /// Sanitising a UID is lossy: `a@b` and `a-b` collapse to the same file
+    /// stem. Both cards must survive an import — the second must not overwrite
+    /// the first's file.
+    #[test]
+    fn uids_that_sanitise_identically_do_not_clobber_each_other() {
+        let (_dir, mut store, meta) = store();
+
+        let colliding = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a@b\r\nFN:At\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a-b\r\nFN:Dash\r\nEND:VCARD\r\n";
+        let summary = store.import_vcf(colliding, &meta.id).unwrap();
+        assert_eq!((summary.added, summary.updated), (2, 0));
+
+        let names: Vec<String> = store.contacts().iter().map(Contact::label).collect();
+        assert_eq!(store.contacts().len(), 2, "one card overwrote the other: {names:?}");
+
+        // And a re-import still updates both rather than growing a third file.
+        let again = store.import_vcf(colliding, &meta.id).unwrap();
+        assert_eq!((again.added, again.updated), (0, 2));
+        assert_eq!(store.contacts().len(), 2);
     }
 
     #[test]

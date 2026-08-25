@@ -106,6 +106,21 @@ pub fn provision_account(
             .get(&calendar.href)
             .and_then(|id| existing.iter().find(|c| &c.id == id).cloned());
 
+        // The disconnect case: a collection that was synced once and then
+        // marked local-only still carries its binding, and resuming it would
+        // push a calendar the user decided was private. The binding is left
+        // in place — unmarking reconnects without re-provisioning — but this
+        // pass creates nothing, syncs nothing, and says nothing per-cycle.
+        if let Some(meta) = &bound
+            && cosmic_pim_caldav::is_local_only(&meta.path)
+        {
+            tracing::debug!(
+                collection = meta.id,
+                "bound collection is marked local-only; leaving it alone"
+            );
+            continue;
+        }
+
         let (meta, created) = match bound {
             Some(meta) => (meta, false),
             None => {

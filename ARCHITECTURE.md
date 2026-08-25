@@ -79,6 +79,8 @@ in one place and all three apps get it.
 | Durable writes | `core::atomic` | Temp file → fsync it → rename → **fsync the parent directory**; optimistic concurrency. |
 | CalDAV / CardDAV | `caldav` | One engine, two flavours. |
 | ICS subscriptions | `caldav::feed` | A URL fetched on an interval, split into ordinary vdir files. Read-only by construction. |
+| iTIP | `caldav::itip` | RFC 5546: what an invitation means, applied to a vdir. Shared by Slate and Envelope; RFC 6638 scheduling will use it, not replace it. |
+| Server quirks | `caldav::quirks` | The ledger of what each server does differently, each fact naming its defence. Populated from CI and field reports, never from documentation. |
 | RFC 5322 messages | `mail::model` | Extract-only. Nothing ever writes a message back through the parser. |
 | Signing in | `auth` | OAuth 2.0 with PKCE, a loopback redirect, and renewal. One flow for every provider. |
 | Where a service lives | `accounts::provider` | Manifests, not a match arm. A new provider is a file. |
@@ -322,6 +324,18 @@ Two things from the calendar side deliberately do **not** carry over. Step 4 of
 a WebDAV flavour. And `caldav::patch` has no mail counterpart, because a message
 is never edited in place; the equivalent operation is a rename.
 
+## Local-only collections
+
+An unbound collection is *not yet* synced; one marked local-only (a
+`.local-only` file in the directory) is *not to be* synced — and only the user
+can tell those apart. The distinction bites in one place: a collection that was
+synced once and then disconnected still carries its binding, and without the
+marker the next pass would resume pushing a calendar the user decided was
+private. Provisioning leaves a marked collection alone, writeback declines to
+queue for it (the queue is durable, and an entry accepted now would fire when
+the marker came off, unasked), and unmarking reconnects with the binding
+intact. This is also the prerequisite for Circle's on-device notes.
+
 ## One sync engine per collection
 
 The vdir layout means a collection can legitimately be synced by `vdirsyncer`
@@ -431,7 +445,7 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 ## Testing
 
-Roughly 780 tests in the substrate, `cargo test --workspace`.
+Roughly 830 tests in the substrate, `cargo test --workspace`.
 
 `caldav/tests/live_server.rs` is the odd one out: it scripts nothing. Gated on
 `COSMIC_PIM_LIVE_CALDAV_URL` and ignored by default, it drives the real engine
