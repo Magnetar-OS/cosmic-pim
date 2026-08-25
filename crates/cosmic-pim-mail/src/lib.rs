@@ -87,6 +87,7 @@ pub mod imap;
 pub mod index;
 pub mod jmap;
 pub mod maildir;
+pub mod mbox;
 pub mod model;
 pub mod outbox;
 pub mod plan;
