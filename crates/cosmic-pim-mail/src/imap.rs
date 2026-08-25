@@ -603,9 +603,12 @@ fn fetch_batch(session: &mut Session, uids: &[u32]) -> Result<Vec<RemoteMessage>
     Ok(fetches.iter().filter_map(remote_message).collect())
 }
 
+/// What one CHANGEDSINCE window reported: `(flag deltas, vanished UIDs)`.
+type FlagWindow = (Vec<(u32, Flags)>, Vec<u32>);
+
 /// Every flag change since `modseq` — and, with QRESYNC, every deletion —
 /// in one round trip.
-fn fetch_flag_deltas(session: &mut Session, modseq: u64) -> Result<(Vec<(u32, Flags)>, Vec<u32>)> {
+fn fetch_flag_deltas(session: &mut Session, modseq: u64) -> Result<FlagWindow> {
     // The VANISHED modifier is only legal once QRESYNC is enabled; sending it
     // to a CONDSTORE-only server is a BAD.
     let query = if session.qresync {
