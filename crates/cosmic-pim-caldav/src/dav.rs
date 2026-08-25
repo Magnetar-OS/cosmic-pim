@@ -1668,6 +1668,46 @@ impl CaldavClient {
         Ok(all)
     }
 
+    /// Creates a calendar collection (RFC 4791 §5.3.1).
+    ///
+    /// The first thing the very first live-server run taught us: Radicale
+    /// answers a PUT into a missing collection with 409 rather than creating
+    /// it, so an engine that can only PUT cannot start from an empty account.
+    /// "Already exists" is tolerated as success, because "make sure this
+    /// calendar exists" is the operation every caller actually means — and it
+    /// is spelled two ways in the wild: 405 (generic WebDAV), and 409 with
+    /// the RFC 4791 §5.3.1.1 `resource-must-be-null` precondition, which is
+    /// what Radicale answers (finding #2 of the first live run).
+    ///
+    /// CalDAV only: an address book is made with extended MKCOL (RFC 5689),
+    /// which can join here when a caller needs it.
+    pub fn mkcalendar(&self, url: &str, display_name: &str) -> Result<()> {
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set><D:prop><D:displayname>{}</D:displayname></D:prop></D:set>
+</C:mkcalendar>"#,
+            xml_escape_text(display_name)
+        );
+        let resp = self.request(
+            "MKCALENDAR",
+            url,
+            &[("Content-Type", "application/xml; charset=utf-8")],
+            &body,
+        )?;
+        match resp.status {
+            201 | 405 => Ok(()),
+            409 if resp.body.contains("resource-must-be-null") => Ok(()),
+            status => Err(Error::status(
+                status,
+                format!(
+                    "caldav: MKCALENDAR {url}: {}",
+                    resp.body.chars().take(300).collect::<String>()
+                ),
+            )),
+        }
+    }
+
     /// Create/update an event resource. `If-Match` is derived from the
     /// stored etag via `prepare_if_match_etag` (skipped when the stored
     /// value isn't RFC 7232-legal there). Returns the new `ETag` when the

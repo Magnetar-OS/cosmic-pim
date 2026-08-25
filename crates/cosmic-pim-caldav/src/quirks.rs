@@ -207,10 +207,17 @@ pub fn quirks_for(server: Server) -> Quirks {
             // Field: sub-collections listed without trailing slashes.
             quirks.sloppy_hrefs = true;
         }
-        // CI (Radicale, via tests/live_server.rs) and the field have not put
-        // anything on record for these yet. That is the healthy state: the
-        // engine's unconditional defences have been enough.
-        Server::Nextcloud | Server::Radicale | Server::Baikal | Server::Fastmail => {}
+        Server::Radicale => {
+            // CI, first live run (2026-08-25): MKCALENDAR on an existing
+            // collection answers 409 + DAV:resource-must-be-null rather than
+            // 405, and a PUT into a missing collection is a 409 rather than
+            // an implicit create. Both defended everywhere: `mkcalendar`
+            // treats that 409 as already-exists, and 409-on-PUT was already
+            // classified Reconcile.
+        }
+        // The field has not put anything on record for these yet. That is the
+        // healthy state: the engine's unconditional defences have been enough.
+        Server::Nextcloud | Server::Baikal | Server::Fastmail => {}
         Server::Unknown => {}
     }
     quirks

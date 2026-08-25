@@ -62,11 +62,21 @@ fn a_full_round_trip_against_a_real_server() {
     };
 
     let client = CaldavClient::new(&live.base, &live.user, &live.pass);
-    let event_url = format!("{}calendar/ci-round-trip.ics", live.base);
+    let calendar_url_direct = format!("{}calendar/", live.base);
+    let event_url = format!("{}ci-round-trip.ics", calendar_url_direct);
 
     // --- create -----------------------------------------------------------
-    // Radicale creates the parent collection on first PUT, which is also the
-    // cheapest way to make the rest of the journey self-provisioning.
+    // Finding #1 of the first live run: a PUT into a missing collection is a
+    // 409, not an implicit create — which is also a live confirmation that
+    // our taxonomy classifies 409 as Reconcile. MKCALENDAR first, and a
+    // second MKCALENDAR must read as success (405 = already there).
+    client
+        .mkcalendar(&calendar_url_direct, "CI round trip")
+        .expect("MKCALENDAR");
+    client
+        .mkcalendar(&calendar_url_direct, "CI round trip")
+        .expect("a second MKCALENDAR must be tolerated");
+
     let etag = client
         .put_event(&event_url, &event("ci-1@cosmic-pim", "Created live"), None)
         .expect("PUT a new event");
@@ -149,10 +159,29 @@ fn a_full_round_trip_against_a_real_server() {
         why.disposition()
     );
 
-    // --- delete, idempotently ---------------------------------------------
-    client
+    // --- delete, guarded then idempotent -----------------------------------
+    // Finding #3 of the first live run: the etag from the original PUT went
+    // stale the moment the edit round-tripped, and Radicale enforces If-Match
+    // on DELETE as strictly as on PUT. Optimistic concurrency covers removal
+    // too — a client deleting over a stale etag would be deleting a version
+    // it has never seen.
+    let stale_delete = client
         .delete_event(&event_url, etag.as_deref())
-        .expect("DELETE");
+        .expect_err("a stale-etag DELETE was accepted");
+    assert_eq!(stale_delete.disposition(), Disposition::Reconcile);
+
+    // With the *current* etag — the one the verify sync recorded — it goes.
+    let current = verify
+        .state()
+        .expect("state")
+        .entries
+        .iter()
+        .find(|(href, _)| href.contains("ci-round-trip"))
+        .map(|(_, etag)| etag.clone())
+        .expect("the verify store holds no etag for the event");
+    client
+        .delete_event(&event_url, Some(&current))
+        .expect("DELETE with the current etag");
     client
         .delete_event(&event_url, None)
         .expect("a second DELETE must be tolerated, not wedged on a 404");
