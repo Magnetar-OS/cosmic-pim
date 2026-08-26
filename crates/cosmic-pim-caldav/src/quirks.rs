@@ -17,8 +17,8 @@
 //! # The discipline
 //!
 //! A fact enters this table from one of two sources: the CI server matrix
-//! (`tests/live_server.rs`, currently Radicale), or a field report with the
-//! wire traffic to back it. Not from documentation — the entire reason the
+//! (`tests/live_server.rs` — Radicale and Xandikos so far), or a field report
+//! with the wire traffic to back it. Not from documentation — the entire reason the
 //! table exists is that servers do not match their documentation.
 //!
 //! Most entries are **defended everywhere**: the engine behaves the same
@@ -51,6 +51,7 @@ pub enum Server {
     Cyrus,
     Davical,
     Zimbra,
+    Xandikos,
     Unknown,
 }
 
@@ -70,6 +71,9 @@ pub fn detect(server_header: Option<&str>, host: Option<&str>) -> Server {
         }
         if header.contains("radicale") {
             return Server::Radicale;
+        }
+        if header.contains("xandikos") {
+            return Server::Xandikos;
         }
         if header.contains("sabre") || header.contains("baikal") {
             // Baïkal is sabre/dav in a costume; ownCloud-era servers also
@@ -214,6 +218,12 @@ pub fn quirks_for(server: Server) -> Quirks {
             // an implicit create. Both defended everywhere: `mkcalendar`
             // treats that 409 as already-exists, and 409-on-PUT was already
             // classified Reconcile.
+        }
+        Server::Xandikos => {
+            // CI, first live run (2026-08-25): MKCALENDAR on an existing
+            // collection answers 403 + resource-must-be-null — a third
+            // spelling of "already exists". Defended everywhere: `mkcalendar`
+            // keys on the precondition element, not the status.
         }
         // The field has not put anything on record for these yet. That is the
         // healthy state: the engine's unconditional defences have been enough.

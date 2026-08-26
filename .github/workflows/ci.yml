@@ -38,13 +38,27 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
-  # The server-matrix job 00-suite.md asks for: the real sync engine against a
-  # real CalDAV server, exercising discovery, listing, multiget, writeback and
-  # the 412 path against something nobody canned. Radicale because it installs
-  # in seconds; Baïkal and Nextcloud can join as containers later.
-  radicale:
-    name: live CalDAV (Radicale)
+  # The server matrix 00-suite.md asks for: the real sync engine against real
+  # CalDAV servers, exercising discovery, MKCALENDAR, listing, multiget,
+  # writeback, the 412 path and guarded deletes against something nobody
+  # canned. Two independent codebases already; Baïkal and Nextcloud can join
+  # as containers later. The journey each job runs has been validated locally
+  # against both servers before ever reaching CI.
+  live-caldav:
+    name: live CalDAV (${{ matrix.server }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: radicale
+            url: http://127.0.0.1:5232/ci/
+            user: ci
+            pass: ci
+          - server: xandikos
+            url: http://127.0.0.1:5233/ci/
+            user: ""
+            pass: ""
     steps:
       - uses: actions/checkout@v4
       - name: Show the pinned toolchain
@@ -52,6 +66,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Start Radicale
+        if: matrix.server == 'radicale'
         run: |
           pipx install radicale
           mkdir -p /tmp/radicale
@@ -67,13 +82,25 @@ jobs:
           EOF
           radicale --config /tmp/radicale.conf &
           for _ in $(seq 1 50); do
-            curl -sf http://127.0.0.1:5232/.web/ >/dev/null && break
+            curl -s -o /dev/null http://127.0.0.1:5232/ && break
             sleep 0.2
           done
 
-      - name: Live tests
+      - name: Start Xandikos
+        if: matrix.server == 'xandikos'
+        run: |
+          pipx install xandikos
+          mkdir -p /tmp/xandikos
+          xandikos -d /tmp/xandikos --autocreate -l 127.0.0.1 -p 5233 \
+            --current-user-principal=/ci/ &
+          for _ in $(seq 1 50); do
+            curl -s -o /dev/null http://127.0.0.1:5233/ && break
+            sleep 0.2
+          done
+
+      - name: Live round trip
         env:
-          COSMIC_PIM_LIVE_CALDAV_URL: http://127.0.0.1:5232/ci/
-          COSMIC_PIM_LIVE_CALDAV_USER: ci
-          COSMIC_PIM_LIVE_CALDAV_PASS: ci
+          COSMIC_PIM_LIVE_CALDAV_URL: ${{ matrix.url }}
+          COSMIC_PIM_LIVE_CALDAV_USER: ${{ matrix.user }}
+          COSMIC_PIM_LIVE_CALDAV_PASS: ${{ matrix.pass }}
         run: cargo test -p cosmic-pim-caldav --test live_server -- --ignored

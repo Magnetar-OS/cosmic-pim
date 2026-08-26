@@ -28,6 +28,15 @@ pub struct SyncPlan {
     /// far more often a server-side hiccup (SOGo transient, an auth blip that
     /// still produced a 207) than a genuine everything-was-deleted; deletes are
     /// skipped for the round and the next sync self-corrects.
+    ///
+    /// The live-confirmed cost (server matrix, 2026-08-25): a collection whose
+    /// last event was legitimately deleted never empties locally — every cycle
+    /// re-trips the guard, and because the ctag stays uncommitted, every cycle
+    /// re-lists. The candidate fix is confirm-on-second-sight: remember the
+    /// ctag the guard fired under, and accept the emptying when a later cycle
+    /// sees the same ctag with the same empty listing. That needs a field in
+    /// the sidecar and a store-trait change, so it is recorded here rather
+    /// than bolted on.
     pub guard_tripped: bool,
 }
 

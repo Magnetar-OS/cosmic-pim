@@ -6,9 +6,10 @@
 //! Every other test in this crate scripts the server, which proves the client
 //! against what we *believe* servers say. This one is the beginning of the
 //! server matrix 00-suite.md asks for: it proves the client against what a
-//! server actually says, which is where the quirks table's entries will come
-//! from. CI runs it against Radicale; Baïkal and Nextcloud can join as
-//! containers later, and Fastmail/Google/iCloud stay a manual checklist.
+//! server actually says, which is where the quirks table's entries come from —
+//! its first afternoon produced six. CI runs it against Radicale and Xandikos;
+//! Baïkal and Nextcloud can join as containers later, and
+//! Fastmail/Google/iCloud stay a manual checklist.
 //!
 //! Ignored by default and gated on the environment, so `cargo test` stays
 //! offline and deterministic:
@@ -61,15 +62,26 @@ fn a_full_round_trip_against_a_real_server() {
         return;
     };
 
-    let client = CaldavClient::new(&live.base, &live.user, &live.pass);
-    let calendar_url_direct = format!("{}calendar/", live.base);
-    let event_url = format!("{}ci-round-trip.ics", calendar_url_direct);
+    // --- discover, then create INSIDE the home -----------------------------
+    // Finding #5 of the first live runs: the calendar home is wherever the
+    // server says it is — `/ci/` on Radicale, `/ci/calendars/` on Xandikos —
+    // and a calendar created at a guessed path exists but is never
+    // discovered. So the journey discovers first, exactly as an app must.
+    let mut client = CaldavClient::new(&live.base, &live.user, &live.pass);
+    client.discover().expect("discovery");
+    let home = client
+        .calendar_home_url()
+        .expect("discovery produced no calendar home")
+        .trim_end_matches('/')
+        .to_owned();
+    let calendar_url_direct = format!("{home}/ci-e2e/");
+    let event_url = format!("{calendar_url_direct}ci-round-trip.ics");
 
-    // --- create -----------------------------------------------------------
-    // Finding #1 of the first live run: a PUT into a missing collection is a
-    // 409, not an implicit create — which is also a live confirmation that
-    // our taxonomy classifies 409 as Reconcile. MKCALENDAR first, and a
-    // second MKCALENDAR must read as success (405 = already there).
+    // Finding #1: a PUT into a missing collection is a 409, not an implicit
+    // create — which also live-confirms the taxonomy's 409 → Reconcile.
+    // MKCALENDAR first, and a second one must read as success (findings #2
+    // and #4: "already exists" is 405, or 409/403 + resource-must-be-null,
+    // depending on the server).
     client
         .mkcalendar(&calendar_url_direct, "CI round trip")
         .expect("MKCALENDAR");
@@ -81,13 +93,10 @@ fn a_full_round_trip_against_a_real_server() {
         .put_event(&event_url, &event("ci-1@cosmic-pim", "Created live"), None)
         .expect("PUT a new event");
 
-    // --- discover ---------------------------------------------------------
-    let mut discovering = CaldavClient::new(&live.base, &live.user, &live.pass);
-    discovering.discover().expect("discovery");
-    let calendars = discovering.list_calendars().expect("list calendars");
+    let calendars = client.list_calendars().expect("list calendars");
     let calendar = calendars
         .iter()
-        .find(|c| c.href.trim_end_matches('/').ends_with("calendar"))
+        .find(|c| c.href.trim_end_matches('/').ends_with("ci-e2e"))
         .unwrap_or_else(|| panic!("the created calendar was not discovered: {calendars:?}"));
 
     // --- sync down --------------------------------------------------------
@@ -186,12 +195,27 @@ fn a_full_round_trip_against_a_real_server() {
         .delete_event(&event_url, None)
         .expect("a second DELETE must be tolerated, not wedged on a 404");
 
-    // And a final sync sees the removal.
+    // And a final sync notices the removal — one way or the other.
+    //
+    // Finding #6: when the deletion empties the collection completely, the
+    // mass-delete guard fires — an empty listing while we hold events is
+    // indistinguishable, in one cycle, from a server hiccup, and the guard
+    // chooses staleness over data loss. So the designed behaviour here is
+    // EITHER the deletion applying (something else still listed) or the
+    // guard tripping and the local copy surviving. What must never happen is
+    // the third thing: a silent nothing.
     let outcome = sync_collection(&client, &calendar_url, &mut store).expect("final sync");
-    assert!(
-        outcome.deleted >= 1 || vdir::read_collection(store.collection()).is_empty(),
-        "the deletion never propagated"
-    );
+    if outcome.guard_tripped {
+        assert!(
+            !vdir::read_collection(store.collection()).is_empty(),
+            "the guard tripped and yet the local copy is gone"
+        );
+    } else {
+        assert!(
+            outcome.deleted >= 1 || vdir::read_collection(store.collection()).is_empty(),
+            "the deletion never propagated and no guard fired"
+        );
+    }
 }
 
 /// Hrefs come back server-relative; the request URL needs them absolute.

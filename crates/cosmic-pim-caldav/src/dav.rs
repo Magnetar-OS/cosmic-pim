@@ -1675,9 +1675,10 @@ impl CaldavClient {
     /// it, so an engine that can only PUT cannot start from an empty account.
     /// "Already exists" is tolerated as success, because "make sure this
     /// calendar exists" is the operation every caller actually means — and it
-    /// is spelled two ways in the wild: 405 (generic WebDAV), and 409 with
-    /// the RFC 4791 §5.3.1.1 `resource-must-be-null` precondition, which is
-    /// what Radicale answers (finding #2 of the first live run).
+    /// is spelled three ways in the wild: 405 (generic WebDAV), 409 with the
+    /// RFC 4791 §5.3.1.1 `resource-must-be-null` precondition (Radicale), and
+    /// 403 with the same precondition (Xandikos). The precondition element is
+    /// the reliable signal; the status is house style.
     ///
     /// CalDAV only: an address book is made with extended MKCOL (RFC 5689),
     /// which can join here when a caller needs it.
@@ -1697,7 +1698,7 @@ impl CaldavClient {
         )?;
         match resp.status {
             201 | 405 => Ok(()),
-            409 if resp.body.contains("resource-must-be-null") => Ok(()),
+            _ if resp.body.contains("resource-must-be-null") => Ok(()),
             status => Err(Error::status(
                 status,
                 format!(
