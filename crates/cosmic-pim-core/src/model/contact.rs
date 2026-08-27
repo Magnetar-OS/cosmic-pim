@@ -165,6 +165,14 @@ pub struct Contact {
     pub title: Option<String>,
     pub note: Option<String>,
     pub birthday: Option<NaiveDate>,
+    /// `BDAY` when the card gives a month and day but **no year** (`--0415`,
+    /// legal vCard and common for contacts who prefer not to state an age).
+    ///
+    /// Mutually exclusive with [`Self::birthday`] by construction — a card has
+    /// one `BDAY`, and this field is only set when a year is absent. `(month,
+    /// day)`. The editor leaves it alone (there is no full date to edit into),
+    /// but the birthday stream serves it, ageless.
+    pub birthday_month_day: Option<(u32, u32)>,
     pub urls: Vec<Typed>,
     pub categories: Vec<String>,
     /// `REV` — the contact's own last-modified stamp.
@@ -217,6 +225,7 @@ impl Contact {
             title: None,
             note: None,
             birthday: None,
+            birthday_month_day: None,
             urls: Vec::new(),
             categories: Vec::new(),
             rev: None,

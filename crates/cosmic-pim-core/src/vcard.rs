@@ -52,6 +52,7 @@ pub fn parse_vcards(text: &str, addressbook_id: &str, file_name: &str) -> Vec<Co
 }
 
 fn convert(card: &VCard, raw: &str, addressbook_id: &str, file_name: &str) -> Contact {
+    let (birthday, birthday_month_day) = birthday(card);
     Contact {
         uid: card
             .uid()
@@ -67,7 +68,8 @@ fn convert(card: &VCard, raw: &str, addressbook_id: &str, file_name: &str) -> Co
         organisation: text_of(card, &VCardProperty::Org),
         title: text_of(card, &VCardProperty::Title),
         note: text_of(card, &VCardProperty::Note),
-        birthday: birthday(card),
+        birthday,
+        birthday_month_day,
         urls: typed_list(card, &VCardProperty::Url),
         categories: list_of(card, &VCardProperty::Categories),
         is_group: is_group(card),
@@ -246,21 +248,35 @@ fn addresses(card: &VCard) -> Vec<Address> {
         .collect()
 }
 
-/// `BDAY`, when it is a real date.
+/// `BDAY`: a full date where the card gives one, a bare `(month, day)` where
+/// it legally omits the year (`--0415`), free text dropped.
 ///
-/// vCard permits a year-less birthday (`--0415`) and even free text. Neither
-/// maps onto `NaiveDate`, and inventing a year would put the contact's birthday
-/// on the wrong anniversary, so both are dropped rather than guessed at.
-fn birthday(card: &VCard) -> Option<NaiveDate> {
-    let entry = card.property(&VCardProperty::Bday)?;
-    let VCardValue::PartialDateTime(dt) = entry.values.first()? else {
-        return None;
+/// The two halves are mutually exclusive: inventing a year for a year-less
+/// birthday would put the anniversary on the wrong date in every year but the
+/// invented one, so a year-less `BDAY` never becomes a `NaiveDate` — it feeds
+/// the birthday stream ageless instead.
+fn birthday(card: &VCard) -> (Option<NaiveDate>, Option<(u32, u32)>) {
+    let Some(entry) = card.property(&VCardProperty::Bday) else {
+        return (None, None);
     };
-    NaiveDate::from_ymd_opt(
-        i32::from(dt.year?),
-        u32::from(dt.month?),
-        u32::from(dt.day?),
-    )
+    let Some(VCardValue::PartialDateTime(dt)) = entry.values.first() else {
+        return (None, None);
+    };
+    let (Some(month), Some(day)) = (dt.month, dt.day) else {
+        return (None, None);
+    };
+    match dt.year {
+        Some(year) => (
+            NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), u32::from(day)),
+            None,
+        ),
+        // Validate through a leap year so `--0229` survives.
+        None => (
+            None,
+            NaiveDate::from_ymd_opt(2000, u32::from(month), u32::from(day))
+                .map(|_| (u32::from(month), u32::from(day))),
+        ),
+    }
 }
 
 /// Whether a card is a group, in either spelling.

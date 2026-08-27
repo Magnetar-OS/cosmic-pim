@@ -21,6 +21,7 @@
 //! public without dictating the licence of anything that merely links them.
 
 pub mod atomic;
+pub mod birthdays;
 pub mod ical;
 pub mod merge;
 pub mod model;
