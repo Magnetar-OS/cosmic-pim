@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
 | [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
-| **cosmic-pim** | — | This substrate | 829 tests |
+| **cosmic-pim** | — | This substrate | 930 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
@@ -144,9 +144,11 @@ let report = cosmic_pim_sync::sync_account_mail(
 )?;
 ```
 
-What a pass could not decide on its own — the server and this device changed the
-same event, and the local change had not been uploaded yet — is recorded with
-both versions intact rather than guessed at:
+When the server and this device changed the same event, the pass first tries to
+settle it without asking: an app that hands the pre-edit bytes to
+`queue_save_with_base` gets non-overlapping changes three-way merged and
+re-queued automatically. Only genuinely overlapping edits are recorded — local,
+remote, and base intact — for the user to decide:
 
 ```rust
 for (collection, conflict) in cosmic_pim_sync::conflicts(&calendar_root) {
