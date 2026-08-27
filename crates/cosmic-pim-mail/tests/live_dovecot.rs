@@ -302,3 +302,90 @@ fn a_deletion_by_another_client_arrives_with_the_next_delta_not_the_next_reconci
     );
     let _ = session.logout();
 }
+
+#[test]
+fn the_drafts_mirror_replaces_rather_than_accumulates_on_a_real_server() {
+    use cosmic_pim_mail::compose::Draft;
+    use cosmic_pim_mail::draft_sync::{self, SweepReport};
+    use cosmic_pim_mail::drafts::{Drafts, new_id};
+    use cosmic_pim_mail::model::Mailbox;
+
+    let Some((base, credentials)) = server() else {
+        eprintln!("PIM_TEST_IMAP not set; skipping the live drafts-mirror test");
+        return;
+    };
+    let endpoint = fresh_user(&base);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut session = connect(&endpoint, &credentials);
+
+    // A fresh user has no Drafts folder yet; the mirror addresses one the
+    // way any client would, and Dovecot auto-creates on APPEND. Create it
+    // explicitly so SELECT (which the sweep leads with) cannot race that.
+    let drafts_wire = "Drafts";
+    let _ = session.create_mailbox(drafts_wire);
+
+    let drafts = Drafts::open(dir.path()).expect("draft store");
+    let me = Mailbox {
+        name: Some("Tester".into()),
+        address: "tester@example.com".into(),
+    };
+
+    // --- First save: one upload, one copy --------------------------------
+    let id = new_id(1_700_000_000_000);
+    let mut draft = Draft::new(me.clone());
+    draft.subject = "Mirror me".into();
+    draft.body = "first version".into();
+    drafts.save(&id, &draft, 1).expect("save");
+
+    let report = draft_sync::sweep(&mut session, drafts_wire, &drafts, "example.com", 1);
+    assert_eq!(
+        report,
+        SweepReport {
+            uploaded: 1,
+            retired: 0,
+            failed: vec![]
+        },
+        "the first sweep should upload exactly one copy"
+    );
+    let mirror = drafts.mirror(&id).expect("mirror").expect("linked");
+    let message_id = mirror.message_id.clone().expect("a minted Message-ID");
+    assert!(!mirror.dirty, "a successful upload left the record dirty");
+
+    // --- Edit and re-sweep: still one copy, the newer one -----------------
+    draft.body = "second version".into();
+    drafts.save(&id, &draft, 2).expect("re-save");
+    let report = draft_sync::sweep(&mut session, drafts_wire, &drafts, "example.com", 2);
+    assert_eq!(report.uploaded, 1);
+    assert_eq!(
+        report.retired, 1,
+        "the superseded copy was not retired: {report:?}"
+    );
+
+    session.select_mailbox(drafts_wire).expect("select");
+    let copies = session
+        .uids_by_message_id(&message_id)
+        .expect("search by Message-ID");
+    assert_eq!(
+        copies.len(),
+        1,
+        "every edit left another copy — the exact bug mirroring must not have"
+    );
+
+    // An idle sweep uploads nothing: dirt, not diffing, drives it.
+    let report = draft_sync::sweep(&mut session, drafts_wire, &drafts, "example.com", 3);
+    assert_eq!(report.uploaded, 0, "a clean record was re-uploaded");
+
+    // --- Discard: the tombstone retires the server copy -------------------
+    drafts.delete(&id).expect("delete");
+    let report = draft_sync::sweep(&mut session, drafts_wire, &drafts, "example.com", 4);
+    assert_eq!(report.retired, 1, "the discarded draft survived: {report:?}");
+    session.select_mailbox(drafts_wire).expect("select");
+    assert!(
+        session
+            .uids_by_message_id(&message_id)
+            .expect("search")
+            .is_empty(),
+        "a discarded draft is still on the server"
+    );
+    let _ = session.logout();
+}

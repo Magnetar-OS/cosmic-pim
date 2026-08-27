@@ -245,6 +245,23 @@ impl Session {
     /// for the user, and a Sent folder with a bold unread count is a bug report
     /// waiting to happen.
     pub fn append(&mut self, mailbox: &str, raw: &[u8], flags: crate::model::Flags) -> Result<()> {
+        self.append_returning_uid(mailbox, raw, flags).map(|_| ())
+    }
+
+    /// [`Self::append`], reporting where the message landed when the server
+    /// says.
+    ///
+    /// `Some((uidvalidity, uid))` is UIDPLUS's APPENDUID — the receipt that
+    /// lets a later operation address exactly the message just filed. `None`
+    /// means the server does not offer it, and the caller's fallback is a
+    /// `Message-ID` search; a UID guessed any other way could name someone
+    /// else's message.
+    pub fn append_returning_uid(
+        &mut self,
+        mailbox: &str,
+        raw: &[u8],
+        flags: crate::model::Flags,
+    ) -> Result<Option<(u32, u32)>> {
         use imap::types::Flag as F;
         let mut imap_flags = vec![F::Seen];
         if flags.flagged {
@@ -253,12 +270,73 @@ impl Session {
         if flags.draft {
             imap_flags.push(F::Draft);
         }
-        self.inner
+        let appended = self
+            .inner
             .append(mailbox, raw)
             .flags(imap_flags)
             .finish()
-            .map(|_| ())
-            .map_err(imap_error)
+            .map_err(imap_error)?;
+        let validity = appended.uid_validity;
+        let uid = appended.uids.as_ref().and_then(|uids| {
+            uids.iter()
+                .map(|member| match member {
+                    imap_proto::UidSetMember::Uid(uid) => *uid,
+                    imap_proto::UidSetMember::UidRange(range) => *range.start(),
+                })
+                .next()
+        });
+        Ok(validity.zip(uid))
+    }
+
+    /// UIDs in the **selected** mailbox whose `Message-ID` header carries
+    /// `id` (without brackets).
+    ///
+    /// The caller selects first because every use pairs this with operations
+    /// on the same mailbox, and a hidden re-SELECT here would silently discard
+    /// the caller's context.
+    pub fn uids_by_message_id(&mut self, id: &str) -> Result<Vec<u32>> {
+        let mut uids: Vec<u32> = self
+            .inner
+            .uid_search(format!("HEADER Message-ID <{id}>"))
+            .map_err(imap_error)?
+            .into_iter()
+            .collect();
+        uids.sort_unstable();
+        Ok(uids)
+    }
+
+    /// SELECTs `mailbox` for callers outside the sync cycle — the drafts
+    /// mirror, which addresses a folder no cycle has selected for it.
+    pub fn select_mailbox(&mut self, mailbox: &str) -> Result<imap::types::Mailbox> {
+        self.select(mailbox)
+    }
+
+    /// CREATEs a mailbox. Already existing is left to the server to say —
+    /// RFC 3501 makes it a NO, and the caller decides whether that matters.
+    pub fn create_mailbox(&mut self, mailbox: &str) -> Result<()> {
+        self.inner.create(mailbox).map_err(imap_error)
+    }
+
+    /// RENAMEs a mailbox. RFC 3501 renames the subtree with it — children
+    /// move too, which is what a user dragging a folder expects.
+    pub fn rename_mailbox(&mut self, from: &str, to: &str) -> Result<()> {
+        // The selection cache would otherwise keep addressing the old name.
+        if self.selected.as_deref() == Some(from) {
+            self.selected = None;
+        }
+        self.inner.rename(from, to).map_err(imap_error)
+    }
+
+    /// DELETEs a mailbox — the folder itself, with every message in it.
+    ///
+    /// The caller confirms; this executes. Nothing here second-guesses,
+    /// because a guard that silently refuses is worse than a dialog that
+    /// asks.
+    pub fn delete_mailbox(&mut self, mailbox: &str) -> Result<()> {
+        if self.selected.as_deref() == Some(mailbox) {
+            self.selected = None;
+        }
+        self.inner.delete(mailbox).map_err(imap_error)
     }
 
     /// Does the server speak RFC 2177 IDLE?

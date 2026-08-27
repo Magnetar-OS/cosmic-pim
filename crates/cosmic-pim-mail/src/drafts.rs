@@ -54,6 +54,10 @@ const DIRECTORY: &str = ".drafts";
 
 const EXTENSION: &str = ".draft.json";
 
+/// A deleted-but-mirrored draft's tombstone: the file holds the `Message-ID`
+/// whose server copy still needs retiring.
+const RETRACT_EXTENSION: &str = ".retract";
+
 /// A saved draft: its id, and enough to list it without opening it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Saved {
@@ -85,20 +89,28 @@ impl Drafts {
     /// The blind-copy list is kept: this copy is the user's own, and losing the
     /// record of who they were blind-copying between one editing session and
     /// the next is the same data loss saving exists to prevent.
+    ///
+    /// The mirror linkage survives a save, and the save marks it dirty: the
+    /// server's copy is now behind this one, and the next mirror pass knows.
     pub fn save(&self, id: &str, draft: &Draft, now_ms: i64) -> Result<()> {
         if !is_valid_id(id) {
             return Err(Error::Draft(format!("{id} is not a draft id")));
         }
+        let mut mirror = self
+            .record(id)
+            .ok()
+            .flatten()
+            .map(|record| record.mirror)
+            .unwrap_or_default();
+        mirror.dirty = true;
         let record = Record {
             saved_ms: now_ms,
             draft: draft.clone(),
+            mirror,
         };
-        let json =
-            serde_json::to_string_pretty(&record).map_err(|why| Error::Draft(why.to_string()))?;
         // Through the substrate's writer, so a crash mid-save cannot leave a
         // truncated draft where a whole one was.
-        atomic::write(&self.path(id), &json, None)?;
-        Ok(())
+        self.write(id, &record)
     }
 
     /// Reads one draft back into an editable form.
@@ -162,8 +174,53 @@ impl Drafts {
     /// Removes a draft. Already gone is not an error — a draft is deleted when
     /// its message is sent, and a retried send must not fail on the second
     /// attempt.
+    ///
+    /// A draft that was mirrored leaves a **tombstone** naming its
+    /// `Message-ID`, so the server copy can be retired on the next pass even
+    /// when this delete happens offline. Without it, discarding a draft on a
+    /// train resurrects it on every other device.
     pub fn delete(&self, id: &str) -> Result<()> {
+        if let Ok(Some(record)) = self.record(id)
+            && let Some(message_id) = record.mirror.message_id
+        {
+            atomic::write(
+                &self.root.join(format!("{id}{RETRACT_EXTENSION}")),
+                &message_id,
+                None,
+            )?;
+        }
         match fs::remove_file(self.path(id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Mirrored drafts that were deleted locally and still need their server
+    /// copy retired: `(draft id, message id)`.
+    pub fn pending_retractions(&self) -> Vec<(String, String)> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut pending: Vec<(String, String)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let id = name.to_str()?.strip_suffix(RETRACT_EXTENSION)?.to_owned();
+                let message_id = fs::read_to_string(entry.path()).ok()?;
+                Some((id, message_id.trim().to_owned()))
+            })
+            .collect();
+        pending.sort();
+        pending
+    }
+
+    /// Drops a tombstone — its server copy is gone.
+    pub fn clear_retraction(&self, id: &str) -> Result<()> {
+        if !is_valid_id(id) {
+            return Ok(());
+        }
+        match fs::remove_file(self.root.join(format!("{id}{RETRACT_EXTENSION}"))) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
@@ -218,6 +275,122 @@ impl Drafts {
 struct Record {
     saved_ms: i64,
     draft: Draft,
+    /// Where (and whether) this draft is mirrored on the server. Defaulted on
+    /// read so records written before mirroring existed load unchanged.
+    #[serde(default)]
+    mirror: Mirror,
+}
+
+/// The server-side linkage of one draft.
+///
+/// The local record stays the authority — see the module documentation — and
+/// this is the receipt for its last upload: enough to *replace* the server
+/// copy rather than accumulate beside it, which is the entire difficulty of
+/// server-side drafts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Mirror {
+    /// The `Message-ID` (without brackets) the mirror is filed under. Minted
+    /// once per draft and stable across edits, so the old copy can always be
+    /// found by search — the replacement path for servers without UIDPLUS.
+    pub message_id: Option<String>,
+    /// Where the last upload landed, when the server said (UIDPLUS's
+    /// APPENDUID). A UID is only meaningful beside its UIDVALIDITY.
+    pub uid_validity: Option<u32>,
+    pub uid: Option<u32>,
+    /// The record has been edited since the server last saw it. Set by every
+    /// save, cleared by a successful upload — which is what makes mirroring
+    /// safe to retry from a poll: an upload that did not happen leaves this
+    /// standing.
+    pub dirty: bool,
+}
+
+impl Drafts {
+    /// The mirror linkage of one draft, if the draft exists.
+    pub fn mirror(&self, id: &str) -> Result<Option<Mirror>> {
+        Ok(self.record(id)?.map(|record| record.mirror))
+    }
+
+    /// The draft exactly as stored, identity included — what a mirror uploads.
+    ///
+    /// [`Self::load`] replaces the identity with the account's current one,
+    /// which is right for *editing*; an upload must write what was saved.
+    pub fn peek(&self, id: &str) -> Result<Option<Draft>> {
+        Ok(self.record(id)?.map(|record| record.draft))
+    }
+
+    /// Every draft the server has not seen the latest version of.
+    pub fn dirty(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|saved| {
+                self.record(&saved.id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.mirror.dirty)
+            })
+            .map(|saved| saved.id)
+            .collect())
+    }
+
+    /// Records a successful upload: the id it is filed under, and the UID the
+    /// server assigned when it said (`None` on servers without UIDPLUS).
+    pub fn mark_mirrored(
+        &self,
+        id: &str,
+        message_id: &str,
+        landed: Option<(u32, u32)>,
+    ) -> Result<()> {
+        let Some(mut record) = self.record(id)? else {
+            // The draft was deleted while its upload was in flight. Nothing to
+            // record — the retraction path handles the server copy.
+            return Ok(());
+        };
+        record.mirror.message_id = Some(message_id.to_owned());
+        record.mirror.uid_validity = landed.map(|(validity, _)| validity);
+        record.mirror.uid = landed.map(|(_, uid)| uid);
+        record.mirror.dirty = false;
+        self.write(id, &record)
+    }
+
+    /// Creates a local record for a draft that already lives on the server —
+    /// one written by another device, opened here for editing.
+    ///
+    /// Linked and clean: the server copy *is* the latest version until the
+    /// first local save marks it dirty.
+    pub fn adopt(
+        &self,
+        id: &str,
+        draft: &Draft,
+        message_id: &str,
+        uid_validity: u32,
+        uid: u32,
+        now_ms: i64,
+    ) -> Result<()> {
+        if !is_valid_id(id) {
+            return Err(Error::Draft(format!("{id} is not a draft id")));
+        }
+        self.write(
+            id,
+            &Record {
+                saved_ms: now_ms,
+                draft: draft.clone(),
+                mirror: Mirror {
+                    message_id: Some(message_id.to_owned()),
+                    uid_validity: Some(uid_validity),
+                    uid: Some(uid),
+                    dirty: false,
+                },
+            },
+        )
+    }
+
+    fn write(&self, id: &str, record: &Record) -> Result<()> {
+        let json =
+            serde_json::to_string_pretty(record).map_err(|why| Error::Draft(why.to_string()))?;
+        atomic::write(&self.path(id), &json, None)?;
+        Ok(())
+    }
 }
 
 /// A fresh draft id.
@@ -448,6 +621,140 @@ mod tests {
         for bad in ["", "../../etc/passwd", "a/b", "..", "not-hex!"] {
             assert!(!is_valid_id(bad), "{bad} was accepted");
         }
+    }
+
+    #[test]
+    fn a_save_marks_the_mirror_dirty_and_an_upload_cleans_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(7);
+
+        drafts.save(&id, &draft(), 7).unwrap();
+        assert_eq!(drafts.dirty().unwrap(), vec![id.clone()]);
+
+        drafts
+            .mark_mirrored(&id, "abc@example.com", Some((41, 9)))
+            .unwrap();
+        assert!(drafts.dirty().unwrap().is_empty());
+        let mirror = drafts.mirror(&id).unwrap().unwrap();
+        assert_eq!(mirror.message_id.as_deref(), Some("abc@example.com"));
+        assert_eq!(mirror.uid, Some(9));
+        assert_eq!(mirror.uid_validity, Some(41));
+    }
+
+    #[test]
+    fn an_edit_after_an_upload_keeps_the_linkage_and_goes_dirty_again() {
+        // The linkage is what lets the next upload *replace* the server copy
+        // rather than accumulate beside it. Losing it on save would recreate
+        // the duplication problem mirroring exists to solve.
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(8);
+        drafts.save(&id, &draft(), 8).unwrap();
+        drafts
+            .mark_mirrored(&id, "abc@example.com", Some((41, 9)))
+            .unwrap();
+
+        let mut edited = draft();
+        edited.body = "more".into();
+        drafts.save(&id, &edited, 9).unwrap();
+
+        let mirror = drafts.mirror(&id).unwrap().unwrap();
+        assert!(mirror.dirty, "the server copy is behind and nothing knows");
+        assert_eq!(mirror.message_id.as_deref(), Some("abc@example.com"));
+        assert_eq!(mirror.uid, Some(9));
+    }
+
+    #[test]
+    fn a_record_written_before_mirroring_existed_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(9);
+        // The pre-mirror shape, byte for byte: no `mirror` key at all.
+        let old = serde_json::json!({
+            "saved_ms": 5,
+            "draft": Draft::new(me()),
+        });
+        std::fs::write(
+            dir.path().join(DIRECTORY).join(format!("{id}{EXTENSION}")),
+            serde_json::to_string(&old).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = drafts.load(&id, me()).unwrap();
+        assert!(loaded.is_some(), "an old record failed to load");
+        let mirror = drafts.mirror(&id).unwrap().unwrap();
+        assert_eq!(mirror, Mirror::default());
+    }
+
+    #[test]
+    fn an_adopted_server_draft_is_linked_and_clean() {
+        // A draft another device wrote, opened here: the server copy is the
+        // latest version until the first local edit.
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(10);
+        drafts
+            .adopt(&id, &draft(), "other@example.com", 41, 12, 10)
+            .unwrap();
+
+        assert!(drafts.dirty().unwrap().is_empty());
+        let mirror = drafts.mirror(&id).unwrap().unwrap();
+        assert_eq!(mirror.uid, Some(12));
+        assert!(drafts.load(&id, me()).unwrap().is_some());
+    }
+
+    #[test]
+    fn marking_a_deleted_draft_mirrored_is_not_an_error() {
+        // The draft was discarded while its upload was in flight.
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        drafts
+            .mark_mirrored(&new_id(11), "gone@example.com", None)
+            .unwrap();
+        assert_eq!(drafts.count(), 0, "a ghost record was created");
+    }
+
+    #[test]
+    fn deleting_a_mirrored_draft_leaves_a_tombstone_for_the_server_copy() {
+        // Discarding on a train: the local record goes now, the server copy
+        // goes when there is a server again. Without the tombstone the mirror
+        // would resurrect on every other device.
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(12);
+        drafts.save(&id, &draft(), 12).unwrap();
+        drafts
+            .mark_mirrored(&id, "m12@example.com", Some((41, 3)))
+            .unwrap();
+
+        drafts.delete(&id).unwrap();
+
+        assert_eq!(
+            drafts.pending_retractions(),
+            vec![(id.clone(), "m12@example.com".to_owned())]
+        );
+        assert_eq!(drafts.count(), 0, "the tombstone was counted as a draft");
+        assert!(drafts.list().unwrap().is_empty());
+
+        drafts.clear_retraction(&id).unwrap();
+        assert!(drafts.pending_retractions().is_empty());
+        drafts
+            .clear_retraction(&id)
+            .expect("clearing twice must not fail");
+    }
+
+    #[test]
+    fn deleting_a_never_mirrored_draft_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(13);
+        drafts.save(&id, &draft(), 13).unwrap();
+        drafts.delete(&id).unwrap();
+        assert!(
+            drafts.pending_retractions().is_empty(),
+            "a draft the server never saw got a tombstone"
+        );
     }
 
     #[test]

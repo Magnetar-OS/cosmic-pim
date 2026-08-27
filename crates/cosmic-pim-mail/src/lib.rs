@@ -78,6 +78,7 @@ pub mod attachment;
 pub mod auth;
 pub mod compose;
 pub mod discovery;
+pub mod draft_sync;
 pub mod drafts;
 pub mod error;
 pub mod folder;

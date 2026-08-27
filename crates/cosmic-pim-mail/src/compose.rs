@@ -322,6 +322,188 @@ impl Draft {
     }
 }
 
+impl Draft {
+    /// The RFC 5322 bytes of this draft's **server mirror** — the copy filed
+    /// into the account's Drafts folder so other devices can see it.
+    ///
+    /// Not [`Self::build`], deliberately. A draft is unfinished: it routinely
+    /// has no recipients and often an address somebody stopped halfway through
+    /// typing, and `lettre` refuses both — correctly, for a message that is to
+    /// be *sent*. A mirror is not sent, so this builder writes what it can and
+    /// leaves out what no message format can carry: an unparseable address
+    /// stays in the local record only, and the record remains the authority
+    /// this device edits. Best-effort by design, exact by construction for
+    /// everything it does write.
+    ///
+    /// `message_id` (without brackets) is the join key that makes replacement
+    /// work on servers without UIDPLUS: the same draft always mirrors under
+    /// the same id, so the old copy can be found and retired by search.
+    #[must_use]
+    pub fn mirror_bytes(&self, message_id: &str, date_ms: i64) -> Vec<u8> {
+        let mut head = String::new();
+        head.push_str(&format!("Message-ID: <{message_id}>\r\n"));
+        if let Some(date) = chrono::DateTime::from_timestamp_millis(date_ms) {
+            head.push_str(&format!("Date: {}\r\n", date.to_rfc2822()));
+        }
+        if looks_like_an_address(&self.from.address) {
+            head.push_str(&format!("From: {}\r\n", header_mailbox(&self.from)));
+        }
+        for (name, list) in [("To", &self.to), ("Cc", &self.cc)] {
+            let sendable: Vec<String> = list
+                .iter()
+                .filter(|m| looks_like_an_address(&m.address))
+                .map(header_mailbox)
+                .collect();
+            if !sendable.is_empty() {
+                head.push_str(&format!("{name}: {}\r\n", sendable.join(",\r\n ")));
+            }
+        }
+        // No `Bcc`, ever — a mirror lives on a server, and the blind-copy list
+        // is exactly the part of a draft that must not. It stays in the local
+        // record, same as a half-typed address.
+        head.push_str(&format!("Subject: {}\r\n", header_text(&self.subject)));
+        if let Some(parent) = &self.in_reply_to {
+            head.push_str(&format!("In-Reply-To: <{parent}>\r\n"));
+        }
+        if !self.references.is_empty() {
+            let refs: Vec<String> = self.references.iter().map(|id| format!("<{id}>")).collect();
+            head.push_str(&format!("References: {}\r\n", refs.join("\r\n ")));
+        }
+        head.push_str("MIME-Version: 1.0\r\n");
+
+        // Base64 for every body: it cannot trip over bare newlines, long
+        // lines, or a charset the server second-guesses, and a mirror is read
+        // by parsers, not by people paging through raw spools.
+        let text_part = format!(
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}",
+            base64_wrapped(self.body.as_bytes())
+        );
+
+        let mut out = head;
+        if self.attachments.is_empty() {
+            out.push_str(&text_part);
+        } else {
+            // The boundary derives from the message id — hex and a domain —
+            // so it cannot collide with base64 payload text.
+            let boundary = format!("=_mirror_{}", message_id.replace(['@', '.'], "_"));
+            out.push_str(&format!(
+                "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
+            ));
+            out.push_str(&format!("--{boundary}\r\n{text_part}\r\n"));
+            for attachment in &self.attachments {
+                out.push_str(&format!(
+                    "--{boundary}\r\nContent-Type: {}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+                    attachment.mime_type,
+                    header_text(&attachment.name),
+                    base64_wrapped(&attachment.bytes)
+                ));
+            }
+            out.push_str(&format!("--{boundary}--\r\n"));
+        }
+        out.into_bytes()
+    }
+
+    /// Reads a mirrored draft — this device's or another's — back into an
+    /// editable form.
+    ///
+    /// `raw` is the message's own bytes, needed to recover attachment
+    /// contents. `from` replaces the stored identity for the same reason
+    /// [`crate::drafts::Drafts::load`] replaces it: the current one is the
+    /// address it would actually go out as.
+    #[must_use]
+    pub fn from_mirror(message: &Message, raw: &[u8], from: Mailbox) -> Self {
+        let attachments = message
+            .attachments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, listed)| {
+                Some(Attachment {
+                    name: listed.name.clone(),
+                    mime_type: listed.mime_type.clone(),
+                    bytes: crate::attachment::bytes_of(raw, index).ok()?,
+                })
+            })
+            .collect();
+        Self {
+            from,
+            to: message.to.clone(),
+            cc: message.cc.clone(),
+            // A parsed Bcc is honoured if one is somehow present, but the
+            // mirror builder never writes one — see above.
+            bcc: message.bcc.clone(),
+            subject: message.subject.clone(),
+            body: message.body.text.clone(),
+            in_reply_to: crate::threading::parse_references(&message.in_reply_to)
+                .into_iter()
+                .next(),
+            references: crate::threading::parse_references(&message.references),
+            attachments,
+        }
+    }
+}
+
+/// `"Name" <address>`, with the display name RFC 2047-encoded when it needs
+/// to be.
+fn header_mailbox(mailbox: &Mailbox) -> String {
+    match mailbox.name.as_deref().filter(|n| !n.trim().is_empty()) {
+        Some(name) => format!("{} <{}>", header_text(name), mailbox.address),
+        None => mailbox.address.clone(),
+    }
+}
+
+/// Header text, RFC 2047 B-encoded when it is not printable ASCII.
+///
+/// Encoded words are capped at 75 characters, so long text is split into a
+/// sequence of words joined by folding whitespace — which decoders collapse
+/// to nothing between adjacent encoded words. The split walks characters, so
+/// a multi-byte sequence is never cut in the middle.
+fn header_text(text: &str) -> String {
+    use base64::Engine as _;
+    let plain = text
+        .chars()
+        .all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\');
+    if plain {
+        return text.to_owned();
+    }
+    // 45 input bytes encode to 60 base64 chars; with the =?UTF-8?B?…?= frame
+    // that is comfortably under the 75-character cap.
+    const CHUNK_BYTES: usize = 45;
+    let mut words = Vec::new();
+    let mut chunk = String::new();
+    for c in text.chars() {
+        if chunk.len() + c.len_utf8() > CHUNK_BYTES {
+            words.push(chunk.clone());
+            chunk.clear();
+        }
+        chunk.push(c);
+    }
+    if !chunk.is_empty() {
+        words.push(chunk);
+    }
+    words
+        .iter()
+        .map(|w| {
+            format!(
+                "=?UTF-8?B?{}?=",
+                base64::engine::general_purpose::STANDARD.encode(w.as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n ")
+}
+
+/// Base64, folded at the 76 columns RFC 2045 asks for.
+fn base64_wrapped(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    encoded
+        .as_bytes()
+        .chunks(76)
+        .map(|line| std::str::from_utf8(line).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
 fn mailbox(from: &Mailbox) -> Result<LettreMailbox> {
     let address = from
         .address
@@ -752,6 +934,109 @@ mod tests {
         draft.to[0].address = "ada@example.com".into();
         assert!(draft.problem().is_none());
         assert!(draft.build(false).is_ok());
+    }
+
+    #[test]
+    fn a_mirror_round_trips_through_a_parser_as_what_was_typed() {
+        let mut draft = Draft::new(me());
+        draft.to.push(Mailbox {
+            name: Some("Ada".into()),
+            address: "ada@example.com".into(),
+        });
+        draft.cc.push(Mailbox {
+            name: None,
+            address: "bob@example.net".into(),
+        });
+        draft.subject = "Half-written plan".into();
+        draft.body = "This is as far as I got.\n\nSecond paragraph.".into();
+        draft.in_reply_to = Some("parent@x".into());
+        draft.references = vec!["root@x".into(), "parent@x".into()];
+
+        let raw = draft.mirror_bytes("abc123@example.com", 1_700_000_000_000);
+        let parsed = Message::parse(&raw).expect("the mirror must parse");
+        assert_eq!(parsed.message_id.as_deref(), Some("abc123@example.com"));
+
+        let back = Draft::from_mirror(&parsed, &raw, me());
+        assert_eq!(back.subject, "Half-written plan");
+        assert_eq!(back.body.trim(), draft.body.trim());
+        assert_eq!(back.to[0].address, "ada@example.com");
+        assert_eq!(back.to[0].name.as_deref(), Some("Ada"));
+        assert_eq!(back.cc[0].address, "bob@example.net");
+        assert_eq!(back.in_reply_to.as_deref(), Some("parent@x"));
+        assert_eq!(back.references, vec!["root@x", "parent@x"]);
+    }
+
+    #[test]
+    fn a_mirror_of_an_unfinished_draft_still_builds() {
+        // The case lettre refuses and the mirror exists for: no recipients,
+        // and an address somebody stopped halfway through typing.
+        let mut draft = Draft::new(me());
+        draft.to.push(Mailbox {
+            name: None,
+            address: "ada@exam".into(),
+        });
+        draft.subject = "Thinking".into();
+        draft.body = "…".into();
+
+        let raw = draft.mirror_bytes("id1@example.com", 0);
+        let parsed = Message::parse(&raw).expect("an unfinished draft must still mirror");
+        assert_eq!(parsed.subject, "Thinking");
+        assert!(
+            parsed.to.is_empty(),
+            "a half-typed address leaked into the wire headers"
+        );
+    }
+
+    #[test]
+    fn a_mirror_never_carries_the_blind_copy_list() {
+        let mut draft = Draft::new(me());
+        draft.bcc.push(Mailbox {
+            name: None,
+            address: "secret@example.org".into(),
+        });
+        draft.subject = "x".into();
+        let raw = draft.mirror_bytes("id2@example.com", 0);
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("secret@example.org"),
+            "the blind-copy list reached a server-side copy"
+        );
+    }
+
+    #[test]
+    fn a_mirror_with_a_non_ascii_subject_and_name_survives_the_round_trip() {
+        let mut draft = Draft::new(me());
+        draft.to.push(Mailbox {
+            name: Some("Δομήνικος".into()),
+            address: "d@example.gr".into(),
+        });
+        draft.subject = "Σχέδιο — ταξίδι στην Κρήτη, μια πολύ μεγάλη γραμμή θέματος που συνεχίζει".into();
+        draft.body = "Καλημέρα.".into();
+
+        let raw = draft.mirror_bytes("id3@example.com", 0);
+        let parsed = Message::parse(&raw).expect("parse");
+        assert_eq!(parsed.subject, draft.subject);
+        assert_eq!(parsed.to[0].name.as_deref(), Some("Δομήνικος"));
+        assert_eq!(parsed.body.text.trim(), "Καλημέρα.");
+    }
+
+    #[test]
+    fn a_mirrored_attachment_comes_back_byte_for_byte() {
+        let mut draft = Draft::new(me());
+        draft.subject = "with file".into();
+        draft.body = "see attached".into();
+        draft.attachments.push(Attachment {
+            name: "report.csv".into(),
+            mime_type: "text/csv".into(),
+            bytes: b"a,b\n1,2\n".to_vec(),
+        });
+
+        let raw = draft.mirror_bytes("id4@example.com", 0);
+        let parsed = Message::parse(&raw).expect("parse");
+        let back = Draft::from_mirror(&parsed, &raw, me());
+        assert_eq!(back.attachments.len(), 1);
+        assert_eq!(back.attachments[0].name, "report.csv");
+        assert_eq!(back.attachments[0].bytes, b"a,b\n1,2\n");
+        assert!(back.body.contains("see attached"));
     }
 
     #[test]
