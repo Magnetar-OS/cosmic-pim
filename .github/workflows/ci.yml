@@ -104,3 +104,40 @@ jobs:
           COSMIC_PIM_LIVE_CALDAV_USER: ${{ matrix.user }}
           COSMIC_PIM_LIVE_CALDAV_PASS: ${{ matrix.pass }}
         run: cargo test -p cosmic-pim-caldav --test live_server -- --ignored
+
+  # The IMAP half of the same argument: the real client against a stock
+  # Dovecot, not our own canned responses. Its first local run found two real
+  # bugs (CONDSTORE advertised-but-never-enabled; the mass-delete guard
+  # wedging a genuine 1→0), which settles whether the job earns its minutes.
+  # The tests skip silently without PIM_TEST_IMAP, so this job is the only
+  # place they actually gate anything. Exchange, Gmail-IMAP, and the rest of
+  # the zoo need real credentials and stay out of shared CI; the quirks table
+  # records what each run of those finds.
+  live-imap:
+    name: live IMAP (dovecot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Dovecot
+        run: |
+          docker run -d --name pim-dovecot -p 14143:31143 \
+            -e USER_PASSWORD=hunter2 \
+            -v "$PWD/crates/cosmic-pim-mail/tests/dovecot.conf:/etc/dovecot/dovecot.conf:ro" \
+            dovecot/dovecot:latest
+          for _ in $(seq 1 100); do
+            (exec 3<>/dev/tcp/127.0.0.1/14143) 2>/dev/null && exec 3>&- && break
+            sleep 0.2
+          done
+
+      - name: Live round trip, IDLE, QRESYNC
+        env:
+          PIM_TEST_IMAP: 127.0.0.1:14143:tester:hunter2
+        run: cargo test -p cosmic-pim-mail --test live_dovecot -- --nocapture
+
+      - name: Server log on failure
+        if: failure()
+        run: docker logs pim-dovecot | tail -100
