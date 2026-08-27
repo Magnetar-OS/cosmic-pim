@@ -197,7 +197,7 @@ MPL-2.0. The applications are GPL-3.0-only and *link* these crates without
 absorbing them. [LICENSING.md](LICENSING.md) explains why that split exists, why
 not MIT and not LGPL, and the one trap (MPL Exhibit B) that would break it.
 
-**Not publishable yet.** The iCalendar and CalDAV layers derive from the
-[Meltemi](https://github.com/entro314-labs/meltemi) project, which carries no
-licence declaration at all. That has to be resolved before anything here is
-published to crates.io or offered upstream. Details in LICENSING.md.
+The iCalendar, CalDAV, and mail layers derive from the
+[Meltemi](https://github.com/entro314-labs/meltemi) project, which now grants
+MPL-2.0 on the donor files explicitly — publishing here is no longer
+licence-blocked. Details in LICENSING.md.

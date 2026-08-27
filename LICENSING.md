@@ -75,9 +75,20 @@ derivative under MPL-2.0, **provided the original copyright and permission
 notice are retained**. That notice lives in `NOTICE` at the repository root and
 in the module header of `atomic.rs`. Do not remove either.
 
-### Meltemi — no licence at all, blocking
+### Meltemi — resolved
 
-`meltemi` has **no LICENSE file and no `license` field** in
+**The declaration exists.** `meltemi` commit `5c14069` (2026-08-27) adds a
+`LICENSING.md` granting MPL-2.0 (Exhibit A only) on the donor files —
+`caldav.rs`, `secrets.rs`, `mail_sync.rs`, `threading.rs`, `model_text.rs`,
+`auth_results.rs` — each carrying an SPDX header, with this repository's
+derivatives named. The repository as a whole stays all-rights-reserved on
+purpose; the grant is per-file, which is exactly MPL's boundary. Every line
+is single-author (verified from `git log`), so no third-party agreement was
+needed. **Publishing the substrate is no longer licence-blocked.**
+
+The history of the problem, kept for context:
+
+`meltemi` had no LICENSE file and no `license` field in
 `src-tauri/Cargo.toml`. Under default copyright that means all rights reserved.
 Because we hold the copyright, we may license it however we choose — but "we
 own it" is not the same as "it is licensed", and the distinction matters the
@@ -98,20 +109,17 @@ So the blocker covers **`cosmic-pim-core`, `cosmic-pim-caldav`, and
 `cosmic-pim-accounts`** — which in practice means the whole substrate, since
 `cosmic-pim-sync` depends on all three.
 
-**Required before any of this is published or upstreamed:**
+What was required, and is now done:
 
-1. Add `LICENSE` + `license =` to the `meltemi` repository, declaring the licence
-   its code is offered under.
-2. Record that the lifted layers are additionally offered under MPL-2.0, so this
-   repository's copy has a stated provenance rather than an implicit one.
+1. ~~Add a licence declaration to the `meltemi` repository~~ — done, as a
+   per-file MPL-2.0 grant rather than a whole-repo LICENSE, because Meltemi's
+   overall licence is a product decision that grant deliberately does not take.
+2. ~~Record that the lifted layers are additionally offered under MPL-2.0~~ —
+   done, in `meltemi/LICENSING.md`, derivatives named.
 
-Until (1) and (2) are done, treat the whole substrate as internal-only: building,
-testing, and consuming it from our own applications by git dependency is fine;
-publishing to crates.io or offering it upstream to `cosmic-utils` is not.
-
-This does **not** block the applications. Slate, Circle, and Envelope are GPL-3
-and distributed by us, and we hold the copyright on the borrowed code — the
-problem is a missing declaration, not a missing right.
+Future ports from Meltemi must extend the grant table there and add the SPDX
+header to the donor file in the same commit — the unlicensed-provenance pile
+must not restart.
 
 ## Contributing back to cosmic-utils
 
