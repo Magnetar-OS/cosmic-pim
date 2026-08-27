@@ -74,18 +74,21 @@ pub struct CollectionState {
 /// [`crate::VdirStore::resolve_conflict_take_remote`] or
 /// [`crate::VdirStore::resolve_conflict_keep_local`].
 ///
-/// # No base copy
+/// # The base copy
 ///
-/// A three-way merge wants the *last synced* bytes as well, and this record
-/// deliberately does not carry them: reconstructing them would mean keeping a
-/// second copy of every item in the collection (the sidecar holds etags, not
-/// payloads), and the bytes are already gone by the time a local edit is
-/// queued — the application writes the file first and queues afterwards. So an
-/// application can offer "keep mine", "take theirs", or a hand-merge of two
-/// texts, but not an automatic merge of non-overlapping properties. Supplying a
-/// base would mean either retaining last-synced copies for pending items or
-/// passing the pre-edit bytes in at save time; both are a design change, not an
-/// implementation detail, and neither is pretended at here.
+/// A three-way merge wants the *last synced* bytes as well — the text both
+/// edits started from. They are captured at save time: the application hands
+/// the pre-edit file contents to the writeback queue, which keeps them on the
+/// pending entry from the **first** enqueue (a second edit before the push
+/// drains keeps the original base — it is still the last text the server
+/// acknowledged). The cost is one payload per *pending* item, not per item.
+///
+/// With a base present, the sync cycle attempts an automatic three-way merge
+/// (`cosmic_pim_core::merge::merge3`) before recording anything: edits to
+/// different properties combine, and only a genuine overlap reaches the user.
+/// `base` is `None` for an edit queued through a caller that did not supply
+/// the pre-edit bytes; such a conflict skips the merge and is recorded as
+/// before.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Conflict {
     pub href: String,
@@ -96,6 +99,27 @@ pub struct Conflict {
     /// The etag of [`Conflict::remote`], which is also what a subsequent
     /// `If-Match` must carry for a resolution to be accepted.
     pub remote_etag: String,
+    /// The last-synced bytes both sides diverged from, when the writeback
+    /// queue captured them. What a conflict UI's per-property view diffs
+    /// against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+}
+
+/// What the mass-delete guard saw: the server listed **nothing** while we hold
+/// events, under this ctag.
+///
+/// One empty listing is far more often a server-side hiccup than a genuine
+/// everything-was-deleted, so the first sighting only skips deletions and
+/// records this. A later cycle that sees the *same* ctag with the same empty
+/// listing confirms the emptying is real — the server has been in that state
+/// across two independent reads — and the deletions are applied. A different
+/// ctag re-arms the sighting; a non-empty listing clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EmptySighting {
+    /// The collection ctag at the time. `None` on servers that publish none —
+    /// there, any second consecutive empty listing confirms.
+    pub ctag: Option<String>,
 }
 
 pub trait CalDavStore {
@@ -140,6 +164,45 @@ pub trait CalDavStore {
     /// divergence forever: the resource is not "unseen", it is "seen and
     /// disputed", and the etag is exactly what a resolution's `If-Match` needs.
     fn record_conflict(&mut self, conflict: &Conflict) -> Result<()>;
+
+    /// The last-synced bytes behind an unsent local change, if the queue
+    /// captured them at save time. `None` disables the automatic merge for
+    /// that resource and nothing else.
+    fn unpushed_base(&self, _href: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Applies an automatic three-way merge: `merged` becomes the local copy,
+    /// `remote.etag` is recorded as current, and the merged text is re-queued
+    /// for upload so the server converges on it too. The re-queued entry's
+    /// base is `remote.ics` — the server's current revision is the last text
+    /// it acknowledged, which is what any *further* divergence merges against.
+    ///
+    /// The default refuses — a store that cannot re-queue must not pretend the
+    /// merge was applied, or the local half of it never reaches the server.
+    fn apply_merged(&mut self, _merged: &str, _remote: &RemoteEvent) -> Result<()> {
+        Err(crate::error::Error::internal(
+            "this store cannot apply an automatic merge",
+        ))
+    }
+
+    /// The recorded first sighting of an empty listing, if one is pending
+    /// confirmation. See [`EmptySighting`].
+    fn empty_sighting(&self) -> Result<Option<EmptySighting>> {
+        Ok(None)
+    }
+
+    /// Records the first sighting. The default forgets it, which degrades to
+    /// the old behaviour: deletions are skipped on every empty listing.
+    fn record_empty_sighting(&mut self, _ctag: Option<&str>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clears a recorded sighting — called whenever a listing is non-empty,
+    /// or once a confirmed emptying has been applied.
+    fn clear_empty_sighting(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// An in-memory [`CalDavStore`] for tests.
@@ -149,7 +212,10 @@ pub struct MemoryStore {
     pub events: HashMap<String, RemoteEvent>,
     /// Stands in for a writeback queue: hrefs mapped to unsent local bytes.
     pub unpushed: HashMap<String, String>,
+    /// The last-synced bytes behind each unsent change, where captured.
+    pub bases: HashMap<String, String>,
     pub conflicts: Vec<Conflict>,
+    pub sighting: Option<EmptySighting>,
 }
 
 impl CalDavStore for MemoryStore {
@@ -190,6 +256,43 @@ impl CalDavStore for MemoryStore {
         }
         self.conflicts.retain(|c| c.href != conflict.href);
         self.conflicts.push(conflict.clone());
+        Ok(())
+    }
+
+    fn unpushed_base(&self, href: &str) -> Result<Option<String>> {
+        Ok(self.bases.get(href).cloned())
+    }
+
+    fn apply_merged(&mut self, merged: &str, remote: &RemoteEvent) -> Result<()> {
+        self.events.insert(
+            remote.href.clone(),
+            RemoteEvent {
+                href: remote.href.clone(),
+                etag: remote.etag.clone(),
+                ics: merged.to_owned(),
+            },
+        );
+        // The merged text is the new unsent change: the server has only its
+        // own half of it until the queue drains. Its base is the server's
+        // revision — the last text the server acknowledged.
+        self.unpushed.insert(remote.href.clone(), merged.to_owned());
+        self.bases.insert(remote.href.clone(), remote.ics.clone());
+        Ok(())
+    }
+
+    fn empty_sighting(&self) -> Result<Option<EmptySighting>> {
+        Ok(self.sighting.clone())
+    }
+
+    fn record_empty_sighting(&mut self, ctag: Option<&str>) -> Result<()> {
+        self.sighting = Some(EmptySighting {
+            ctag: ctag.map(ToOwned::to_owned),
+        });
+        Ok(())
+    }
+
+    fn clear_empty_sighting(&mut self) -> Result<()> {
+        self.sighting = None;
         Ok(())
     }
 }

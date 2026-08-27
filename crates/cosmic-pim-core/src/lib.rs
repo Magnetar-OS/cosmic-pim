@@ -22,6 +22,7 @@
 
 pub mod atomic;
 pub mod ical;
+pub mod merge;
 pub mod model;
 pub mod patch;
 pub mod store;

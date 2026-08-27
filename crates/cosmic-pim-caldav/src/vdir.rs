@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::dav::Flavor;
 use crate::error::{Error, Result};
 use crate::push::{PendingPush, PushOp, PushQueue};
-use crate::store::{CalDavStore, CollectionState, Conflict, RemoteEvent};
+use crate::store::{CalDavStore, CollectionState, Conflict, EmptySighting, RemoteEvent};
 
 const STATE_FILE: &str = ".caldav-state.json";
 
@@ -154,6 +154,10 @@ struct SidecarState {
     /// payload would. See [`crate::store::Conflict`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     conflicts: Vec<Conflict>,
+    /// The mass-delete guard's pending confirmation, if an empty listing has
+    /// been seen once. See [`crate::store::EmptySighting`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    empty_sighting: Option<EmptySighting>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,13 +333,43 @@ impl VdirStore {
     /// Queues a local edit for writeback, allocating the file name an href will
     /// use if it does not have one yet.
     pub fn queue_put(&mut self, href: &str) -> Result<()> {
+        self.queue_put_with_base(href, None)
+    }
+
+    /// [`Self::queue_put`], with the pre-edit file contents the caller read
+    /// before saving.
+    ///
+    /// `base` sticks from the **first** enqueue: a second edit before the push
+    /// drains replaces the operation but keeps the original base, because that
+    /// is still the last text the server acknowledged — the correct third
+    /// point for a three-way merge if the server turns out to have changed the
+    /// same resource meanwhile. Passing `None` never clears a captured base.
+    pub fn queue_put_with_base(&mut self, href: &str, base: Option<&str>) -> Result<()> {
         let file = self.file_name_for(href);
         let etag = self.state.entries.get(href).map(|e| e.etag.clone());
+        let already_pending = self
+            .state
+            .pending
+            .iter()
+            .any(|entry| entry.op.href() == href);
         self.enqueue(PushOp::Put {
             href: href.to_owned(),
             file,
             etag,
-        })
+        })?;
+        if let Some(base) = base
+            && !already_pending
+            && let Some(entry) = self
+                .state
+                .pending
+                .iter_mut()
+                .find(|entry| entry.op.href() == href)
+            && entry.base.is_none()
+        {
+            entry.base = Some(base.to_owned());
+            self.save_sidecar()?;
+        }
+        Ok(())
     }
 
     /// Queues a server-side delete, capturing the coordinates before the local
@@ -676,6 +710,59 @@ impl CalDavStore for VdirStore {
         self.state.conflicts.push(conflict.clone());
         self.save_sidecar()
     }
+
+    fn unpushed_base(&self, href: &str) -> Result<Option<String>> {
+        Ok(self
+            .state
+            .pending
+            .iter()
+            .find(|entry| matches!(&entry.op, PushOp::Put { href: h, .. } if h == href))
+            .and_then(|entry| entry.base.clone()))
+    }
+
+    /// Writes the merged text as the local copy, adopts the server's etag, and
+    /// re-queues the push so the server converges on the merge too.
+    ///
+    /// The re-queued entry's base is the server's revision — the last text the
+    /// server acknowledged, which is what any *further* divergence would need
+    /// to merge against. Set explicitly, because the old entry (whose base
+    /// predates both edits) is dropped rather than extended: first-enqueue-wins
+    /// must not preserve a base from before a merge that already consumed it.
+    fn apply_merged(&mut self, merged: &str, remote: &RemoteEvent) -> Result<()> {
+        let file = self.file_name_for(&remote.href);
+        let target = self.meta.path.join(&file);
+        atomic::write(&target, merged, None)
+            .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
+        self.state.entries.insert(
+            remote.href.clone(),
+            SidecarEntry {
+                file,
+                etag: remote.etag.clone(),
+            },
+        );
+        self.state
+            .pending
+            .retain(|entry| entry.op.href() != remote.href);
+        self.queue_put_with_base(&remote.href, Some(&remote.ics))
+    }
+
+    fn empty_sighting(&self) -> Result<Option<EmptySighting>> {
+        Ok(self.state.empty_sighting.clone())
+    }
+
+    fn record_empty_sighting(&mut self, ctag: Option<&str>) -> Result<()> {
+        self.state.empty_sighting = Some(EmptySighting {
+            ctag: ctag.map(ToOwned::to_owned),
+        });
+        self.save_sidecar()
+    }
+
+    fn clear_empty_sighting(&mut self) -> Result<()> {
+        if self.state.empty_sighting.take().is_some() {
+            self.save_sidecar()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -899,6 +986,7 @@ impl PushQueue for VdirStore {
                 next_attempt_ms: 0,
                 last_error: None,
                 blocked: false,
+                base: None,
             });
         }
         self.save_sidecar()
@@ -1179,6 +1267,7 @@ mod conflict_tests {
                 local,
                 remote: SERVER_V2.into(),
                 remote_etag: "\"v2\"".into(),
+                base: None,
             })
             .unwrap();
     }
@@ -1340,6 +1429,162 @@ mod conflict_tests {
             .unwrap();
 
         assert!(store.pending().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod base_capture_tests {
+    use super::*;
+    use cosmic_pim_core::model::Rgb;
+    use cosmic_pim_core::store::vdir;
+
+    const HREF: &str = "/cal/a.ics";
+    const V1: &str = "BEGIN:VCALENDAR\r\nX-V:1\r\nEND:VCALENDAR\r\n";
+    const EDIT_1: &str = "BEGIN:VCALENDAR\r\nX-V:1-mine\r\nEND:VCALENDAR\r\n";
+    const EDIT_2: &str = "BEGIN:VCALENDAR\r\nX-V:2-mine\r\nEND:VCALENDAR\r\n";
+
+    fn synced() -> (tempfile::TempDir, VdirStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        let mut store = VdirStore::open(meta).unwrap();
+        store.set_remote("/cal/", false).unwrap();
+        store
+            .upsert(&RemoteEvent {
+                href: HREF.into(),
+                etag: "\"v1\"".into(),
+                ics: V1.into(),
+            })
+            .unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn the_first_enqueue_captures_the_base_durably() {
+        let (dir, mut store) = synced();
+        store.queue_put_with_base(HREF, Some(V1)).unwrap();
+
+        assert_eq!(store.unpushed_base(HREF).unwrap().as_deref(), Some(V1));
+
+        // Durable: the base has to survive the process, exactly like the edit.
+        let meta = vdir::collections(dir.path()).remove(0);
+        let reopened = VdirStore::open(meta).unwrap();
+        assert_eq!(reopened.unpushed_base(HREF).unwrap().as_deref(), Some(V1));
+    }
+
+    #[test]
+    fn a_second_edit_keeps_the_first_edits_base() {
+        // The server still holds V1; a merge after the second edit must diff
+        // against V1, not against the first edit.
+        let (_dir, mut store) = synced();
+        std::fs::write(store.collection().path.join("a.ics"), EDIT_1).unwrap();
+        store.queue_put_with_base(HREF, Some(V1)).unwrap();
+
+        std::fs::write(store.collection().path.join("a.ics"), EDIT_2).unwrap();
+        store.queue_put_with_base(HREF, Some(EDIT_1)).unwrap();
+
+        assert_eq!(
+            store.unpushed_base(HREF).unwrap().as_deref(),
+            Some(V1),
+            "the base moved with the second edit; a merge would diff against the wrong text"
+        );
+    }
+
+    #[test]
+    fn a_baseless_enqueue_never_clears_a_captured_base() {
+        let (_dir, mut store) = synced();
+        store.queue_put_with_base(HREF, Some(V1)).unwrap();
+        store.queue_put(HREF).unwrap();
+
+        assert_eq!(store.unpushed_base(HREF).unwrap().as_deref(), Some(V1));
+    }
+
+    #[test]
+    fn the_base_goes_with_the_entry_when_the_push_succeeds() {
+        let (_dir, mut store) = synced();
+        store.queue_put_with_base(HREF, Some(V1)).unwrap();
+        store.resolve(HREF).unwrap();
+
+        assert_eq!(store.unpushed_base(HREF).unwrap(), None);
+    }
+
+    #[test]
+    fn a_sidecar_written_before_bases_existed_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        std::fs::write(
+            meta.path.join(STATE_FILE),
+            r#"{"ctag":"x","entries":{},"pending":[{"op":{"kind":"put","href":"/cal/a.ics","file":"a.ics","etag":null}}]}"#,
+        )
+        .unwrap();
+
+        let store = VdirStore::open(meta).expect("an old sidecar must not be fatal");
+        assert_eq!(store.pending().len(), 1);
+        assert_eq!(store.unpushed_base("/cal/a.ics").unwrap(), None);
+    }
+
+    #[test]
+    fn apply_merged_writes_requeues_and_rebases() {
+        const MERGED: &str = "BEGIN:VCALENDAR\r\nX-V:merged\r\nEND:VCALENDAR\r\n";
+        const SERVER_V2: &str = "BEGIN:VCALENDAR\r\nX-V:2-theirs\r\nEND:VCALENDAR\r\n";
+        let (_dir, mut store) = synced();
+        std::fs::write(store.collection().path.join("a.ics"), EDIT_1).unwrap();
+        store.queue_put_with_base(HREF, Some(V1)).unwrap();
+
+        store
+            .apply_merged(
+                MERGED,
+                &RemoteEvent {
+                    href: HREF.into(),
+                    etag: "\"v2\"".into(),
+                    ics: SERVER_V2.into(),
+                },
+            )
+            .unwrap();
+
+        let file = std::fs::read_to_string(store.collection().path.join("a.ics")).unwrap();
+        assert_eq!(file, MERGED, "the merged text did not reach the file");
+        assert_eq!(store.entry_for(HREF).unwrap().1, "\"v2\"");
+
+        let pending = store.pending();
+        assert_eq!(pending.len(), 1, "the merge was not re-queued for upload");
+        let PushOp::Put { etag, .. } = &pending[0].op else {
+            panic!("expected a Put");
+        };
+        assert_eq!(etag.as_deref(), Some("\"v2\""), "the push would 412");
+        assert_eq!(
+            pending[0].base.as_deref(),
+            Some(SERVER_V2),
+            "a further divergence would merge against a base from before this merge"
+        );
+    }
+}
+
+#[cfg(test)]
+mod empty_sighting_tests {
+    use super::*;
+    use cosmic_pim_core::model::Rgb;
+    use cosmic_pim_core::store::vdir;
+
+    #[test]
+    fn a_sighting_round_trips_through_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = vdir::create_collection(dir.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        let mut store = VdirStore::open(meta).unwrap();
+
+        assert_eq!(store.empty_sighting().unwrap(), None);
+        store.record_empty_sighting(Some("ctag-9")).unwrap();
+
+        let meta = vdir::collections(dir.path()).remove(0);
+        let mut reopened = VdirStore::open(meta).unwrap();
+        assert_eq!(
+            reopened.empty_sighting().unwrap(),
+            Some(EmptySighting {
+                ctag: Some("ctag-9".into())
+            })
+        );
+
+        reopened.clear_empty_sighting().unwrap();
+        assert_eq!(reopened.empty_sighting().unwrap(), None);
     }
 }
 

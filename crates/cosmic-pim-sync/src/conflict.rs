@@ -141,6 +141,7 @@ mod tests {
                 local,
                 remote: SERVER_V2.into(),
                 remote_etag: "\"v2\"".into(),
+                base: None,
             })
             .unwrap();
 

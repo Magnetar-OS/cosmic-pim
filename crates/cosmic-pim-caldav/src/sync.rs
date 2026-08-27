@@ -65,13 +65,17 @@ pub struct SyncOutcome {
     /// Resources changed on both sides, recorded rather than overwritten.
     /// See [`crate::store::Conflict`].
     pub conflicts: usize,
+    /// Resources changed on both sides whose edits did not overlap: merged
+    /// automatically against the captured base, applied locally, and
+    /// re-queued for upload. Nobody was asked, because there was no question.
+    pub auto_merged: usize,
 }
 
 impl SyncOutcome {
     /// Whether anything actually changed on disk.
     #[must_use]
     pub fn changed(&self) -> bool {
-        self.fetched > 0 || self.deleted > 0
+        self.fetched > 0 || self.deleted > 0 || self.auto_merged > 0
     }
 
     /// Whether the cycle applied the collection in full.
@@ -105,14 +109,48 @@ pub fn sync_collection(
     let listing = client.list_events(calendar_url)?;
 
     // 3. plan.
-    let plan = plan_sync(&listing, &local.entries);
+    let mut plan = plan_sync(&listing, &local.entries);
     outcome.guard_tripped = plan.guard_tripped;
     if plan.guard_tripped {
-        tracing::warn!(
-            calendar_url,
-            held = local.entries.len(),
-            "server listed no events while we hold some; skipping deletions this round"
-        );
+        // Confirm-on-second-sight: one empty listing is a hiccup; the same
+        // empty listing under the same ctag on a later, independent cycle is
+        // the server genuinely saying the collection is empty. Without this,
+        // a collection whose last event was legitimately deleted never
+        // empties locally — every cycle re-trips the guard and, because the
+        // ctag stays uncommitted, re-lists forever.
+        // A listing that is "empty" because every resource individually
+        // failed is not an empty collection — it neither confirms nor arms
+        // the sighting.
+        let genuinely_empty = listing.failed_uris.is_empty();
+        let confirmed = genuinely_empty
+            && store
+                .empty_sighting()?
+                .is_some_and(|sighting| sighting.ctag.as_deref() == remote_ctag.as_deref());
+        if confirmed {
+            tracing::info!(
+                calendar_url,
+                held = local.entries.len(),
+                "empty listing confirmed on second sight; applying the emptying"
+            );
+            plan.to_delete = local.entries.keys().cloned().collect();
+            plan.to_delete.sort();
+            outcome.guard_tripped = false;
+            store.clear_empty_sighting()?;
+        } else {
+            tracing::warn!(
+                calendar_url,
+                held = local.entries.len(),
+                "server listed no events while we hold some; \
+                 skipping deletions until a second cycle confirms"
+            );
+            if genuinely_empty {
+                store.record_empty_sighting(remote_ctag.as_deref())?;
+            }
+        }
+    } else {
+        // Any non-empty listing invalidates a pending sighting: whatever the
+        // hiccup was, the server is listing events again.
+        store.clear_empty_sighting()?;
     }
 
     // 4. fetch.
@@ -138,10 +176,34 @@ pub fn sync_collection(
             );
             continue;
         };
-        // Both sides changed: record it, write neither over the other.
+        // Both sides changed. With the base in hand, edits to different
+        // properties are not a disagreement — merge them and move on. Only a
+        // genuine overlap (or a missing base) is recorded for the user.
         if let Some(local) = store.unpushed_local(href)?
             && local != *ics
         {
+            let base = store.unpushed_base(href)?;
+            if let Some(merged) = base
+                .as_deref()
+                .and_then(|base| cosmic_pim_core::merge::merge3(base, &local, ics))
+            {
+                tracing::info!(
+                    href,
+                    "both sides changed a resource in different places; merged automatically"
+                );
+                store.apply_merged(
+                    &merged,
+                    &RemoteEvent {
+                        href: href.clone(),
+                        etag: (*etag).to_owned(),
+                        ics: ics.clone(),
+                    },
+                )?;
+                applied.insert(href.as_str());
+                outcome.auto_merged += 1;
+                continue;
+            }
+
             tracing::warn!(
                 href,
                 "the server and this device both changed a resource; \
@@ -152,6 +214,7 @@ pub fn sync_collection(
                 local,
                 remote: ics.clone(),
                 remote_etag: (*etag).to_owned(),
+                base,
             })?;
             applied.insert(href.as_str());
             outcome.conflicts += 1;
@@ -228,8 +291,25 @@ mod tests {
             return Ok(outcome);
         }
 
-        let plan = plan_sync(listing, &local.entries);
+        let mut plan = plan_sync(listing, &local.entries);
         outcome.guard_tripped = plan.guard_tripped;
+        if plan.guard_tripped {
+            let genuinely_empty = listing.failed_uris.is_empty();
+            let confirmed = genuinely_empty
+                && store
+                    .empty_sighting()?
+                    .is_some_and(|sighting| sighting.ctag.as_deref() == remote_ctag);
+            if confirmed {
+                plan.to_delete = local.entries.keys().cloned().collect();
+                plan.to_delete.sort();
+                outcome.guard_tripped = false;
+                store.clear_empty_sighting()?;
+            } else if genuinely_empty {
+                store.record_empty_sighting(remote_ctag)?;
+            }
+        } else {
+            store.clear_empty_sighting()?;
+        }
 
         let etags: HashMap<&str, &str> = listing
             .entries
@@ -245,11 +325,29 @@ mod tests {
             if let Some(local) = store.unpushed_local(href)?
                 && local != *ics
             {
+                let base = store.unpushed_base(href)?;
+                if let Some(merged) = base
+                    .as_deref()
+                    .and_then(|base| cosmic_pim_core::merge::merge3(base, &local, ics))
+                {
+                    store.apply_merged(
+                        &merged,
+                        &RemoteEvent {
+                            href: href.clone(),
+                            etag: (*etag).to_owned(),
+                            ics: ics.clone(),
+                        },
+                    )?;
+                    applied.insert(href.clone());
+                    outcome.auto_merged += 1;
+                    continue;
+                }
                 store.record_conflict(&Conflict {
                     href: href.clone(),
                     local,
                     remote: ics.clone(),
                     remote_etag: (*etag).to_owned(),
+                    base,
                 })?;
                 applied.insert(href.clone());
                 outcome.conflicts += 1;
@@ -609,6 +707,203 @@ mod tests {
             Some("ctag-1"),
             "the ctag advanced over an event that never arrived, so it is never retried"
         );
+    }
+
+    /// The server moved the event; the summary is untouched. Against
+    /// [`LOCAL_EDIT`] (summary only) the two edits are disjoint.
+    const SERVER_MOVED: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+        BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T100000Z\r\nSUMMARY:X\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn disjoint_edits_merge_instead_of_conflicting() {
+        // We renamed; the server moved. With the base captured there is no
+        // question to ask: both changes land, nothing is recorded, and the
+        // merged text is queued so the server converges too.
+        let mut store = store_with_unsent_edit();
+        store.bases.insert("/a.ics".into(), ICS.into());
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"2\"")], &[]),
+            &[("/a.ics".to_owned(), SERVER_MOVED.to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.auto_merged, 1);
+        assert_eq!(outcome.conflicts, 0, "a mergeable divergence was escalated");
+        assert!(store.conflicts.is_empty());
+
+        let merged = &store.events["/a.ics"].ics;
+        assert!(
+            merged.contains("SUMMARY:Mine"),
+            "the local edit was lost: {merged}"
+        );
+        assert!(
+            merged.contains("DTSTART:20260804T100000Z"),
+            "the server's edit was lost: {merged}"
+        );
+        assert_eq!(
+            store.unpushed["/a.ics"], *merged,
+            "the merged text was not queued, so the server never learns the local half"
+        );
+        assert_eq!(
+            store.bases["/a.ics"], SERVER_MOVED,
+            "the next divergence would merge against a base this merge already consumed"
+        );
+        assert_eq!(store.ctag.as_deref(), Some("ctag-2"));
+    }
+
+    #[test]
+    fn an_overlapping_edit_is_a_conflict_carrying_its_base() {
+        // Both sides renamed. No merge can answer that, but the conflict now
+        // carries the base, which is what a per-property resolution UI diffs
+        // against.
+        let mut store = store_with_unsent_edit();
+        store.bases.insert("/a.ics".into(), ICS.into());
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"2\"")], &[]),
+            &[("/a.ics".to_owned(), SERVER_EDIT.to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.conflicts, 1);
+        assert_eq!(outcome.auto_merged, 0);
+        assert_eq!(store.conflicts[0].base.as_deref(), Some(ICS));
+    }
+
+    #[test]
+    fn a_divergence_with_no_base_is_recorded_not_guessed_at() {
+        // The edits are disjoint and WOULD merge — but nothing captured the
+        // base, so there is no third point to diff against and no merge is
+        // attempted. Base-less callers keep exactly the old behaviour.
+        let mut store = store_with_unsent_edit();
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"2\"")], &[]),
+            &[("/a.ics".to_owned(), SERVER_MOVED.to_owned())],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.auto_merged, 0, "merged two texts with no base");
+        assert_eq!(outcome.conflicts, 1);
+        assert_eq!(store.conflicts[0].base, None);
+    }
+
+    #[test]
+    fn a_second_empty_listing_under_the_same_ctag_confirms_the_emptying() {
+        let mut store = MemoryStore::default();
+        for href in ["/a.ics", "/b.ics", "/c.ics"] {
+            store
+                .upsert(&RemoteEvent {
+                    href: href.into(),
+                    etag: "\"1\"".into(),
+                    ics: ICS.into(),
+                })
+                .unwrap();
+        }
+
+        // First sighting: skip, remember, leave the ctag uncommitted.
+        let first = run(&mut store, Some("ctag-2"), &listing(&[], &[]), &[]).unwrap();
+        assert!(first.guard_tripped);
+        assert_eq!(first.deleted, 0);
+        assert_eq!(store.events.len(), 3);
+        assert!(store.ctag.is_none(), "a guarded cycle claimed the ctag");
+
+        // Second sighting, same ctag: the server has said "empty" twice
+        // across independent reads. Believe it.
+        let second = run(&mut store, Some("ctag-2"), &listing(&[], &[]), &[]).unwrap();
+        assert!(!second.guard_tripped);
+        assert_eq!(second.deleted, 3);
+        assert!(
+            store.events.is_empty(),
+            "the confirmed emptying was not applied"
+        );
+        assert_eq!(store.ctag.as_deref(), Some("ctag-2"));
+        assert_eq!(store.sighting, None, "a spent sighting was left armed");
+    }
+
+    #[test]
+    fn a_different_ctag_re_arms_the_sighting_rather_than_confirming() {
+        // The collection changed between the two empty listings — whatever is
+        // happening, it is not the same state seen twice. Start over.
+        let mut store = MemoryStore::default();
+        store
+            .upsert(&RemoteEvent {
+                href: "/a.ics".into(),
+                etag: "\"1\"".into(),
+                ics: ICS.into(),
+            })
+            .unwrap();
+
+        run(&mut store, Some("ctag-2"), &listing(&[], &[]), &[]).unwrap();
+        let second = run(&mut store, Some("ctag-3"), &listing(&[], &[]), &[]).unwrap();
+
+        assert!(second.guard_tripped);
+        assert_eq!(store.events.len(), 1);
+        assert_eq!(
+            store.sighting.as_ref().and_then(|s| s.ctag.as_deref()),
+            Some("ctag-3"),
+            "the sighting was not re-armed under the new ctag"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_listing_clears_a_pending_sighting() {
+        let mut store = MemoryStore::default();
+        store
+            .upsert(&RemoteEvent {
+                href: "/a.ics".into(),
+                etag: "\"1\"".into(),
+                ics: ICS.into(),
+            })
+            .unwrap();
+
+        run(&mut store, Some("ctag-2"), &listing(&[], &[]), &[]).unwrap();
+        assert!(store.sighting.is_some());
+
+        // The hiccup passed; the server lists events again.
+        run(
+            &mut store,
+            Some("ctag-3"),
+            &listing(&[("/a.ics", "\"1\"")], &[]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(store.sighting, None);
+
+        // A later single empty listing starts from scratch.
+        let next = run(&mut store, Some("ctag-4"), &listing(&[], &[]), &[]).unwrap();
+        assert!(next.guard_tripped);
+        assert_eq!(next.deleted, 0);
+    }
+
+    #[test]
+    fn a_listing_of_pure_failures_never_confirms_an_emptying() {
+        // Every resource individually failed. That is a sick server, not an
+        // empty collection — no sighting, no confirmation, ever.
+        let mut store = MemoryStore::default();
+        store
+            .upsert(&RemoteEvent {
+                href: "/a.ics".into(),
+                etag: "\"1\"".into(),
+                ics: ICS.into(),
+            })
+            .unwrap();
+
+        for _ in 0..3 {
+            let outcome = run(&mut store, Some("ctag-2"), &listing(&[], &["/a.ics"]), &[]).unwrap();
+            assert!(outcome.guard_tripped);
+            assert_eq!(outcome.deleted, 0);
+        }
+        assert_eq!(store.events.len(), 1);
+        assert_eq!(store.sighting, None);
     }
 
     #[test]

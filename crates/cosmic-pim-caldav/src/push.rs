@@ -103,6 +103,13 @@ pub struct PendingPush {
     /// requests until it is re-queued or its conflict is resolved.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub blocked: bool,
+    /// The last-synced bytes this edit diverged from, captured at the *first*
+    /// enqueue and kept across re-enqueues — a second edit before the push
+    /// drains does not move the base, because the server still holds the
+    /// original text. What makes an automatic three-way merge possible when
+    /// the server changes the same resource; `None` merely disables that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// The queue operations a store must support for writeback to work.
@@ -324,6 +331,7 @@ mod tests {
                     next_attempt_ms: 0,
                     last_error: None,
                     blocked: false,
+                    base: None,
                 });
             }
             Ok(())

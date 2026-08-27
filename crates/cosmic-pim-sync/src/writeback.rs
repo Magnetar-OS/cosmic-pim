@@ -28,7 +28,28 @@ use crate::error::Result;
 ///
 /// Returns whether anything was queued — `false` means the collection is not
 /// CalDAV-backed.
+///
+/// Prefer [`queue_save_with_base`] where the caller read the file before
+/// overwriting it: the pre-edit bytes are what make an automatic three-way
+/// merge possible if the server turns out to have changed the same resource.
+/// This form queues with no base, which merely disables that merge.
 pub fn queue_save(root: &Path, collection_id: &str, file_name: &str) -> Result<bool> {
+    queue_save_with_base(root, collection_id, file_name, None)
+}
+
+/// [`queue_save`], with the file's pre-edit contents.
+///
+/// `previous` is what the file held *before* the save this call is queueing —
+/// exactly the text the server last acknowledged, when the file was in sync at
+/// the moment the edit began. The queue keeps it from the first enqueue only
+/// (see `VdirStore::queue_put_with_base`), so callers pass what they read and
+/// never need to reason about earlier unsent edits themselves.
+pub fn queue_save_with_base(
+    root: &Path,
+    collection_id: &str,
+    file_name: &str,
+    previous: Option<&str>,
+) -> Result<bool> {
     let Some(meta) = crate::provision::open_collection(root, collection_id) else {
         return Ok(false);
     };
@@ -56,7 +77,7 @@ pub fn queue_save(root: &Path, collection_id: &str, file_name: &str) -> Result<b
     let Some(href) = store.href_for_file(file_name) else {
         return Ok(false);
     };
-    store.queue_put(&href)?;
+    store.queue_put_with_base(&href, previous)?;
     Ok(true)
 }
 
@@ -200,6 +221,32 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         }
         assert!(queue_delete(dir.path(), &id, "a.ics").unwrap());
         assert_eq!(pending(dir.path(), &id), vec!["/dav/cal/a.ics".to_string()]);
+    }
+
+    #[test]
+    fn the_pre_edit_bytes_reach_the_queue_as_the_merge_base() {
+        let (dir, id) = collection(true);
+        {
+            let meta = crate::provision::open_collection(dir.path(), &id).unwrap();
+            let mut store = VdirStore::open(meta).unwrap();
+            store
+                .upsert(&RemoteEvent {
+                    href: "/dav/cal/a.ics".into(),
+                    etag: "\"1\"".into(),
+                    ics: ICS.into(),
+                })
+                .unwrap();
+        }
+
+        assert!(queue_save_with_base(dir.path(), &id, "a.ics", Some(ICS)).unwrap());
+
+        let meta = crate::provision::open_collection(dir.path(), &id).unwrap();
+        let store = VdirStore::open(meta).unwrap();
+        assert_eq!(
+            store.unpushed_base("/dav/cal/a.ics").unwrap().as_deref(),
+            Some(ICS),
+            "the base was dropped between the app and the queue"
+        );
     }
 
     #[test]
