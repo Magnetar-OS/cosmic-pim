@@ -715,6 +715,156 @@ mod tests {
         );
     }
 
+    /// A weekly 09:00 series saved into a fresh store.
+    fn weekly_series(store: &mut Store) -> (CalendarMeta, Event) {
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        let mut master = Event::draft(
+            &cal.id,
+            day(2026, 8, 4).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        );
+        master.summary = "Standup".into();
+        master.rrule = Some("FREQ=WEEKLY;INTERVAL=1".into());
+        store.save(&master).unwrap();
+        (cal, master)
+    }
+
+    fn instants(store: &Store) -> Vec<NaiveDate> {
+        store
+            .occurrences(day(2026, 8, 1), day(2026, 9, 1), &HashSet::new())
+            .unwrap()
+            .iter()
+            .map(|o| o.start.date())
+            .collect()
+    }
+
+    /// The identity of the instance falling on `date` — the exact value the
+    /// UI hands back from a clicked occurrence.
+    fn instance_on(store: &Store, date: NaiveDate) -> DateTime<Utc> {
+        store
+            .occurrences(day(2026, 8, 1), day(2026, 9, 1), &HashSet::new())
+            .unwrap()
+            .iter()
+            .find(|o| o.start.date() == date)
+            .expect("an instance on that date")
+            .recurrence_id
+            .expect("a series member carries its identity")
+    }
+
+    #[test]
+    fn excluding_an_occurrence_removes_exactly_that_instance() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+        let cut = instance_on(&store, day(2026, 8, 11));
+
+        store
+            .exclude_occurrence(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+
+        assert_eq!(
+            instants(&store),
+            vec![day(2026, 8, 4), day(2026, 8, 18), day(2026, 8, 25)]
+        );
+    }
+
+    #[test]
+    fn excluding_an_overridden_occurrence_removes_the_override_too() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+
+        // The 11th was moved to 14:00 by an override…
+        let mut over = master.clone();
+        over.rrule = None;
+        over.summary = "Moved".into();
+        over.start = EventTime::Zoned(day(2026, 8, 11).and_hms_opt(14, 0, 0).unwrap(), store.local);
+        over.end = EventTime::Zoned(day(2026, 8, 11).and_hms_opt(15, 0, 0).unwrap(), store.local);
+        over.recurrence_id = Some(EventTime::Zoned(
+            day(2026, 8, 11).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        ));
+        store.save(&over).unwrap();
+
+        // …and then the instance is deleted outright.
+        let cut = instance_on(&store, day(2026, 8, 11));
+        store
+            .exclude_occurrence(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+
+        let got = instants(&store);
+        assert!(
+            !got.contains(&day(2026, 8, 11)),
+            "neither the generated instance nor the override may survive: {got:?}"
+        );
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn truncating_ends_the_series_before_the_cut() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+        let cut = instance_on(&store, day(2026, 8, 18));
+
+        let deleted_whole = store
+            .truncate_series(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+
+        assert!(!deleted_whole);
+        assert_eq!(instants(&store), vec![day(2026, 8, 4), day(2026, 8, 11)]);
+
+        // The rule survived the surgery verbatim apart from the cut.
+        let after = store
+            .event(&master.calendar_id, &master.uid)
+            .unwrap()
+            .unwrap();
+        let rule = after.rrule.unwrap();
+        assert!(rule.contains("FREQ=WEEKLY"), "{rule}");
+        assert!(rule.contains("INTERVAL=1"), "{rule}");
+        assert!(rule.contains("UNTIL="), "{rule}");
+    }
+
+    #[test]
+    fn truncating_at_the_first_instance_deletes_the_series() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+        let cut = instance_on(&store, day(2026, 8, 4));
+
+        let deleted_whole = store
+            .truncate_series(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+
+        assert!(deleted_whole);
+        assert!(instants(&store).is_empty());
+    }
+
+    #[test]
+    fn truncating_purges_overrides_past_the_cut() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+
+        let mut over = master.clone();
+        over.rrule = None;
+        over.summary = "Moved".into();
+        over.start = EventTime::Zoned(day(2026, 8, 25).and_hms_opt(14, 0, 0).unwrap(), store.local);
+        over.end = EventTime::Zoned(day(2026, 8, 25).and_hms_opt(15, 0, 0).unwrap(), store.local);
+        over.recurrence_id = Some(EventTime::Zoned(
+            day(2026, 8, 25).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        ));
+        store.save(&over).unwrap();
+
+        let cut = instance_on(&store, day(2026, 8, 18));
+        store
+            .truncate_series(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+
+        let got = instants(&store);
+        assert_eq!(
+            got,
+            vec![day(2026, 8, 4), day(2026, 8, 11)],
+            "the orphaned override leaked past the cut"
+        );
+    }
+
     #[test]
     fn opens_empty_and_reports_no_calendars() {
         let (_dir, store) = store();

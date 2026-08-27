@@ -15,7 +15,9 @@ pub mod todo;
 pub use calendar::{CalendarMeta, DEFAULT_CALENDAR_COLOR, PALETTE, Rgb};
 pub use contact::{Address, Contact, StructuredName, Typed};
 pub use event::{Event, EventTime, Freq, Occurrence, Recurrence, RepeatEnd};
-pub use recur::expand;
+pub use recur::{
+    expand, expand_merged, instant_of, naive_in_series_zone, rid_for, truncate_rule, until_before,
+};
 pub use todo::{Todo, TodoStatus};
 
 use chrono_tz::Tz;

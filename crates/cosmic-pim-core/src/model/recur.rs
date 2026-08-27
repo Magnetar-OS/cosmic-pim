@@ -13,6 +13,165 @@ use rrule::{RRule, RRuleSet, Unvalidated};
 /// so a pathological file cannot hang the UI thread.
 const MAX_OCCURRENCES: u16 = 2_000;
 
+/// Expands a set of events into occurrences, honouring `RECURRENCE-ID`
+/// overrides.
+///
+/// An override VEVENT — same UID as its series master, a `RECURRENCE-ID`
+/// naming the instance it replaces — must do two things to the calendar: its
+/// own start and properties appear, and the master's generated copy of that
+/// instance does not. Expanding each event in isolation cannot know about the
+/// other component, which is why this takes the whole candidate set: it is the
+/// one place master and override meet.
+#[must_use]
+pub fn expand_merged(
+    events: &[Event],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    local: Tz,
+) -> Vec<Occurrence> {
+    use std::collections::{HashMap, HashSet};
+
+    // The instances that have been replaced, per series.
+    let mut replaced: HashMap<(&str, &str), HashSet<DateTime<Utc>>> = HashMap::new();
+    for event in events {
+        if let Some(rid) = event.recurrence_id
+            && let Some(instant) = instant_of(rid, local)
+        {
+            replaced
+                .entry((event.calendar_id.as_str(), event.uid.as_str()))
+                .or_default()
+                .insert(instant);
+        }
+    }
+
+    let mut out = Vec::new();
+    for event in events {
+        match event.recurrence_id {
+            // An override is a single concrete occurrence at its own time —
+            // whether or not its master is in the set (a master can fall
+            // outside the query window while its override moved into it).
+            Some(rid) => {
+                let duration = event.duration(local);
+                let start_utc = event.start.to_utc(local);
+                if start_utc + duration > from && start_utc < to {
+                    out.push(occurrence_at(
+                        event,
+                        event.start.naive_local(local),
+                        duration,
+                        instant_of(rid, local),
+                    ));
+                }
+            }
+            None => {
+                let suppressed = replaced.get(&(event.calendar_id.as_str(), event.uid.as_str()));
+                out.extend(
+                    expand(event, from, to, local)
+                        .into_iter()
+                        .filter(|occurrence| match (occurrence.recurrence_id, suppressed) {
+                            (Some(instant), Some(set)) => !set.contains(&instant),
+                            _ => true,
+                        }),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The `RECURRENCE-ID` value identifying the instance of a series generated at
+/// `instant`, matching the master's `DTSTART` in kind and zone — which is what
+/// RFC 5545 requires of an override component.
+///
+/// Inverse of [`instant_of`]: `instant_of(rid_for(start, i, local), local) == i`
+/// for any instant a well-formed master can generate.
+#[must_use]
+pub fn rid_for(master_start: EventTime, instant: DateTime<Utc>, local: Tz) -> EventTime {
+    match master_start {
+        EventTime::Date(_) => EventTime::Date(instant.with_timezone(&local).date_naive()),
+        EventTime::Floating(_) => EventTime::Floating(instant.with_timezone(&local).naive_local()),
+        EventTime::Zoned(_, tz) => EventTime::Zoned(instant.with_timezone(&tz).naive_local(), tz),
+    }
+}
+
+/// `instant` as a wall-clock value in the zone the series iterates in — the
+/// value space `EXDATE` entries live in.
+#[must_use]
+pub fn naive_in_series_zone(
+    master_start: EventTime,
+    instant: DateTime<Utc>,
+    local: Tz,
+) -> NaiveDateTime {
+    match master_start {
+        // Floating and all-day series iterate in the viewer's zone.
+        EventTime::Date(_) | EventTime::Floating(_) => instant.with_timezone(&local).naive_local(),
+        EventTime::Zoned(_, tz) => instant.with_timezone(&tz).naive_local(),
+    }
+}
+
+/// The `UNTIL=` value that ends a series *before* the instance at `instant`.
+///
+/// RFC 5545: `UNTIL` is inclusive and must match `DTSTART`'s value type — a
+/// date for all-day series, a UTC date-time for zoned ones, a floating
+/// date-time for floating ones.
+#[must_use]
+pub fn until_before(master_start: EventTime, instant: DateTime<Utc>, local: Tz) -> String {
+    match master_start {
+        EventTime::Date(_) => {
+            let day = instant.with_timezone(&local).date_naive() - Duration::days(1);
+            day.format("%Y%m%d").to_string()
+        }
+        EventTime::Floating(_) => {
+            let t = instant.with_timezone(&local).naive_local() - Duration::seconds(1);
+            t.format("%Y%m%dT%H%M%S").to_string()
+        }
+        EventTime::Zoned(..) => {
+            let t = instant - Duration::seconds(1);
+            t.format("%Y%m%dT%H%M%SZ").to_string()
+        }
+    }
+}
+
+/// `rule` with any `COUNT` or `UNTIL` replaced by `UNTIL=<until>`.
+///
+/// The rest of the rule passes through verbatim — this is the one edit that
+/// must not flatten `BYDAY`, `BYSETPOS`, or anything else the caller does not
+/// understand.
+#[must_use]
+pub fn truncate_rule(rule: &str, until: &str) -> String {
+    let mut parts: Vec<&str> = rule
+        .split(';')
+        .map(str::trim)
+        .filter(|part| {
+            let key = part.split('=').next().unwrap_or("").trim();
+            !part.is_empty()
+                && !key.eq_ignore_ascii_case("UNTIL")
+                && !key.eq_ignore_ascii_case("COUNT")
+        })
+        .collect();
+    let until = format!("UNTIL={until}");
+    parts.push(&until);
+    parts.join(";")
+}
+
+/// The instant a `RECURRENCE-ID` names, in the same value space the master's
+/// expansion produces its instants in.
+///
+/// Zoned values resolve through their own zone; floating and date values
+/// through the viewer's, which is also the zone [`expand_rule`] iterates
+/// floating and all-day masters in — so a well-formed override (RFC 5545
+/// requires its value type to match the master's `DTSTART`) lands on exactly
+/// the instant the master would have generated.
+pub fn instant_of(rid: EventTime, local: Tz) -> Option<DateTime<Utc>> {
+    let (naive, tz) = match rid {
+        EventTime::Date(d) => (d.and_time(NaiveTime::MIN), local),
+        EventTime::Floating(dt) => (dt, local),
+        EventTime::Zoned(dt, tz) => (dt, tz),
+    };
+    tz.from_local_datetime(&naive)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 /// Expands `event` into every occurrence overlapping `[from, to)`.
 ///
 /// `local` is the viewer's timezone, used to resolve floating times and to place
@@ -148,7 +307,7 @@ fn occurrence_at(
 mod tests {
     use super::*;
     use crate::model::event::EventTime;
-    use chrono::{Datelike, NaiveDate};
+    use chrono::{Datelike, NaiveDate, Timelike};
 
     fn utc(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
@@ -170,6 +329,7 @@ mod tests {
             created: None,
             last_modified: None,
             file_name: "test-uid.ics".into(),
+            recurrence_id: None,
         }
     }
 
@@ -284,5 +444,98 @@ mod tests {
         );
         let got = expand(&e, utc(2026, 8, 1), utc(2026, 9, 1), chrono_tz::UTC);
         assert_eq!(got.len(), 1, "a broken rule should not hide the event");
+    }
+
+    /// A weekly 09:00 series with the 11 Aug instance moved to 14:00 by an
+    /// override component.
+    fn series_with_override() -> Vec<Event> {
+        let master = event_with(
+            EventTime::Zoned(at(2026, 8, 4, 9), chrono_tz::UTC),
+            EventTime::Zoned(at(2026, 8, 4, 10), chrono_tz::UTC),
+            Some("FREQ=WEEKLY"),
+        );
+
+        let mut moved = event_with(
+            EventTime::Zoned(at(2026, 8, 11, 14), chrono_tz::UTC),
+            EventTime::Zoned(at(2026, 8, 11, 15), chrono_tz::UTC),
+            None,
+        );
+        moved.summary = "Standup (moved)".into();
+        moved.recurrence_id = Some(EventTime::Zoned(at(2026, 8, 11, 9), chrono_tz::UTC));
+
+        vec![master, moved]
+    }
+
+    #[test]
+    fn an_override_replaces_the_generated_instance() {
+        let got = expand_merged(
+            &series_with_override(),
+            utc(2026, 8, 1),
+            utc(2026, 9, 1),
+            chrono_tz::UTC,
+        );
+
+        // Four Tuesdays in the window: three generated, one overridden.
+        assert_eq!(got.len(), 4);
+
+        let aug_11: Vec<_> = got
+            .iter()
+            .filter(|o| o.start.date() == NaiveDate::from_ymd_opt(2026, 8, 11).unwrap())
+            .collect();
+        assert_eq!(
+            aug_11.len(),
+            1,
+            "the replaced instance must not also appear"
+        );
+        assert_eq!(aug_11[0].start.time().hour(), 14);
+        assert_eq!(aug_11[0].summary, "Standup (moved)");
+    }
+
+    #[test]
+    fn an_override_moved_out_of_the_window_still_suppresses_its_instance() {
+        let mut events = series_with_override();
+        // The override now lives in September, outside the queried window —
+        // exactly what a candidate query would still hand us.
+        events[1].start = EventTime::Zoned(at(2026, 9, 2, 14), chrono_tz::UTC);
+        events[1].end = EventTime::Zoned(at(2026, 9, 2, 15), chrono_tz::UTC);
+
+        let got = expand_merged(&events, utc(2026, 8, 1), utc(2026, 9, 1), chrono_tz::UTC);
+
+        // Three generated Tuesdays; the 11th is gone and its replacement is
+        // outside the window.
+        assert_eq!(got.len(), 3);
+        assert!(
+            got.iter()
+                .all(|o| o.start.date() != NaiveDate::from_ymd_opt(2026, 8, 11).unwrap()),
+            "the replaced instance leaked back in"
+        );
+    }
+
+    #[test]
+    fn an_orphan_override_still_appears() {
+        // The master fell outside the candidate set — its series ended long
+        // ago, say — but the override moved an instance into this window.
+        let events = series_with_override().split_off(1);
+
+        let got = expand_merged(&events, utc(2026, 8, 1), utc(2026, 9, 1), chrono_tz::UTC);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].summary, "Standup (moved)");
+    }
+
+    #[test]
+    fn the_override_occurrence_names_the_instance_it_replaces() {
+        let got = expand_merged(
+            &series_with_override(),
+            utc(2026, 8, 1),
+            utc(2026, 9, 1),
+            chrono_tz::UTC,
+        );
+        let moved = got.iter().find(|o| o.summary.ends_with("(moved)")).unwrap();
+        // The identity is the *replaced* instant, not the new start — this is
+        // what lets a click on the occurrence find the override component.
+        assert_eq!(
+            moved.recurrence_id,
+            Some(utc(2026, 8, 11) + Duration::hours(9))
+        );
     }
 }

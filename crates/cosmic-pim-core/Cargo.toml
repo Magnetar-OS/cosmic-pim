@@ -47,6 +47,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 # The watcher hands debounced bursts to the UI over a tokio channel.
 tokio = { version = "1.53", features = ["sync", "time"] }
 
+# Inline PHOTO payloads are base64 in both vCard dialects; setting one means
+# encoding. Same version as cosmic-pim-accounts, deliberately.
+base64 = "0.23"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.53", features = ["macros", "rt", "time"] }

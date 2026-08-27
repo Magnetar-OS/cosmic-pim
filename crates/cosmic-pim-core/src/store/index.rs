@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Bumped whenever the schema changes; a mismatch wipes and rebuilds the cache.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS events (
@@ -47,7 +47,13 @@ CREATE TABLE IF NOT EXISTS events (
     start_utc   INTEGER NOT NULL,
     end_utc     INTEGER NOT NULL,
     until_utc   INTEGER,
-    PRIMARY KEY (calendar_id, file_name, uid)
+    rid_kind    INTEGER NOT NULL DEFAULT -1,
+    rid_naive   INTEGER NOT NULL DEFAULT 0,
+    rid_tz      TEXT,
+    -- The RID columns are part of the key: a series master and its overrides
+    -- share (calendar_id, file_name, uid) and differ only in RECURRENCE-ID.
+    -- Without them the last component read would silently overwrite the rest.
+    PRIMARY KEY (calendar_id, file_name, uid, rid_kind, rid_naive)
 );
 
 CREATE INDEX IF NOT EXISTS events_range    ON events (start_utc, end_utc);
@@ -371,19 +377,75 @@ impl Index {
         values.push(Box::new(to.timestamp()));
 
         let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), row_to_event)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut events: Vec<Event> = rows.collect::<Result<_, _>>()?;
+
+        // An override can sit outside the query window while the instance it
+        // replaces is inside it — moved to next month, say. Expansion still
+        // needs it, to suppress the master's generated copy, so pull every
+        // override belonging to a recurring candidate the window selected.
+        let series: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.rrule.is_some() && e.recurrence_id.is_none())
+            .collect();
+        if !series.is_empty() {
+            let ph = std::iter::repeat_n("(?,?)", series.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT {COLUMNS} FROM events
+                 WHERE rid_kind != {RID_NONE} AND (calendar_id, uid) IN (VALUES {ph})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let values: Vec<&str> = series
+                .iter()
+                .flat_map(|e| [e.calendar_id.as_str(), e.uid.as_str()])
+                .collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), row_to_event)?;
+            for event in rows {
+                let event = event?;
+                // The in-window pass may already have found it.
+                let dup = events.iter().any(|e| {
+                    e.uid == event.uid
+                        && e.calendar_id == event.calendar_id
+                        && e.recurrence_id == event.recurrence_id
+                });
+                if !dup {
+                    events.push(event);
+                }
+            }
+        }
+
+        Ok(events)
     }
 
     /// Looks up a single event by UID.
+    ///
+    /// For a recurring event this is the series master; overrides carry the
+    /// same UID and are reached through [`Self::events_with_uid`].
     pub fn event(&self, calendar_id: &str, uid: &str) -> Result<Option<Event>, StoreError> {
         Ok(self
             .conn
             .query_row(
-                &format!("SELECT {COLUMNS} FROM events WHERE calendar_id = ?1 AND uid = ?2"),
+                &format!(
+                    "SELECT {COLUMNS} FROM events
+                     WHERE calendar_id = ?1 AND uid = ?2 AND rid_kind = {RID_NONE}"
+                ),
                 params![calendar_id, uid],
                 row_to_event,
             )
             .optional()?)
+    }
+
+    /// Every component stored under one UID: the master first, then its
+    /// overrides. One row for a one-off event.
+    pub fn events_with_uid(&self, calendar_id: &str, uid: &str) -> Result<Vec<Event>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM events
+             WHERE calendar_id = ?1 AND uid = ?2
+             ORDER BY rid_kind, rid_naive"
+        ))?;
+        let rows = stmt.query_map(params![calendar_id, uid], row_to_event)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Total number of indexed events, for diagnostics and tests.
@@ -396,7 +458,16 @@ impl Index {
 
 const COLUMNS: &str = "calendar_id, file_name, uid, summary, description, location, \
      start_kind, start_naive, start_tz, end_kind, end_naive, end_tz, \
-     rrule, exdates, sequence, created, modified, alarms";
+     rrule, exdates, sequence, created, modified, alarms, \
+     rid_kind, rid_naive, rid_tz";
+
+/// `rid_kind` for a component that is not an override. Distinct from every
+/// [`split_time`] kind, and NOT NULL so it can participate in the primary key.
+const RID_NONE: i64 = -1;
+
+fn split_rid(rid: Option<EventTime>) -> (i64, i64, Option<String>) {
+    rid.map_or((RID_NONE, 0, None), split_time)
+}
 
 fn insert_event(
     tx: &rusqlite::Transaction<'_>,
@@ -420,17 +491,21 @@ fn insert_event(
         .collect::<Vec<_>>()
         .join(",");
 
+    let (rid_kind, rid_naive, rid_tz) = split_rid(event.recurrence_id);
+
     tx.execute(
         "INSERT INTO events (
             calendar_id, file_name, uid, summary, description, location,
             start_kind, start_naive, start_tz, end_kind, end_naive, end_tz,
             rrule, exdates, sequence, created, modified,
-            start_utc, end_utc, until_utc, alarms
+            start_utc, end_utc, until_utc, alarms,
+            rid_kind, rid_naive, rid_tz
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-            ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+            ?22, ?23, ?24
          )
-         ON CONFLICT(calendar_id, file_name, uid) DO UPDATE SET
+         ON CONFLICT(calendar_id, file_name, uid, rid_kind, rid_naive) DO UPDATE SET
             summary = excluded.summary, description = excluded.description,
             location = excluded.location,
             start_kind = excluded.start_kind, start_naive = excluded.start_naive,
@@ -442,7 +517,8 @@ fn insert_event(
             sequence = excluded.sequence, created = excluded.created,
             modified = excluded.modified,
             start_utc = excluded.start_utc, end_utc = excluded.end_utc,
-            until_utc = excluded.until_utc",
+            until_utc = excluded.until_utc,
+            rid_tz = excluded.rid_tz",
         params![
             event.calendar_id,
             event.file_name,
@@ -465,6 +541,9 @@ fn insert_event(
             event.end.to_utc(local).timestamp(),
             series_until(event, local).map(|d| d.timestamp()),
             alarms,
+            rid_kind,
+            rid_naive,
+            rid_tz,
         ],
     )?;
     Ok(())
@@ -562,6 +641,10 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         last_modified: row
             .get::<_, Option<i64>>(16)?
             .and_then(|s| DateTime::from_timestamp(s, 0)),
+        recurrence_id: {
+            let kind: i64 = row.get(18)?;
+            (kind != RID_NONE).then(|| join_time(kind, row.get(19).unwrap_or(0), row.get(20).ok()))
+        },
     })
 }
 
@@ -605,6 +688,106 @@ mod tests {
 
         assert!(index.sync_calendar(&cal).unwrap());
         assert_eq!(index.event_count().unwrap(), 1);
+    }
+
+    /// Writes a weekly series whose 11 Aug instance is overridden, master and
+    /// override in one file — the shape every other CalDAV client produces.
+    fn write_series_with_override(cal: &CalendarMeta) -> Event {
+        let master = write(&cal, "Standup", 4, Some("FREQ=WEEKLY"));
+
+        let mut over = master.clone();
+        over.rrule = None;
+        over.summary = "Standup (moved)".into();
+        over.start = crate::model::EventTime::Zoned(
+            NaiveDate::from_ymd_opt(2026, 8, 11)
+                .unwrap()
+                .and_hms_opt(14, 0, 0)
+                .unwrap(),
+            chrono_tz::UTC,
+        );
+        over.end = crate::model::EventTime::Zoned(
+            NaiveDate::from_ymd_opt(2026, 8, 11)
+                .unwrap()
+                .and_hms_opt(15, 0, 0)
+                .unwrap(),
+            chrono_tz::UTC,
+        );
+        over.recurrence_id = Some(crate::model::EventTime::Zoned(
+            NaiveDate::from_ymd_opt(2026, 8, 11)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            chrono_tz::UTC,
+        ));
+        vdir::write_event(&cal, &over).unwrap();
+        master
+    }
+
+    #[test]
+    fn a_master_and_its_override_are_both_indexed() {
+        let (_root, cal, mut index) = setup();
+        let master = write_series_with_override(&cal);
+        index.sync_calendar(&cal).unwrap();
+
+        // The primary key must keep both components apart: they share
+        // calendar, file, and UID, and differ only in RECURRENCE-ID.
+        assert_eq!(index.event_count().unwrap(), 2);
+
+        let found = index.event(&cal.id, &master.uid).unwrap().unwrap();
+        assert!(
+            found.recurrence_id.is_none(),
+            "event() must return the master, not whichever row was written last"
+        );
+
+        let all = index.events_with_uid(&cal.id, &master.uid).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].recurrence_id.is_none(), "master sorts first");
+        assert!(all[1].recurrence_id.is_some());
+    }
+
+    #[test]
+    fn candidates_carry_the_override_even_when_it_left_the_window() {
+        let (_root, cal, mut index) = setup();
+        let master = write_series_with_override(&cal);
+
+        // Move the override into September, outside the August window.
+        let mut over = index_override(&mut index, &cal, &master);
+        over.start = crate::model::EventTime::Zoned(
+            NaiveDate::from_ymd_opt(2026, 9, 2)
+                .unwrap()
+                .and_hms_opt(14, 0, 0)
+                .unwrap(),
+            chrono_tz::UTC,
+        );
+        over.end = crate::model::EventTime::Zoned(
+            NaiveDate::from_ymd_opt(2026, 9, 2)
+                .unwrap()
+                .and_hms_opt(15, 0, 0)
+                .unwrap(),
+            chrono_tz::UTC,
+        );
+        vdir::write_event(&cal, &over).unwrap();
+        index.sync_calendar(&cal).unwrap();
+
+        let ids = vec![cal.id.clone()];
+        let got = index
+            .candidates(&ids, utc(2026, 8, 1), utc(2026, 9, 1))
+            .unwrap();
+
+        // Expansion cannot suppress the replaced instance without seeing the
+        // override, however far away it moved.
+        assert_eq!(got.len(), 2, "the out-of-window override must ride along");
+        assert!(got.iter().any(|e| e.recurrence_id.is_some()));
+    }
+
+    fn index_override(index: &mut Index, cal: &CalendarMeta, master: &Event) -> Event {
+        index.sync_calendar(cal).unwrap();
+        index
+            .events_with_uid(&cal.id, &master.uid)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.recurrence_id.is_some())
+            .expect("the override row")
     }
 
     #[test]

@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 // re-exports keep `vdir::parse_ics(..)` and friends working for existing
 // callers.
 pub use crate::ical::{
-    format_iso_duration, parse_ics, parse_iso_duration, parse_todos, to_ics, todo_to_ics,
+    format_iso_duration, parse_ics, parse_iso_duration, parse_todos, remove_vevent, to_ics,
+    todo_to_ics, upsert_vevent,
 };
 
 /// Where calendars live by default: `$XDG_DATA_HOME/calendars`.
@@ -228,7 +229,17 @@ pub fn write_event_if_unchanged(
     }
 
     let target = meta.path.join(&event.file_name);
-    atomic::write(&target, &to_ics(event), expected).map_err(Into::into)
+
+    // A recurring event's overrides share the file. Serialising the whole file
+    // from this one event would delete them, so an existing document is
+    // patched component-wise: only the VEVENT whose RECURRENCE-ID matches is
+    // regenerated, and the rest passes through byte-for-byte.
+    let text = match std::fs::read_to_string(&target) {
+        Ok(existing) if !existing.trim().is_empty() => upsert_vevent(&existing, event),
+        _ => to_ics(event),
+    };
+
+    atomic::write(&target, &text, expected).map_err(Into::into)
 }
 
 /// The concurrency token for an event's file, for a caller that intends to

@@ -242,6 +242,11 @@ pub struct Event {
     pub last_modified: Option<DateTime<Utc>>,
     /// File name within the collection directory, e.g. `<uid>.ics`.
     pub file_name: String,
+    /// `RECURRENCE-ID` — set when this VEVENT is an override of one instance
+    /// of a series, naming the instance it replaces in the master's `DTSTART`
+    /// value space. `None` for a one-off event or a series master. An override
+    /// lives in the same file as its master, under the same UID.
+    pub recurrence_id: Option<EventTime>,
 }
 
 impl Event {
@@ -264,6 +269,7 @@ impl Event {
             sequence: 0,
             created: Some(Utc::now()),
             last_modified: Some(Utc::now()),
+            recurrence_id: None,
         }
     }
 

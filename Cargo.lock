@@ -310,9 +310,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "calcard"
-version = "0.3.12"
+version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65e3ea651377325105d53a7d9cd27c2ff09c62fe4d14b3a352b808f39d9ac457"
+checksum = "75b779382e675380a1ff8a4873acee5ba60158be7a00458fb98e6b85aad1f2ee"
 dependencies = [
  "ahash",
  "chrono",
@@ -525,6 +525,7 @@ dependencies = [
 name = "cosmic-pim-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "calcard",
  "chrono",
  "chrono-tz",
@@ -3087,9 +3088,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.25.0"
+version = "1.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
+checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",

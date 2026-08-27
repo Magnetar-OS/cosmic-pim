@@ -1547,8 +1547,15 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
             "urn:uuid:new@server".to_owned(),
         ];
         let apple = set_members(APPLE_GROUP, &more).unwrap();
-        assert_eq!(apple.matches("X-ADDRESSBOOKSERVER-MEMBER:").count(), 2, "{apple}");
-        assert!(!apple.contains("\nMEMBER:"), "RFC spelling in an Apple group: {apple}");
+        assert_eq!(
+            apple.matches("X-ADDRESSBOOKSERVER-MEMBER:").count(),
+            2,
+            "{apple}"
+        );
+        assert!(
+            !apple.contains("\nMEMBER:"),
+            "RFC spelling in an Apple group: {apple}"
+        );
         assert!(apple.contains("X-CUSTOM:keep-me"), "{apple}");
         assert!(apple.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{apple}");
 
@@ -1571,7 +1578,12 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
     fn a_new_group_speaks_its_versions_dialect_and_round_trips() {
         let v3 = group_vcard("Friends", "g-new", WriteVersion::V3);
         assert!(v3.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{v3}");
-        assert!(!v3.contains("KIND:group\r\n") || !v3.contains("VERSION:3.0") || v3.contains("X-ADDRESSBOOKSERVER"), "{v3}");
+        assert!(
+            !v3.contains("KIND:group\r\n")
+                || !v3.contains("VERSION:3.0")
+                || v3.contains("X-ADDRESSBOOKSERVER"),
+            "{v3}"
+        );
         let back = parse_vcards(&v3, "d", "g.vcf").remove(0);
         assert!(back.is_group, "the 3.0 spelling did not parse back");
         assert_eq!(back.label(), "Friends");
@@ -1588,7 +1600,10 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
     fn a_fresh_v3_group_gains_members_in_the_apple_spelling() {
         let card = group_vcard("Friends", "g", WriteVersion::V3);
         let with = set_members(&card, &[member_uri("ada@server")]).unwrap();
-        assert!(with.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"), "{with}");
+        assert!(
+            with.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"),
+            "{with}"
+        );
         let back = parse_vcards(&with, "d", "g.vcf").remove(0);
         assert_eq!(back.members, vec!["urn:uuid:ada@server"]);
     }
@@ -1603,7 +1618,13 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
 
         let patched = patch_vcard(APPLE_GROUP, &group).unwrap();
         assert!(patched.contains("FN:Best Friends"), "{patched}");
-        assert!(patched.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{patched}");
-        assert!(patched.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"), "{patched}");
+        assert!(
+            patched.contains("X-ADDRESSBOOKSERVER-KIND:group"),
+            "{patched}"
+        );
+        assert!(
+            patched.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"),
+            "{patched}"
+        );
     }
 }

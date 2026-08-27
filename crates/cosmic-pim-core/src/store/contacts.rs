@@ -666,7 +666,7 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob@x\r\nFN:Bob\r\nEND:VCARD\r\n";
 
     #[test]
     fn an_import_into_a_read_only_book_is_refused() {
-        let (_dir, mut store, meta) = store();
+        let (_dir, _store, meta) = store();
         let mut frozen = meta.clone();
         frozen.read_only = true;
         // Route through the store with a doctored book list is intrusive;
@@ -746,9 +746,16 @@ mod group_store_tests {
             .unwrap();
         assert!(group.is_group);
 
-        assert_eq!(store.contacts().len(), 1, "the group leaked into the people list");
+        assert_eq!(
+            store.contacts().len(),
+            1,
+            "the group leaked into the people list"
+        );
         assert_eq!(store.groups().len(), 1);
-        assert!(store.search("Friends").is_empty(), "search returned a group as a person");
+        assert!(
+            store.search("Friends").is_empty(),
+            "search returned a group as a person"
+        );
     }
 
     #[test]

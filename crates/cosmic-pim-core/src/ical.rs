@@ -103,6 +103,12 @@ fn convert_event(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{}@cosmic-pim", uuid::Uuid::new_v4()));
 
+    // Same conversion as DTSTART: RFC 5545 requires RECURRENCE-ID's value type
+    // to match the master's DTSTART, so the same date/floating/zoned reading
+    // applies. Present only on override components.
+    let recurrence_id = pick_datetime_entry(component, &ICalendarProperty::RecurrenceId)
+        .and_then(|(entry, is_date)| to_event_time(entry, is_date, resolver));
+
     Some(Event {
         uid,
         calendar_id: calendar_id.to_owned(),
@@ -118,6 +124,7 @@ fn convert_event(
         created: utc_property(component, &ICalendarProperty::Created),
         last_modified: utc_property(component, &ICalendarProperty::LastModified),
         file_name: file_name.to_owned(),
+        recurrence_id,
     })
 }
 
@@ -755,6 +762,165 @@ pub(crate) fn fold_line(line: &str, out: &mut String) {
     out.push_str("\r\n");
 }
 
+/// Rewrites one VEVENT of an existing document, leaving its siblings intact.
+///
+/// A recurring event's overrides live in the same file as their master, under
+/// the same UID. Serialising a whole file from a single [`Event`] — what
+/// [`to_ics`] does — would therefore silently delete every other component the
+/// moment one of them is edited. This replaces the component whose
+/// `RECURRENCE-ID` matches `event.recurrence_id` (byte-for-byte preserving the
+/// rest of the document), or appends the event as a new component when no
+/// match exists.
+#[must_use]
+pub fn upsert_vevent(text: &str, event: &Event) -> String {
+    use crate::patch::{logical_lines, terminator_of};
+
+    // Which component to replace: match on the parsed RECURRENCE-ID, in
+    // document order — the same order the component walk below sees.
+    let rids: Vec<Option<EventTime>> = parse_ics(text, &event.calendar_id, &event.file_name)
+        .iter()
+        .map(|e| e.recurrence_id)
+        .collect();
+    let target = rids.iter().position(|rid| *rid == event.recurrence_id);
+
+    let terminator = terminator_of(text);
+    let mut component = String::new();
+    write_vevent(event, &mut component);
+    let component = if terminator == "\n" {
+        component.replace("\r\n", "\n")
+    } else {
+        component
+    };
+
+    let lines = logical_lines(text);
+    let mut out = String::with_capacity(text.len() + component.len());
+    let mut vevent_index = 0usize;
+    // Depth of BEGIN/END nesting *inside* a VEVENT, so a VALARM's END does not
+    // close the component early.
+    let mut inside: Option<usize> = None;
+    let mut replaced = false;
+
+    for line in &lines {
+        let begins = line.begins();
+        let ends = line.ends();
+
+        match inside {
+            None => {
+                if begins.as_deref() == Some("VEVENT") {
+                    if target == Some(vevent_index) {
+                        // Swap the whole component for the regenerated one.
+                        out.push_str(&component);
+                        replaced = true;
+                        inside = Some(usize::MAX); // skip until the matching END
+                    } else {
+                        inside = Some(0);
+                        out.push_str(line.raw());
+                    }
+                    vevent_index += 1;
+                    continue;
+                }
+                // A new component goes in before the document closes.
+                if !replaced && ends.as_deref() == Some("VCALENDAR") {
+                    out.push_str(&component);
+                    replaced = true;
+                }
+                out.push_str(line.raw());
+            }
+            Some(depth) => {
+                let skipping = depth == usize::MAX;
+                let mut depth = if skipping { 0 } else { depth };
+                if begins.is_some() {
+                    depth += 1;
+                } else if ends.is_some() {
+                    if depth == 0 {
+                        inside = None;
+                        if skipping {
+                            continue; // the replaced component's own END
+                        }
+                        out.push_str(line.raw());
+                        continue;
+                    }
+                    depth -= 1;
+                }
+                if !skipping {
+                    out.push_str(line.raw());
+                    inside = Some(depth);
+                } else {
+                    inside = Some(usize::MAX);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Removes the VEVENT whose `RECURRENCE-ID` matches `rid` from a document.
+///
+/// Returns `None` when no component matches, or when the match is the only
+/// VEVENT in the document — an empty calendar file is not a meaningful thing
+/// to write, and the caller should delete the file instead.
+#[must_use]
+pub fn remove_vevent(
+    text: &str,
+    calendar_id: &str,
+    file_name: &str,
+    rid: Option<EventTime>,
+) -> Option<String> {
+    use crate::patch::logical_lines;
+
+    let rids: Vec<Option<EventTime>> = parse_ics(text, calendar_id, file_name)
+        .iter()
+        .map(|e| e.recurrence_id)
+        .collect();
+    if rids.len() < 2 {
+        return None;
+    }
+    let target = rids.iter().position(|r| *r == rid)?;
+
+    let lines = logical_lines(text);
+    let mut out = String::with_capacity(text.len());
+    let mut vevent_index = 0usize;
+    let mut inside: Option<(usize, bool)> = None; // (nesting depth, skipping)
+
+    for line in &lines {
+        match inside {
+            None => {
+                if line.begins().as_deref() == Some("VEVENT") {
+                    let skipping = vevent_index == target;
+                    inside = Some((0, skipping));
+                    vevent_index += 1;
+                    if !skipping {
+                        out.push_str(line.raw());
+                    }
+                    continue;
+                }
+                out.push_str(line.raw());
+            }
+            Some((depth, skipping)) => {
+                if line.begins().is_some() {
+                    inside = Some((depth + 1, skipping));
+                } else if line.ends().is_some() {
+                    if depth == 0 {
+                        inside = None;
+                        if skipping {
+                            continue;
+                        }
+                        out.push_str(line.raw());
+                        continue;
+                    }
+                    inside = Some((depth - 1, skipping));
+                }
+                if !skipping {
+                    out.push_str(line.raw());
+                }
+            }
+        }
+    }
+
+    Some(out)
+}
+
 /// Serialises one event as a complete single-VEVENT iCalendar document.
 #[must_use]
 pub fn to_ics(event: &Event) -> String {
@@ -793,6 +959,11 @@ fn write_vevent(event: &Event, out: &mut String) {
     );
     fold_line(&datetime_line("DTSTART", event.start), out);
     fold_line(&datetime_line("DTEND", event.end), out);
+    if let Some(rid) = event.recurrence_id {
+        // What makes this component an override rather than a second event:
+        // the instance of the series it replaces.
+        fold_line(&datetime_line("RECURRENCE-ID", rid), out);
+    }
     fold_line(&format!("SUMMARY:{}", escape_text(&event.summary)), out);
 
     if let Some(description) = &event.description {
@@ -1420,6 +1591,134 @@ mod recurrence_id_tests {
     fn a_master_has_no_recurrence_id() {
         let ids = recurrence_ids(&doc(&["DTSTART:20260803T090000Z\r\nRRULE:FREQ=WEEKLY"]));
         assert_eq!(ids, vec![None]);
+    }
+
+    #[test]
+    fn an_override_component_parses_with_its_recurrence_id() {
+        let text = doc(&[
+            "DTSTART:20260803T090000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Standup",
+            "DTSTART:20260810T140000Z\r\nRECURRENCE-ID:20260810T090000Z\r\nSUMMARY:Moved",
+        ]);
+        let events = parse_ics(&text, "personal", "series.ics");
+
+        assert_eq!(events.len(), 2, "both components must survive parsing");
+        assert_eq!(events[0].recurrence_id, None);
+        assert_eq!(
+            events[1].recurrence_id,
+            Some(EventTime::Zoned(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                    .unwrap()
+                    .and_hms_opt(9, 0, 0)
+                    .unwrap(),
+                chrono_tz::UTC,
+            ))
+        );
+        assert_eq!(events[1].uid, events[0].uid, "an override shares the UID");
+    }
+
+    #[test]
+    fn a_recurrence_id_round_trips_through_serialisation() {
+        let text =
+            doc(&["DTSTART:20260810T140000Z\r\nRECURRENCE-ID:20260810T090000Z\r\nSUMMARY:Moved"]);
+        let event = parse_ics(&text, "personal", "series.ics").remove(0);
+
+        let written = to_ics(&event);
+        assert!(
+            written.contains("RECURRENCE-ID:20260810T090000Z"),
+            "serialising an override must keep what makes it one:\n{written}"
+        );
+
+        let back = parse_ics(&written, "personal", "series.ics").remove(0);
+        assert_eq!(back.recurrence_id, event.recurrence_id);
+    }
+
+    #[test]
+    fn upserting_the_master_leaves_the_override_untouched() {
+        let text = doc(&[
+            "DTSTART:20260803T090000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Standup\r\nX-CUSTOM:kept",
+            "DTSTART:20260810T140000Z\r\nRECURRENCE-ID:20260810T090000Z\r\nSUMMARY:Moved",
+        ]);
+        let mut master = parse_ics(&text, "personal", "series.ics").remove(0);
+        master.summary = "Renamed".into();
+
+        let out = upsert_vevent(&text, &master);
+        let events = parse_ics(&out, "personal", "series.ics");
+
+        assert_eq!(events.len(), 2, "the override component vanished:\n{out}");
+        assert_eq!(events[0].summary, "Renamed");
+        assert_eq!(events[1].summary, "Moved");
+        // The untouched component passes through byte-for-byte — including a
+        // property the model does not represent.
+        assert!(out.contains("RECURRENCE-ID:20260810T090000Z"));
+    }
+
+    #[test]
+    fn upserting_the_override_leaves_the_master_untouched() {
+        let text = doc(&[
+            "DTSTART:20260803T090000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Standup\r\nX-CUSTOM:kept",
+            "DTSTART:20260810T140000Z\r\nRECURRENCE-ID:20260810T090000Z\r\nSUMMARY:Moved",
+        ]);
+        let mut over = parse_ics(&text, "personal", "series.ics").remove(1);
+        over.summary = "Moved again".into();
+
+        let out = upsert_vevent(&text, &over);
+        let events = parse_ics(&out, "personal", "series.ics");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].summary, "Standup");
+        assert_eq!(events[1].summary, "Moved again");
+        assert!(
+            out.contains("X-CUSTOM:kept"),
+            "the master must pass through byte-for-byte:\n{out}"
+        );
+        assert!(out.contains("RRULE:FREQ=WEEKLY"));
+    }
+
+    #[test]
+    fn upserting_a_new_override_appends_a_component() {
+        let text = doc(&["DTSTART:20260803T090000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Standup"]);
+        let mut over = parse_ics(&text, "personal", "series.ics").remove(0);
+        over.rrule = None;
+        over.summary = "One moved instance".into();
+        over.recurrence_id = Some(EventTime::Zoned(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            chrono_tz::UTC,
+        ));
+
+        let out = upsert_vevent(&text, &over);
+        let events = parse_ics(&out, "personal", "series.ics");
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the new component was not appended:\n{out}"
+        );
+        assert_eq!(events[0].summary, "Standup", "the master must survive");
+        assert!(events[1].recurrence_id.is_some());
+    }
+
+    #[test]
+    fn removing_the_override_keeps_the_master() {
+        let text = doc(&[
+            "DTSTART:20260803T090000Z\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Standup",
+            "DTSTART:20260810T140000Z\r\nRECURRENCE-ID:20260810T090000Z\r\nSUMMARY:Moved",
+        ]);
+        let rid = parse_ics(&text, "personal", "series.ics")[1].recurrence_id;
+
+        let out = remove_vevent(&text, "personal", "series.ics", rid).expect("a match");
+        let events = parse_ics(&out, "personal", "series.ics");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].summary, "Standup");
+    }
+
+    #[test]
+    fn removing_the_last_component_asks_for_file_deletion_instead() {
+        let text = doc(&["DTSTART:20260803T090000Z\r\nSUMMARY:Only one"]);
+        assert!(remove_vevent(&text, "personal", "one.ics", None).is_none());
     }
 
     #[test]
