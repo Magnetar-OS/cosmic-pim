@@ -161,6 +161,28 @@ versions instead of choosing one (`caldav::store::Conflict`). Resolution is the
 application's: keep local, take remote, or supply a merge. Nothing resolves
 itself with time, because the alternative to asking is guessing.
 
+**A divergence with a base merges itself when the edits do not overlap.** The
+writeback queue captures the pre-edit bytes at the first enqueue (an app passes
+them through `sync::queue_save_with_base`; a second edit before the push drains
+keeps the original base, because that is still the last text the server
+acknowledged). With that third point in hand, `core::merge::merge3` runs a
+conservative unit-level three-way merge before anything is recorded: the server
+moved the event and this device renamed it → both changes land, the merged text
+is re-queued so the server converges, and no question is asked because there
+was no question. Only a genuine overlap — the same property, the same
+identityless sub-component — becomes a `Conflict`, which now carries the base
+for a per-property resolution UI. No base means no merge is attempted: guessing
+is still worse than asking.
+
+**An empty listing is believed on the second sighting, not the first.** The
+mass-delete guard treats one empty listing over a populated collection as a
+server hiccup and skips deletions — but a collection whose last event was
+legitimately deleted would then never empty locally. So the guard records the
+ctag the empty listing arrived under, and a later cycle seeing the *same* ctag
+with the same genuinely-empty listing (a listing that is only "empty" because
+every resource individually failed never counts) applies the emptying. A
+different ctag re-arms the sighting; any non-empty listing clears it.
+
 **A failed write is classified, not just retried.** `Error::Status` carries the
 HTTP code and `Disposition` says what it means: retry (timeouts, 5xx, 429),
 reconcile (412 — our `If-Match` is stale, and every retry sends the same stale

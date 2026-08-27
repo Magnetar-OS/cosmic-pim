@@ -36,15 +36,20 @@ accounting (zero sync-engine lines) is the standing proof the shape works.
 
 ## Gaps (dependency order)
 
-### Conflict surfacing
+### Conflict surfacing — DONE
 
-The reconciler resolves what it can; the missing piece is the API for what it
-can't. On 412-with-divergence, produce a conflict record — local bytes, remote
-bytes, base bytes (last-synced state) — persisted in the sidecar, exposed
-through sync reports, resolvable by an app choosing per-property (via the
-patcher) or wholesale. Non-overlapping property changes auto-merge; overlapping
-go to the record. Both apps' conflict UI consumes this; neither can build it
-until the engine emits it.
+Landed in full. The conflict record (local, remote, base) persists in the
+sidecar and is read with `sync::conflicts`; counts surface through the sync
+reports; resolution is `conflict::take_remote` / `keep_local` (wholesale or
+with a merged text). The base is captured at first enqueue via
+`sync::queue_save_with_base` — apps pass the pre-edit bytes — and
+non-overlapping changes auto-merge in the cycle (`core::merge::merge3`,
+conservative and unit-level; VEVENT children keyed by UID + RECURRENCE-ID and
+merged recursively) before anything is recorded. What remains is app-side:
+the conflict UI (02/03) and the one-line `queue_save_with_base` adoption at
+each save call site. The mass-delete guard also gained confirm-on-second-sight
+(the live-server finding): an emptied collection now empties locally once the
+same genuinely-empty listing is seen under the same ctag twice.
 
 ### Per-server quirks table
 
