@@ -215,6 +215,54 @@ impl Outbox {
         }
     }
 
+    /// Queues a message to go out at a chosen time.
+    ///
+    /// Undo-send's grace delay and "send later" are both this entry with
+    /// different clocks: the drain already refuses anything before its
+    /// `next_attempt_ms`, so a scheduled send needs no second mechanism.
+    ///
+    /// Unlike [`Self::queue`] the draft has not failed anywhere, so it is
+    /// checked *now*: a message that cannot build would otherwise fail at
+    /// its send time, when nobody is looking at a composer any more.
+    pub fn schedule(&self, id: &str, draft: &Draft, not_before_ms: i64) -> Result<()> {
+        if let Some(problem) = draft.problem() {
+            return Err(Error::Draft(problem.to_owned()));
+        }
+        self.write(&Queued {
+            id: id.to_owned(),
+            draft: draft.clone(),
+            attempts: 0,
+            next_attempt_ms: not_before_ms,
+            last_error: None,
+            given_up: false,
+        })
+    }
+
+    /// Takes a queued message back, returning its draft — the undo for a
+    /// send that has not gone yet.
+    ///
+    /// `None` means it already left (or never existed), and the caller must
+    /// say so rather than reopen a composer for a message the recipients
+    /// already have. The take is a rename, so a drain running concurrently
+    /// cannot send what was cancelled or cancel what was sent: whichever
+    /// claims the file first wins, and the other finds it gone.
+    pub fn cancel(&self, id: &str) -> Result<Option<Draft>> {
+        if !crate::drafts::is_valid_id(id) {
+            return Ok(None);
+        }
+        let claimed = self.path(id).with_extension("cancelling");
+        match fs::rename(self.path(id), &claimed) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let text = fs::read_to_string(&claimed)?;
+        let _ = fs::remove_file(&claimed);
+        let queued: Queued = serde_json::from_str(&text)
+            .map_err(|why| Error::Draft(format!("the cancelled message could not be read: {why}")))?;
+        Ok(Some(queued.draft))
+    }
+
     /// Puts a given-up message back in the queue, due now.
     ///
     /// The explicit "try again" a stopped message needs — and the only way one
@@ -257,6 +305,14 @@ impl Outbox {
 
         for mut queued in self.list()? {
             if !queued.is_live() || queued.next_attempt_ms > now_ms {
+                outcome.skipped += 1;
+                continue;
+            }
+            // The listing is a snapshot; a cancel may have claimed the file
+            // since. Checked immediately before the send, because sending a
+            // message the user just took back is the unforgivable direction
+            // of this race.
+            if !self.path(&queued.id).exists() {
                 outcome.skipped += 1;
                 continue;
             }
@@ -541,6 +597,56 @@ mod tests {
         for attempts in [12, 63, 64, u32::MAX] {
             assert_eq!(retry_delay_ms(attempts), MAX_DELAY_MS);
         }
+    }
+
+    #[test]
+    fn a_scheduled_send_waits_for_its_time_and_then_goes() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .schedule("0000000000000001", &draft("later"), 10_000)
+            .unwrap();
+
+        // Before the deadline: nothing is sent, nothing is attempted.
+        let early = outbox
+            .drain_with(|_| panic!("a not-yet-due message was submitted"), 9_999)
+            .unwrap();
+        assert_eq!(early.skipped, 1);
+
+        let due = outbox
+            .drain_with(|_| Outcome::Sent(b"bytes".to_vec()), 10_000)
+            .unwrap();
+        assert_eq!(due.sent.len(), 1);
+        assert_eq!(outbox.count(), 0);
+    }
+
+    #[test]
+    fn a_draft_that_cannot_be_sent_is_refused_at_scheduling_time() {
+        // The alternative is failing at the send time, when nobody is looking
+        // at a composer any more.
+        let (_dir, outbox) = outbox();
+        let unfinished = Draft::new(Mailbox {
+            name: None,
+            address: "me@example.com".into(),
+        });
+        assert!(outbox.schedule("0000000000000002", &unfinished, 0).is_err());
+        assert_eq!(outbox.count(), 0);
+    }
+
+    #[test]
+    fn cancelling_hands_the_draft_back_exactly_once() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .schedule("0000000000000003", &draft("regretted"), i64::MAX)
+            .unwrap();
+
+        let taken = outbox.cancel("0000000000000003").unwrap();
+        assert_eq!(taken.expect("the draft came back").subject, "regretted");
+        assert_eq!(outbox.count(), 0);
+
+        assert!(
+            outbox.cancel("0000000000000003").unwrap().is_none(),
+            "a second cancel resurrected the message"
+        );
     }
 
     #[test]
