@@ -366,7 +366,10 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
                 element.clear();
             }
             Ok(Event::Text(text)) => {
-                let value = text.xml10_content().trim().to_string();
+                let value = quick_xml::escape::unescape(text.as_ref())
+                    .unwrap_or_else(|_| text.xml10_content())
+                    .trim()
+                    .to_string();
                 if value.is_empty() {
                     continue;
                 }

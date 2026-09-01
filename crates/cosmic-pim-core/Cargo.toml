@@ -29,7 +29,7 @@ jiff = "0.2.35"
 # two parsers with different TZID handling reading the SAME vdir is a genuine
 # bug source, not a style preference. It also parses vCard, which is what makes
 # a contacts app a new module rather than a new dependency.
-calcard = "0.3.10"
+calcard = "0.3.13"
 rrule = "0.14"
 
 # --- storage ---

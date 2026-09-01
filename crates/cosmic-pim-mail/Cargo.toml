@@ -47,7 +47,7 @@ lettre = { version = "0.11", default-features = false, features = [
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
 # Streaming pull parser for those documents, the same one cosmic-pim-caldav
 # uses for multistatus XML.
-quick-xml = "0.41"
+quick-xml = "0.42.0"
 
 # HTML → what a human would actually see. A real html5ever tree, not a
 # tag-stripper: hostile mail is precisely where parser-differential tricks live.
