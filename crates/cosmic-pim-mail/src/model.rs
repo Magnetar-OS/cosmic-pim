@@ -256,6 +256,13 @@ pub struct Message {
     /// the `https:` target with `List-Unsubscribe=One-Click`, no page, no
     /// confirmation maze.
     pub one_click_unsubscribe: bool,
+    /// RFC 2919 `List-Id`, angle-bracketed identifier only (`dev.lists.example`
+    /// from `Dev list <dev.lists.example>`), lowercased.
+    ///
+    /// The one header that names a mailing list stably — `From` rotates per
+    /// poster, `Subject` tags get edited — which makes it the right key for a
+    /// filter rule's "this list" condition.
+    pub list_id: Option<String>,
 }
 
 impl Message {
@@ -309,6 +316,17 @@ impl Message {
             one_click_unsubscribe: msg.header_raw("List-Unsubscribe-Post").is_some_and(|text| {
                 text.to_ascii_lowercase()
                     .contains("list-unsubscribe=one-click")
+            }),
+            list_id: msg.header_raw("List-Id").and_then(|raw| {
+                // `Display Name <the.actual.id>` — the bracketed part is the
+                // identifier; a bare value without brackets is taken whole.
+                let raw = raw.trim();
+                let id = match (raw.rfind('<'), raw.rfind('>')) {
+                    (Some(open), Some(close)) if open < close => &raw[open + 1..close],
+                    _ => raw,
+                };
+                let id = id.trim().to_ascii_lowercase();
+                (!id.is_empty()).then_some(id)
             }),
         }
     }
@@ -438,6 +456,24 @@ References: <root@example.com> <parent@example.com>\r\n\
 Date: Mon, 3 Feb 2025 10:00:00 +0000\r\n\
 \r\n\
 Body text.\r\n";
+
+    #[test]
+    fn list_id_is_the_bracketed_identifier_lowercased() {
+        let msg = Message::parse(
+            b"From: a@example.com\r\nList-Id: Dev List <DEV.Lists.Example>\r\nSubject: x\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        assert_eq!(msg.list_id.as_deref(), Some("dev.lists.example"));
+
+        let bare = Message::parse(
+            b"From: a@example.com\r\nList-Id: dev.lists.example\r\nSubject: x\r\n\r\nbody\r\n",
+        )
+        .unwrap();
+        assert_eq!(bare.list_id.as_deref(), Some("dev.lists.example"));
+
+        let none = Message::parse(SIMPLE).unwrap();
+        assert_eq!(none.list_id, None);
+    }
 
     #[test]
     fn headers_are_extracted_for_display() {

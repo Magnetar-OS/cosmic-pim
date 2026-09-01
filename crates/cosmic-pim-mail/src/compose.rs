@@ -1009,7 +1009,8 @@ mod tests {
             name: Some("Δομήνικος".into()),
             address: "d@example.gr".into(),
         });
-        draft.subject = "Σχέδιο — ταξίδι στην Κρήτη, μια πολύ μεγάλη γραμμή θέματος που συνεχίζει".into();
+        draft.subject =
+            "Σχέδιο — ταξίδι στην Κρήτη, μια πολύ μεγάλη γραμμή θέματος που συνεχίζει".into();
         draft.body = "Καλημέρα.".into();
 
         let raw = draft.mirror_bytes("id3@example.com", 0);

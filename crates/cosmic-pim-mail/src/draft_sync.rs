@@ -105,7 +105,15 @@ pub fn sweep(
         }
     };
     for id in dirty {
-        match mirror_one(session, wire_name, drafts, &id, domain, uid_validity, now_ms) {
+        match mirror_one(
+            session,
+            wire_name,
+            drafts,
+            &id,
+            domain,
+            uid_validity,
+            now_ms,
+        ) {
             Ok(retired) => {
                 report.uploaded += 1;
                 report.retired += retired;
@@ -132,14 +140,25 @@ fn mirror_one(
         // tombstone if one was needed; nothing to upload.
         return Ok(0);
     };
-    let message_id = drafts
-        .mirror(id)?
-        .and_then(|mirror| mirror.message_id)
+    let linkage = drafts.mirror(id)?.unwrap_or_default();
+    let message_id = linkage
+        .message_id
+        .clone()
         .unwrap_or_else(|| mint_message_id(id, domain));
 
     // Before the append, so the new copy can never match its own retirement
     // query.
-    let old = session.uids_by_message_id(&message_id)?;
+    let mut old = session.uids_by_message_id(&message_id)?;
+    // The linkage UID joins the retirement set while it still means
+    // something. It is what retires an adopted draft that never carried a
+    // Message-ID — and the second leg for a server whose SEARCH is broken,
+    // which is the "mangles both" case replacement promised to survive.
+    if linkage.uid_validity == Some(uid_validity)
+        && let Some(uid) = linkage.uid
+        && !old.contains(&uid)
+    {
+        old.push(uid);
+    }
 
     let landed = session.append_returning_uid(
         wire_name,
