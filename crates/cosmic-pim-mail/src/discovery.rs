@@ -341,15 +341,16 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(start)) => {
-                element = String::from_utf8_lossy(start.local_name().as_ref()).into_owned();
+                // quick-xml 0.42: names arrive as &str, already decoded.
+                element = start.local_name().as_ref().to_owned();
                 match element.as_str() {
                     "incomingServer" => {
                         in_incoming = true;
                         // Only IMAP is usable here. A POP3 block is a real
                         // answer to a different question.
                         incoming_is_imap = start.attributes().flatten().any(|attribute| {
-                            attribute.key.local_name().as_ref() == b"type"
-                                && attribute.value.as_ref() == b"imap"
+                            attribute.key.local_name().as_ref() == "type"
+                                && attribute.value.as_ref() == "imap"
                         });
                     }
                     "outgoingServer" => in_outgoing = true,
@@ -357,7 +358,7 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
                 }
             }
             Ok(Event::End(end)) => {
-                match String::from_utf8_lossy(end.local_name().as_ref()).as_ref() {
+                match end.local_name().as_ref() {
                     "incomingServer" => in_incoming = false,
                     "outgoingServer" => in_outgoing = false,
                     _ => {}
@@ -365,7 +366,7 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
                 element.clear();
             }
             Ok(Event::Text(text)) => {
-                let value = text.decode().unwrap_or_default().trim().to_string();
+                let value = text.xml10_content().trim().to_string();
                 if value.is_empty() {
                     continue;
                 }
