@@ -220,7 +220,7 @@ fn drain_outbox_with(
     now_ms: i64,
     submit: impl FnMut(&cosmic_pim_mail::Draft) -> cosmic_pim_mail::Outcome,
 ) -> Result<Drained> {
-    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id).join("outbox"))
+    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id))
         .map_err(Error::Mail)?;
     let outcome = outbox.drain_with(submit, now_ms).map_err(Error::Mail)?;
     Ok(Drained {
@@ -590,7 +590,7 @@ fn drain_outbox(
     now_ms: i64,
     session: &mut Session,
 ) -> Result<(usize, usize)> {
-    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id).join("outbox"))
+    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id))
         .map_err(Error::Mail)?;
 
     let outcome = outbox
@@ -659,6 +659,53 @@ mod tests {
 
         assert!(report.mailboxes.is_empty());
         assert!(!report.changed());
+    }
+
+    #[test]
+    fn the_drain_reads_the_outbox_the_app_writes() {
+        // Regression: the drain used to open `<account>/outbox`, and
+        // `Outbox::open` joins its own `.outbox` on top — so the sync pass
+        // drained a phantom empty directory and queued sends never left on
+        // the next check. The paths must resolve to the same place.
+        use cosmic_pim_mail::compose::Draft;
+        use cosmic_pim_mail::model::Mailbox;
+        use cosmic_pim_mail::smtp::Outcome;
+
+        let account = account_with_mail();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Queue exactly as the app does: Outbox::open on the account root.
+        let mut draft = Draft::new(Mailbox {
+            name: None,
+            address: "ada@example.com".into(),
+        });
+        draft.to.push(Mailbox {
+            name: None,
+            address: "bob@example.net".into(),
+        });
+        draft.subject = "waiting".into();
+        let outbox = cosmic_pim_mail::Outbox::open(dir.path().join(&account.id)).unwrap();
+        outbox
+            .queue(
+                "0000000000000001",
+                &draft,
+                &Outcome::NotSent(cosmic_pim_mail::Error::Imap("offline".into())),
+                0,
+            )
+            .unwrap();
+
+        // Drain exactly as the sync pass does, far enough in the future that
+        // the backoff has elapsed, with a submitter that always accepts.
+        let drained = drain_outbox_with(&account, dir.path(), i64::MAX, |built| {
+            Outcome::Sent(format!("To: {}\r\n\r\nx", built.to[0].address).into_bytes())
+        })
+        .expect("drain");
+
+        assert_eq!(
+            drained.sent, 1,
+            "the drain did not see the message the app queued"
+        );
+        assert_eq!(outbox.count(), 0, "the sent message stayed queued");
     }
 
     #[test]
