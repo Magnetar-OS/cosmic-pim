@@ -121,6 +121,24 @@ pub struct MailEndpoint {
     pub from_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from_name: String,
+
+    /// Additional addresses this account may send as.
+    ///
+    /// The provider has to be configured to accept them — an alias here that
+    /// the server does not know is a message the server will refuse or, worse,
+    /// rewrite. The client's job is to offer the choice and put the right
+    /// name on it; it cannot make an address deliverable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<Alias>,
+}
+
+/// One additional From identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alias {
+    /// The display name for this identity. Empty means "the account's own".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub address: String,
 }
 
 fn default_smtp_port() -> u16 {
@@ -154,6 +172,7 @@ impl MailEndpoint {
             pop3_transport: Transport::Tls,
             from_address: String::new(),
             from_name: String::new(),
+            aliases: Vec::new(),
         }
     }
 
@@ -254,6 +273,34 @@ impl Account {
             .filter(|n| !n.is_empty())
             .map_or_else(|| self.display_name.clone(), ToOwned::to_owned);
         Some((name, address))
+    }
+
+    /// Every identity mail may go out as: the primary first, then the
+    /// aliases, each `(name, address)`.
+    ///
+    /// Duplicates of the primary are dropped rather than listed twice, and an
+    /// alias with no name of its own borrows the primary's — a From line with
+    /// a bare address where every other message carries a name reads like a
+    /// different sender.
+    #[must_use]
+    pub fn identities(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self.from_identity().into_iter().collect();
+        let primary_name = out.first().map(|(name, _)| name.clone()).unwrap_or_default();
+        if let Some(mail) = self.mail.as_ref() {
+            for alias in &mail.aliases {
+                let address = alias.address.trim();
+                if address.is_empty()
+                    || out.iter().any(|(_, a)| a.eq_ignore_ascii_case(address))
+                {
+                    continue;
+                }
+                let name = Some(alias.name.trim())
+                    .filter(|n| !n.is_empty())
+                    .map_or_else(|| primary_name.clone(), ToOwned::to_owned);
+                out.push((name, address.to_owned()));
+            }
+        }
+        out
     }
 
     /// The secret slot holding this account's password.
@@ -549,6 +596,59 @@ mod tests {
             "https://caldav.fastmail.com/",
             "me@fastmail.com",
         )
+    }
+
+    #[test]
+    fn identities_lead_with_the_primary_and_fill_in_missing_alias_names() {
+        let mut account = account();
+        let mut mail = MailEndpoint::tls("imap.fastmail.com");
+        mail.from_address = "me@fastmail.com".into();
+        mail.from_name = "Ada".into();
+        mail.aliases = vec![
+            Alias {
+                name: String::new(),
+                address: "sales@example.com".into(),
+            },
+            Alias {
+                name: "Support".into(),
+                address: "help@example.com".into(),
+            },
+            // A duplicate of the primary must not be listed twice.
+            Alias {
+                name: "Me again".into(),
+                address: "ME@fastmail.com".into(),
+            },
+        ];
+        account.mail = Some(mail);
+
+        let identities = account.identities();
+        assert_eq!(
+            identities,
+            vec![
+                ("Ada".to_owned(), "me@fastmail.com".to_owned()),
+                ("Ada".to_owned(), "sales@example.com".to_owned()),
+                ("Support".to_owned(), "help@example.com".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_account_without_aliases_has_exactly_its_primary_identity() {
+        let mut account = account();
+        let mut mail = MailEndpoint::tls("imap.fastmail.com");
+        mail.from_address = "me@fastmail.com".into();
+        account.mail = Some(mail);
+        assert_eq!(account.identities().len(), 1);
+    }
+
+    #[test]
+    fn an_endpoint_written_before_aliases_existed_still_loads() {
+        let toml = r#"
+            protocol = "imap"
+            imap_host = "imap.example.com"
+        "#;
+        let endpoint: MailEndpoint = toml::from_str(toml).expect("an old endpoint must load");
+        assert!(endpoint.aliases.is_empty());
     }
 
     #[test]

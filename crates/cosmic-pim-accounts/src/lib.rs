@@ -33,7 +33,7 @@ pub mod error;
 pub mod provider;
 pub mod secret;
 
-pub use account::{Account, AccountStore, AuthMethod, MailEndpoint, Transport};
+pub use account::{Account, AccountStore, Alias, AuthMethod, MailEndpoint, Transport};
 pub use credential::{OAuthCredential, Secret};
 pub use error::{Error, Result};
 pub use provider::{MailProtocol, MailService, OAuth, Provider, Registry};

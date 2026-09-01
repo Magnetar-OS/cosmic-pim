@@ -228,6 +228,7 @@ impl MailService {
             pop3_transport: self.pop3_transport,
             from_address: username.to_owned(),
             from_name: String::new(),
+            aliases: Vec::new(),
         }
     }
 }
