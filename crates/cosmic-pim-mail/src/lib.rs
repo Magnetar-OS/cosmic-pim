@@ -28,7 +28,9 @@
 //! - [`attachment`] — getting attachments out of a message, and safely onto a disk.
 //! - [`compose`] — drafts, and how a reply or a forward is built from a message.
 //! - [`discovery`] — working out where an address's mail lives, from the address.
-//! - [`drafts`] — unsent messages, kept on this device.
+//! - [`drafts`] — unsent messages: local records, mirrored to the server.
+//! - [`draft_sync`] — the mirror: replacement without duplication.
+//! - [`rules`] — filter rules: match a message, plan its actions.
 //! - [`smtp`] — sending, and the one failure that must never be auto-retried.
 //! - [`threading`] — JWZ threading with deterministic thread ids.
 //! - [`folder`] — mailbox names, hierarchy, and RFC 6154 special use.
@@ -94,6 +96,7 @@ pub mod outbox;
 pub mod plan;
 pub mod pop3;
 pub mod push;
+pub mod rules;
 pub mod sasl;
 pub mod search;
 pub mod smtp;

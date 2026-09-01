@@ -546,6 +546,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tiny_http",
+ "toml",
  "tracing",
 ]
 
