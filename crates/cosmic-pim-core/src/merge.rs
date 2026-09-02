@@ -29,6 +29,13 @@
 //! invented data to every device the user owns. The asymmetry decides every
 //! borderline case.
 //!
+//! The question itself is served by the same machinery: [`overlaps`] lists
+//! exactly the units [`merge3`] refused over — base, local, and remote
+//! versions side by side — and [`resolve`] rebuilds the document from the
+//! user's per-unit choices, merging everything undisputed the ordinary way.
+//! That is the whole per-property conflict UI contract: show `overlaps`,
+//! collect a [`Side`] per unit, write back what `resolve` returns.
+//!
 //! # Units
 //!
 //! A component's contents divide into units, compared side by side:
@@ -242,9 +249,107 @@ fn inventory(text: &str) -> Option<Inventory<'_>> {
     })
 }
 
+/* ---------------- overlaps, and choosing over them ---------------- */
+
+/// Which revision's version of one disputed unit survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Local,
+    Remote,
+}
+
+/// One unit both revisions changed, incompatibly — the thing a conflict UI
+/// puts in front of the user, with all three versions to diff.
+///
+/// `unit` is a stable label doubling as the choice key for [`resolve`]:
+/// `"SUMMARY"`, `"item1.EMAIL"`, `"VALARM"`, and for a dispute *inside* a
+/// keyed child, a slash path like `"VEVENT s@x 20260810T090000Z/SUMMARY"`.
+/// The values are unfolded logical lines; `None` means the unit does not
+/// exist in that revision (added on one side, or deleted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlap {
+    pub unit: String,
+    pub base: Option<Vec<String>>,
+    pub local: Option<Vec<String>>,
+    pub remote: Option<Vec<String>>,
+}
+
+/// The disputed units of a divergence — what [`merge3`] could not decide.
+///
+/// Empty means the revisions merge cleanly (or one side did not change);
+/// `None` means the texts cannot be compared at all (unparseable, or not the
+/// same kind of document), in which case the only honest resolutions are
+/// wholesale keep-local / take-remote.
+#[must_use]
+pub fn overlaps(base: &str, local: &str, remote: &str) -> Option<Vec<Overlap>> {
+    if local == base || remote == base || local == remote {
+        return Some(Vec::new());
+    }
+    let mut found = Vec::new();
+    merge_with(base, local, remote, "", &mut |unit, b, l, r| {
+        found.push(Overlap {
+            unit: unit.to_owned(),
+            base: b.map(<[String]>::to_vec),
+            local: l.map(<[String]>::to_vec),
+            remote: r.map(<[String]>::to_vec),
+        });
+        // Any answer keeps the walk going; the output text is discarded.
+        Some(Side::Remote)
+    })?;
+    Some(found)
+}
+
+/// Builds the merged text from per-unit choices over the [`overlaps`].
+///
+/// `choices` maps each [`Overlap::unit`] to the side that survives; every
+/// disputed unit must be decided — a missing choice yields `None` rather than
+/// a half-resolved document. Units that were never in dispute merge exactly
+/// as [`merge3`] would have merged them.
+#[must_use]
+pub fn resolve(
+    base: &str,
+    local: &str,
+    remote: &str,
+    choices: &BTreeMap<String, Side>,
+) -> Option<String> {
+    merge_with(base, local, remote, "", &mut |unit, _, _, _| {
+        choices.get(unit).copied()
+    })
+}
+
+/// The choice-key label for one unit, extended by `path` when nested.
+fn label(path: &str, key: &Key) -> String {
+    let own = match key {
+        Key::Prop(None, name) | Key::Collective(name) => name.clone(),
+        Key::Prop(Some(group), name) => format!("{group}.{name}"),
+        Key::Child(name, uid, rid) if rid.is_empty() => format!("{name} {uid}"),
+        Key::Child(name, uid, rid) => format!("{name} {uid} {rid}"),
+    };
+    if path.is_empty() {
+        own
+    } else {
+        format!("{path}/{own}")
+    }
+}
+
 /* ---------------- the merge ---------------- */
 
+/// What to do about one genuinely overlapping unit. `None` aborts the merge.
+type Decide<'a> =
+    dyn FnMut(&str, Option<&[String]>, Option<&[String]>, Option<&[String]>) -> Option<Side> + 'a;
+
 fn merge_component(base: &str, local: &str, remote: &str) -> Option<String> {
+    // The strict form: any overlap is fatal. `merge3`'s behaviour.
+    merge_with(base, local, remote, "", &mut |_, _, _, _| None)
+}
+
+fn merge_with(
+    base: &str,
+    local: &str,
+    remote: &str,
+    path: &str,
+    decide: &mut Decide<'_>,
+) -> Option<String> {
     let base_inv = inventory(base)?;
     let local_inv = inventory(local)?;
     let remote_inv = inventory(remote)?;
@@ -278,30 +383,41 @@ fn merge_component(base: &str, local: &str, remote: &str) -> Option<String> {
         if !local_changed {
             continue; // remote's version flows through the reconstruction
         }
-        if remote_changed {
+        let take_local = if remote_changed {
             if l == r {
                 continue; // both made the identical change
             }
             // Both changed a keyed child: recurse — the disagreement may be
-            // about different units inside it.
+            // about different units inside it, each decidable on its own.
             if let (Key::Child(..), Some(_), Some(_), Some(_)) = (key, &b, &l, &r) {
-                let merged = merge_component(
+                let merged = merge_with(
                     &base_inv.child_text(key)?,
                     &local_inv.child_text(key)?,
                     &remote_inv.child_text(key)?,
+                    &label(path, key),
+                    decide,
                 )?;
                 substitutions.insert(key.clone(), Some(merged));
                 continue;
             }
-            return None; // a genuine overlap: the user decides
-        }
+            // A genuine overlap: someone decides, or nobody does and the
+            // merge honestly fails.
+            match decide(&label(path, key), b.as_deref(), l.as_deref(), r.as_deref())? {
+                Side::Local => true,
+                // Remote's version (or its deletion) flows through the
+                // reconstruction untouched.
+                Side::Remote => continue,
+            }
+        } else {
+            true // changed locally only: local is authoritative for this unit
+        };
 
-        // Changed locally only: local's version is authoritative for this unit.
-        let replacement = match l {
+        debug_assert!(take_local);
+        let replacement = match &l {
             None => None,
             Some(unfolded_lines) => {
                 let mut text = String::new();
-                for line in &unfolded_lines {
+                for line in unfolded_lines {
                     fold(line, terminator, &mut text);
                 }
                 Some(text)
@@ -656,6 +772,133 @@ TEL:+1\r\nTEL:+2\r\nEND:VCARD\r\n";
         let merged = merge3(&base, &local, &remote).expect("merged");
         assert!(!merged.contains('\r'), "an LF document gained CRLF");
         assert!(merged.contains("SUMMARY:Team sync (moved)\n"));
+    }
+
+    /* ---------------- overlaps and per-unit resolution ---------------- */
+
+    #[test]
+    fn a_clean_merge_has_no_overlaps() {
+        let base = event("Team sync", "20260810T090000Z", None);
+        let local = event("Team sync (moved)", "20260810T090000Z", None);
+        let remote = event("Team sync", "20260810T100000Z", None);
+        assert_eq!(overlaps(&base, &local, &remote), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_disputed_property_lists_all_three_versions() {
+        let base = event("Team sync", "20260810T090000Z", None);
+        let local = event("Sprint review", "20260810T090000Z", None);
+        let remote = event("Retrospective", "20260810T090000Z", None);
+
+        let found = overlaps(&base, &local, &remote).expect("comparable");
+        assert_eq!(found.len(), 1);
+        let o = &found[0];
+        assert_eq!(o.unit, "VEVENT a@test/SUMMARY");
+        assert_eq!(
+            o.base.as_deref(),
+            Some(&["SUMMARY:Team sync".to_owned()][..])
+        );
+        assert_eq!(
+            o.local.as_deref(),
+            Some(&["SUMMARY:Sprint review".to_owned()][..])
+        );
+        assert_eq!(
+            o.remote.as_deref(),
+            Some(&["SUMMARY:Retrospective".to_owned()][..])
+        );
+    }
+
+    #[test]
+    fn choosing_a_side_per_unit_builds_the_document() {
+        // Two disputes: the summary and the location. One goes each way, and
+        // the undisputed DTSTART edit still merges like merge3 would.
+        let base = event("Team sync", "20260810T090000Z", Some("Room 5"));
+        let local = event("Sprint review", "20260810T090000Z", Some("Room 6"));
+        let remote = event("Retrospective", "20260810T100000Z", Some("Room 7"));
+
+        let found = overlaps(&base, &local, &remote).expect("comparable");
+        assert_eq!(found.len(), 2, "{found:?}");
+
+        let mut choices = BTreeMap::new();
+        choices.insert("VEVENT a@test/SUMMARY".to_owned(), Side::Local);
+        choices.insert("VEVENT a@test/LOCATION".to_owned(), Side::Remote);
+
+        let text = resolve(&base, &local, &remote, &choices).expect("every unit decided");
+        assert!(text.contains("SUMMARY:Sprint review\r\n"), "{text}");
+        assert!(text.contains("LOCATION:Room 7\r\n"), "{text}");
+        assert!(
+            text.contains("DTSTART:20260810T100000Z\r\n"),
+            "the undisputed remote edit was lost: {text}"
+        );
+    }
+
+    #[test]
+    fn an_undecided_unit_refuses_rather_than_half_resolving() {
+        let base = event("Team sync", "20260810T090000Z", None);
+        let local = event("Sprint review", "20260810T090000Z", None);
+        let remote = event("Retrospective", "20260810T090000Z", None);
+
+        assert!(
+            resolve(&base, &local, &remote, &BTreeMap::new()).is_none(),
+            "a document was produced with a dispute nobody decided"
+        );
+    }
+
+    #[test]
+    fn resolve_with_no_disputes_equals_merge3() {
+        let base = event("Team sync", "20260810T090000Z", None);
+        let local = event("Team sync (moved)", "20260810T090000Z", None);
+        let remote = event("Team sync", "20260810T100000Z", None);
+
+        assert_eq!(
+            resolve(&base, &local, &remote, &BTreeMap::new()),
+            merge3(&base, &local, &remote)
+        );
+    }
+
+    #[test]
+    fn a_dispute_inside_an_override_carries_its_path() {
+        let base = series("Master", "Override");
+        let local = series("Master", "Mine");
+        let remote = series("Master", "Theirs");
+
+        let found = overlaps(&base, &local, &remote).expect("comparable");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].unit, "VEVENT s@x 20260810T090000Z/SUMMARY");
+
+        let mut choices = BTreeMap::new();
+        choices.insert(found[0].unit.clone(), Side::Local);
+        let text = resolve(&base, &local, &remote, &choices).expect("decided");
+        assert!(text.contains("SUMMARY:Mine\r\n"), "{text}");
+        assert!(text.contains("SUMMARY:Master\r\n"));
+    }
+
+    #[test]
+    fn remove_versus_edit_is_decidable_both_ways() {
+        let base = event("Team sync", "20260810T090000Z", Some("Room 5"));
+        let local = event("Team sync", "20260810T090000Z", None);
+        let remote = event("Team sync", "20260810T090000Z", Some("Room 6"));
+
+        let found = overlaps(&base, &local, &remote).expect("comparable");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].local, None, "the deletion did not read as absence");
+
+        let mut keep_deletion = BTreeMap::new();
+        keep_deletion.insert(found[0].unit.clone(), Side::Local);
+        let gone = resolve(&base, &local, &remote, &keep_deletion).unwrap();
+        assert!(!gone.contains("LOCATION"), "{gone}");
+
+        let mut keep_theirs = BTreeMap::new();
+        keep_theirs.insert(found[0].unit.clone(), Side::Remote);
+        let kept = resolve(&base, &local, &remote, &keep_theirs).unwrap();
+        assert!(kept.contains("LOCATION:Room 6\r\n"), "{kept}");
+    }
+
+    #[test]
+    fn garbage_has_no_overlaps_to_offer() {
+        let doc = event("A", "20260810T090000Z", None);
+        let local = event("B", "20260810T090000Z", None);
+        assert_eq!(overlaps(&doc, &local, "<html>sign in</html>"), None);
     }
 
     #[test]
