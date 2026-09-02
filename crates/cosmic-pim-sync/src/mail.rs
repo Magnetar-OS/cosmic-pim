@@ -638,6 +638,7 @@ mod tests {
             pop3_transport: Transport::Tls,
             from_address: "ada@example.com".into(),
             from_name: "Ada".into(),
+            aliases: Vec::new(),
         });
         account
     }
