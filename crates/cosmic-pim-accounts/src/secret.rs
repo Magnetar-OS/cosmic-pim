@@ -50,7 +50,28 @@ use crate::error::{Error, Result};
 
 const KEY_FILE: &str = "secrets.key";
 const STORE_FILE: &str = "secrets.enc.json";
+/// Which backend holds each slot. Plain JSON: slot names are account ids,
+/// which already live unencrypted in `accounts.toml` — the *values* are what
+/// is secret, and none live here.
+const RECORD_FILE: &str = "secrets.backends.json";
 const PROBE_SLOT: &str = "__cosmic-pim-backend-probe";
+
+/// How long the keychain probe may take before the store gives up on it.
+///
+/// A locked Secret Service provider can sit on a `SearchItems` call for
+/// *minutes* before answering "the collection is locked" — measured at ~3.5
+/// minutes against a locked provider, with every app's init stalled behind
+/// it. Three seconds is beyond any healthy daemon's answer time and short
+/// enough that a wedged one costs a barely visible pause instead of a hang.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Skips the OS keychain entirely when set (any value).
+///
+/// The escape hatch for a keyring daemon that is present but broken — or
+/// locked forever — which is otherwise unrecoverable from outside the app.
+/// Read inside [`SecretStore::open`], so every app in the suite honours it
+/// without carrying a flag of its own.
+const NO_KEYRING_ENV: &str = "COSMIC_PIM_NO_KEYRING";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,15 +94,26 @@ pub struct SecretStore {
 impl SecretStore {
     /// Opens a store, probing the OS keychain to decide the backend.
     ///
-    /// `dir` is only used by the envelope fallback; nothing is written there
-    /// when the keychain works.
+    /// `dir` holds the envelope fallback and the per-slot backend record;
+    /// nothing secret is written there while the keychain works.
+    ///
+    /// The probe is bounded by [`PROBE_TIMEOUT`] — a locked Secret Service
+    /// provider blocks for minutes otherwise, and everything downstream of an
+    /// app's init would stall behind it. `COSMIC_PIM_NO_KEYRING` skips the
+    /// keychain outright.
     #[must_use]
     pub fn open(service: &str, dir: &Path) -> Self {
-        let (backend, fallback_reason) = match Self::probe(service) {
+        if std::env::var_os(NO_KEYRING_ENV).is_some() {
+            let mut store = Self::open_envelope_only(service, dir);
+            store.fallback_reason = Some(format!("{NO_KEYRING_ENV} is set"));
+            return store;
+        }
+
+        let (backend, fallback_reason) = match Self::probe_with_timeout(service) {
             Ok(()) => (Backend::OsKeychain, None),
             Err(why) => {
                 tracing::warn!(%why, "OS keychain unusable; falling back to a local envelope");
-                (Backend::LocalEnvelope, Some(why.to_string()))
+                (Backend::LocalEnvelope, Some(why))
             }
         };
 
@@ -123,6 +155,33 @@ impl SecretStore {
         }
     }
 
+    /// [`Self::probe`] on its own thread, abandoned if it exceeds
+    /// [`PROBE_TIMEOUT`].
+    ///
+    /// The abandoned thread finishes (or hangs) harmlessly in the background —
+    /// its probe entry deletes itself on the way out — while the store gets on
+    /// with the envelope. Blocking the caller instead was measured at ~85 s to
+    /// four *minutes* of frozen init against a locked provider.
+    fn probe_with_timeout(service: &str) -> std::result::Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let owned = service.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name("keychain-probe".into())
+            .spawn(move || {
+                let _ = tx.send(Self::probe(&owned).map_err(|e| e.to_string()));
+            });
+        if spawned.is_err() {
+            return Err("could not spawn the keychain probe".to_owned());
+        }
+        match rx.recv_timeout(PROBE_TIMEOUT) {
+            Ok(outcome) => outcome,
+            Err(_) => Err(format!(
+                "keychain did not answer within {}s (locked or wedged provider?)",
+                PROBE_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
     #[must_use]
     pub fn backend(&self) -> Backend {
         self.backend
@@ -133,47 +192,173 @@ impl SecretStore {
         self.fallback_reason.as_deref()
     }
 
+    /// Loads a secret, honouring where it was actually written.
+    ///
+    /// # Why the per-slot record exists
+    ///
+    /// The backend is decided per *open*. A password stored to the envelope
+    /// while the keychain was locked used to become invisible — `Ok(None)`,
+    /// not an error — the moment the keychain started answering again, and
+    /// the account it belonged to was silently skipped. So every write
+    /// records which backend took it, and reads follow the record rather than
+    /// the day's probe result. A slot recorded in the keychain while the
+    /// keychain is unreachable is an **error naming the problem**, never a
+    /// silent `None`.
     pub fn load(&self, slot: &str) -> Result<Option<String>> {
-        match self.backend {
-            Backend::OsKeychain => {
-                match keyring::Entry::new(&self.service, slot)
-                    .map_err(Error::keychain)?
-                    .get_password()
-                {
-                    Ok(v) => Ok(Some(v)),
-                    Err(keyring::Error::NoEntry) => Ok(None),
-                    Err(e) => Err(Error::keychain(e)),
+        match self.recorded_backend(slot) {
+            Some(Backend::LocalEnvelope) => self.envelope_load(slot),
+            Some(Backend::OsKeychain) => match self.backend {
+                Backend::OsKeychain => self.keychain_load(slot),
+                Backend::LocalEnvelope => Err(Error::keychain(format!(
+                    "this secret lives in the OS keychain, which is unavailable ({})",
+                    self.fallback_reason.as_deref().unwrap_or("unknown reason")
+                ))),
+            },
+            // Written before records existed: read the live backend, and on a
+            // miss check the envelope — the one place a secret can be without
+            // the keychain knowing. Whatever is found gets recorded, so the
+            // legacy path runs at most once per slot.
+            None => match self.backend {
+                Backend::OsKeychain => match self.keychain_load(slot)? {
+                    Some(value) => {
+                        self.record_backend(slot, Backend::OsKeychain);
+                        Ok(Some(value))
+                    }
+                    None => {
+                        let fallback = self.envelope_load(slot)?;
+                        if fallback.is_some() {
+                            self.record_backend(slot, Backend::LocalEnvelope);
+                        }
+                        Ok(fallback)
+                    }
+                },
+                Backend::LocalEnvelope => {
+                    let value = self.envelope_load(slot)?;
+                    if value.is_some() {
+                        self.record_backend(slot, Backend::LocalEnvelope);
+                    }
+                    Ok(value)
                 }
-            }
-            Backend::LocalEnvelope => self.envelope_load(slot),
+            },
         }
     }
 
     pub fn store(&self, slot: &str, value: &str) -> Result<()> {
+        let previous = self.recorded_backend(slot);
         match self.backend {
             Backend::OsKeychain => keyring::Entry::new(&self.service, slot)
                 .map_err(Error::keychain)?
                 .set_password(value)
-                .map_err(Error::keychain),
-            Backend::LocalEnvelope => self.envelope_store(slot, value),
+                .map_err(Error::keychain)?,
+            Backend::LocalEnvelope => self.envelope_store(slot, value)?,
         }
+        self.record_backend(slot, self.backend);
+
+        // A rewrite that moved backends leaves a stale copy behind. The
+        // envelope copy is cheap and safe to remove; a stale *keychain* copy
+        // is not touched from the fallback — the keychain being unreachable
+        // is why we are here, and one blocked call per save is the bug this
+        // module just fixed. The record shadows it either way.
+        if previous == Some(Backend::LocalEnvelope) && self.backend == Backend::OsKeychain {
+            if let Err(why) = self.envelope_forget(slot) {
+                tracing::warn!(slot, %why, "could not remove the superseded envelope copy");
+            }
+        } else if previous == Some(Backend::OsKeychain) && self.backend == Backend::LocalEnvelope {
+            tracing::info!(
+                slot,
+                "a keychain copy of this secret is now shadowed by the envelope; \
+                 it will be overwritten the next time the keychain takes a save"
+            );
+        }
+        Ok(())
     }
 
     /// Best-effort delete. A missing entry is success and anything else is
     /// logged rather than returned: removing an account must not fail because
     /// its password was already gone.
+    ///
+    /// Removes every copy it can reach — the recorded backend, and the
+    /// envelope regardless (cheap, and the one place a stray copy hides). A
+    /// keychain copy is only touched while the keychain answers.
     pub fn forget(&self, slot: &str) {
-        let outcome = match self.backend {
-            Backend::OsKeychain => keyring::Entry::new(&self.service, slot)
+        if self.backend == Backend::OsKeychain {
+            let outcome = keyring::Entry::new(&self.service, slot)
                 .map_err(Error::keychain)
                 .and_then(|entry| match entry.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                     Err(e) => Err(Error::keychain(e)),
-                }),
-            Backend::LocalEnvelope => self.envelope_forget(slot),
+                });
+            if let Err(why) = outcome {
+                tracing::warn!(slot, %why, "could not delete the keychain copy");
+            }
+        }
+        if let Err(why) = self.envelope_forget(slot) {
+            tracing::warn!(slot, %why, "could not delete the envelope copy");
+        }
+        self.erase_record(slot);
+    }
+
+    fn keychain_load(&self, slot: &str) -> Result<Option<String>> {
+        match keyring::Entry::new(&self.service, slot)
+            .map_err(Error::keychain)?
+            .get_password()
+        {
+            Ok(v) => Ok(Some(v)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(Error::keychain(e)),
+        }
+    }
+
+    /* ---------------- the per-slot backend record ---------------- */
+
+    fn read_records(&self) -> HashMap<String, Backend> {
+        std::fs::read(self.dir.join(RECORD_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn recorded_backend(&self, slot: &str) -> Option<Backend> {
+        self.read_records().get(slot).copied()
+    }
+
+    /// Durable, best-effort: a record that fails to write costs one legacy
+    /// lookup later, not a secret.
+    fn record_backend(&self, slot: &str, backend: Backend) {
+        // The same lock the envelope uses: the record's read-modify-write is
+        // just as unatomic across threads as the envelope's is.
+        let Ok(_guard) = self.envelope_lock.lock() else {
+            return;
         };
-        if let Err(why) = outcome {
-            tracing::warn!(slot, %why, "could not delete secret");
+        let mut records = self.read_records();
+        if records.get(slot) == Some(&backend) {
+            return;
+        }
+        records.insert(slot.to_owned(), backend);
+        self.write_records(&records);
+    }
+
+    fn erase_record(&self, slot: &str) {
+        let Ok(_guard) = self.envelope_lock.lock() else {
+            return;
+        };
+        let mut records = self.read_records();
+        if records.remove(slot).is_some() {
+            self.write_records(&records);
+        }
+    }
+
+    fn write_records(&self, records: &HashMap<String, Backend>) {
+        std::fs::create_dir_all(&self.dir).ok();
+        match serde_json::to_string_pretty(records) {
+            Ok(json) => {
+                if let Err(why) =
+                    cosmic_pim_core::atomic::write(&self.dir.join(RECORD_FILE), &json, None)
+                {
+                    tracing::warn!(%why, "could not write the secret backend record");
+                }
+            }
+            Err(why) => tracing::warn!(%why, "could not serialise the secret backend record"),
         }
     }
 
@@ -434,5 +619,113 @@ mod tests {
         let (dir, store) = store();
         std::fs::write(dir.path().join(STORE_FILE), "{ not json").unwrap();
         assert_eq!(store.load("slot").unwrap(), None);
+    }
+
+    /* ---------------- the per-slot backend record ---------------- */
+
+    #[test]
+    fn a_write_records_which_backend_took_it() {
+        let (dir, store) = store();
+        store.store("slot", "hunter2").unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join(RECORD_FILE)).unwrap();
+        assert!(
+            raw.contains("local-envelope"),
+            "no backend was recorded: {raw}"
+        );
+    }
+
+    /// The stranding bug this record exists to prevent: a secret written to
+    /// the envelope while the keychain was locked must never read back as a
+    /// silent `None` under a different backend decision. A record naming an
+    /// unreachable keychain is an error that says so.
+    #[test]
+    fn a_slot_recorded_in_an_unreachable_keychain_is_an_error_not_a_silent_miss() {
+        let (dir, store) = store();
+        std::fs::write(
+            dir.path().join(RECORD_FILE),
+            r#"{"work-account":"os-keychain"}"#,
+        )
+        .unwrap();
+
+        let outcome = store.load("work-account");
+        assert!(
+            outcome.is_err(),
+            "an unreachable recorded backend answered {outcome:?} instead of naming the problem"
+        );
+        assert!(
+            outcome.unwrap_err().to_string().contains("keychain"),
+            "the error does not say where the secret lives"
+        );
+    }
+
+    #[test]
+    fn a_recorded_envelope_slot_is_read_from_the_envelope() {
+        let (dir, store) = store();
+        store.store("slot", "hunter2").unwrap();
+
+        // Reopen and read through the record path explicitly.
+        let reopened = SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+        assert_eq!(
+            reopened.recorded_backend("slot"),
+            Some(Backend::LocalEnvelope)
+        );
+        assert_eq!(reopened.load("slot").unwrap().as_deref(), Some("hunter2"));
+    }
+
+    /// Secrets written before records existed migrate on first read.
+    #[test]
+    fn a_legacy_slot_without_a_record_is_found_and_recorded() {
+        let (dir, store) = store();
+        store.store("slot", "hunter2").unwrap();
+        std::fs::remove_file(dir.path().join(RECORD_FILE)).unwrap();
+
+        assert_eq!(store.load("slot").unwrap().as_deref(), Some("hunter2"));
+        assert_eq!(
+            store.recorded_backend("slot"),
+            Some(Backend::LocalEnvelope),
+            "the legacy lookup did not record what it found"
+        );
+    }
+
+    #[test]
+    fn forgetting_erases_the_record_with_the_secret() {
+        let (_dir, store) = store();
+        store.store("slot", "hunter2").unwrap();
+        store.forget("slot");
+
+        assert_eq!(store.recorded_backend("slot"), None);
+        assert_eq!(store.load("slot").unwrap(), None);
+    }
+
+    #[test]
+    fn a_corrupt_record_file_degrades_to_the_legacy_lookup() {
+        let (dir, store) = store();
+        store.store("slot", "hunter2").unwrap();
+        std::fs::write(dir.path().join(RECORD_FILE), "{ not json").unwrap();
+
+        assert_eq!(store.load("slot").unwrap().as_deref(), Some("hunter2"));
+    }
+
+    /// `COSMIC_PIM_NO_KEYRING` must route `open` straight to the envelope —
+    /// the escape hatch for a present-but-broken keyring daemon, honoured by
+    /// every app because it lives here and not in a per-app flag.
+    #[test]
+    fn the_no_keyring_env_var_skips_the_keychain_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: process-global, but no other test in this crate calls
+        // `SecretStore::open`, so nothing else observes the variable.
+        unsafe { std::env::set_var(NO_KEYRING_ENV, "1") };
+        let opened = SecretStore::open("cosmic-pim-test", dir.path());
+        unsafe { std::env::remove_var(NO_KEYRING_ENV) };
+
+        assert_eq!(opened.backend(), Backend::LocalEnvelope);
+        assert!(
+            opened
+                .fallback_reason()
+                .unwrap_or("")
+                .contains(NO_KEYRING_ENV),
+            "the UI cannot say why the keychain was skipped"
+        );
     }
 }
