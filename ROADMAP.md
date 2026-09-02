@@ -32,13 +32,23 @@ work. Last touched 2026-09-02.
 - **Milestone 2 — moving.** Substrate side largely ahead of the apps:
   occurrence overrides (RECURRENCE-ID end to end), server-side drafts
   mirror, filter rules + List-Id, outbox with scheduled sends and honest
-  cancel, send-as aliases, mbox import (parse side). `PARITY.md` audits
-  exist in all three app repos — data-loss-shaped gaps and ranked ceiling
-  gaps are enumerated there. App-side adoption open: conflict UIs,
-  `queue_save_with_base` at save sites, birthday display, three-scope
-  recurrence editing.
-- **Milestones 3–6 — not started**, except items the fleet pulled forward
-  (folder management in Envelope exceeds the Geary baseline already).
+  cancel, send-as aliases, mbox import (parse side), DSN parsing.
+  `PARITY.md` audits are committed in all three app repos —
+  data-loss-shaped gaps and ranked ceiling gaps are enumerated there.
+  Circle adopted `queue_save_with_base` (CardDAV auto-merge is live end to
+  end). App-side adoption open: conflict UIs, Slate's
+  `queue_save_with_base` sites, birthday display, three-scope recurrence
+  editing.
+- **Milestone 4 — pulled forward.** The iMIP hand-off contract is specified
+  (ARCHITECTURE.md, `Scheduling1`, encoding included) and Envelope's half is
+  implemented and committed (invitation detection, `DeliverInvitation`
+  caller with NameHasOwner degradation, `SendSchedulingReply` export into
+  the durable outbox; substrate `mail::calendar::invitation` +
+  `Outbox::submit`). Slate's half is the open item; end-to-end test when it
+  lands.
+- **Milestones 3, 5, 6 — not started**, except items the fleet pulled
+  forward (folder management in Envelope exceeds the Geary baseline
+  already).
 
 ---
 
