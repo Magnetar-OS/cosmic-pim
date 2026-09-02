@@ -21,31 +21,33 @@ work. Last touched 2026-09-02.
 
 - **Milestone 0 — done.** Docs agree with the code; the Meltemi MPL-2.0 grant
   exists (per-file, extended as ports continue); all four repos green.
-- **Milestone 1 — done except two in-flight items.** Landed: conflict base
+- **Milestone 1 — done except one in-flight item.** Landed: conflict base
   capture + automatic three-way merge + per-unit `overlaps`/`resolve`
   (`core::merge`), mass-delete confirm-on-second-sight, error taxonomy,
   quirks tables (DAV seeded, IMAP seeded from Dovecot), Windows TZ mapping,
   local-only collections, birthday synthesis (`core::birthdays`), round-trip
-  corpus, scheduling placeholder (`caldav::itip`). In flight: the RRULE
-  golden suite (`tests/golden.rs`), and the Baïkal/Nextcloud CI legs
-  (Radicale, Xandikos, Dovecot already run).
+  corpus, the RRULE golden suite, scheduling semantics (`caldav::itip`).
+  In flight: the Baïkal/Nextcloud CI legs (Radicale, Xandikos, Dovecot
+  already run).
 - **Milestone 2 — moving.** Substrate side largely ahead of the apps:
   occurrence overrides (RECURRENCE-ID end to end), server-side drafts
   mirror, filter rules + List-Id, outbox with scheduled sends and honest
   cancel, send-as aliases, mbox import (parse side), DSN parsing.
   `PARITY.md` audits are committed in all three app repos —
   data-loss-shaped gaps and ranked ceiling gaps are enumerated there.
-  Circle adopted `queue_save_with_base` (CardDAV auto-merge is live end to
-  end). App-side adoption open: conflict UIs, Slate's
-  `queue_save_with_base` sites, birthday display, three-scope recurrence
-  editing.
-- **Milestone 4 — pulled forward.** The iMIP hand-off contract is specified
-  (ARCHITECTURE.md, `Scheduling1`, encoding included) and Envelope's half is
-  implemented and committed (invitation detection, `DeliverInvitation`
-  caller with NameHasOwner degradation, `SendSchedulingReply` export into
-  the durable outbox; substrate `mail::calendar::invitation` +
-  `Outbox::submit`). Slate's half is the open item; end-to-end test when it
-  lands.
+  Both apps adopted `queue_save_with_base` (auto-merge live end to end for
+  events, tasks, and cards) and both consume `overlaps`/`resolve` in a
+  per-property conflict UI. Slate displays the birthday stream. App-side
+  open: three-scope recurrence editing UI.
+- **Milestone 4 — both iMIP halves implemented; end-to-end run pending.**
+  The contract is specified (ARCHITECTURE.md, `Scheduling1`, encoding
+  included). Envelope: invitation detection, `DeliverInvitation` caller
+  with NameHasOwner degradation, `SendSchedulingReply` export into the
+  durable outbox, charset handling pinned. Slate: `DeliverInvitation`
+  export, invitation dialog with slot conflict check, `itip::apply`
+  outcomes, REPLY handed back, series-CANCEL queues the server delete.
+  Remaining: the two apps' joint end-to-end run, then organizer send-side
+  and RFC 6638 free/busy.
 - **Milestones 3, 5, 6 — not started**, except items the fleet pulled
   forward (folder management in Envelope exceeds the Geary baseline
   already).
