@@ -167,6 +167,25 @@ impl Outbox {
         }
     }
 
+    /// Queues a message that has never been attempted, due immediately.
+    ///
+    /// This is the entry for sends that start life in the queue — a
+    /// scheduling reply handed over D-Bus, anything programmatic — where no
+    /// [`Outcome`] exists because nothing has touched the wire yet. The next
+    /// drain makes the first attempt; from there the message is
+    /// indistinguishable from one that failed once and was queued by
+    /// [`Self::queue`].
+    pub fn submit(&self, id: &str, draft: &Draft, now_ms: i64) -> Result<()> {
+        self.write(&Queued {
+            id: id.to_owned(),
+            draft: draft.clone(),
+            attempts: 0,
+            next_attempt_ms: now_ms,
+            last_error: None,
+            given_up: false,
+        })
+    }
+
     /// Everything waiting, oldest first — the order they should go out in.
     pub fn list(&self) -> Result<Vec<Queued>> {
         let Ok(entries) = fs::read_dir(&self.root) else {
@@ -430,6 +449,25 @@ mod tests {
             security: crate::imap::Security::Plaintext,
             username: "me@example.com".into(),
         }
+    }
+
+    #[test]
+    fn a_submitted_message_is_due_immediately_and_goes_on_the_first_drain() {
+        // `submit` is for sends that start life in the queue — no Outcome,
+        // no attempt yet — so the very next drain must try it, not back off.
+        let (_dir, outbox) = outbox();
+        outbox.submit("0000feed", &draft("Re: standup"), 1_000).unwrap();
+
+        let queued = outbox.list().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].attempts, 0);
+        assert!(queued[0].last_error.is_none());
+
+        let outcome = outbox
+            .drain_with(|_| Outcome::Sent(b"raw".to_vec()), 1_000)
+            .unwrap();
+        assert_eq!(outcome.sent.len(), 1);
+        assert_eq!(outbox.count(), 0);
     }
 
     #[test]

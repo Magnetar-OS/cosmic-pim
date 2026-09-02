@@ -79,6 +79,7 @@
 
 pub mod attachment;
 pub mod auth;
+pub mod calendar;
 pub mod compose;
 pub mod discovery;
 pub mod draft_sync;
