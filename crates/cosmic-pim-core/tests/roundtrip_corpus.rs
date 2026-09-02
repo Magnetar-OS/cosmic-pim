@@ -283,10 +283,7 @@ fn a_no_op_patch_reproduces_every_export_byte_for_byte() {
     for (label, component, text) in corpus() {
         let patched = patch_component(text, component, &no_edits())
             .unwrap_or_else(|| panic!("{label}: the patcher found no {component}"));
-        assert_eq!(
-            patched, text,
-            "{label}: a no-op patch changed bytes"
-        );
+        assert_eq!(patched, text, "{label}: a no-op patch changed bytes");
     }
 }
 
@@ -327,15 +324,16 @@ fn assert_only_property_changed(label: &str, original: &str, patched: &str, prop
     }
     let mut end_before = before.len();
     let mut end_after = after.len();
-    while end_before > start
-        && end_after > start
-        && before[end_before - 1] == after[end_after - 1]
+    while end_before > start && end_after > start && before[end_before - 1] == after[end_after - 1]
     {
         end_before -= 1;
         end_after -= 1;
     }
 
-    for line in before[start..end_before].iter().chain(&after[start..end_after]) {
+    for line in before[start..end_before]
+        .iter()
+        .chain(&after[start..end_after])
+    {
         let is_own = line.to_ascii_uppercase().starts_with(property)
             || line.starts_with(' ')
             || line.starts_with('\t');
@@ -375,7 +373,10 @@ fn editing_the_summary_touches_nothing_but_the_summary() {
             }
             "icloud" => {
                 assert!(patched.contains("X-APPLE-STRUCTURED-LOCATION"), "{label}");
-                assert!(patched.contains("BEGIN:VALARM"), "{label}: the alarm vanished");
+                assert!(
+                    patched.contains("BEGIN:VALARM"),
+                    "{label}: the alarm vanished"
+                );
             }
             "outlook" => {
                 assert!(
@@ -414,7 +415,10 @@ fn editing_an_ungrouped_email_leaves_the_apple_groups_alone() {
     let patched = patch_component(APPLE_VCF, "VCARD", &edits).expect("a VCARD");
 
     assert!(patched.contains("ada@analytical.example"));
-    assert!(!patched.contains("ada@engines.example"), "the old work address survived");
+    assert!(
+        !patched.contains("ada@engines.example"),
+        "the old work address survived"
+    );
     assert!(
         patched.contains("item1.EMAIL;type=INTERNET:ada@personal.example\r\n"),
         "the grouped personal address was disturbed"
@@ -424,7 +428,9 @@ fn editing_an_ungrouped_email_leaves_the_apple_groups_alone() {
         "the label was orphaned — the classic bug"
     );
     // And the folded PHOTO is still exactly itself.
-    assert!(patched.contains("PHOTO;ENCODING=b;TYPE=JPEG:/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwc\r\n"));
+    assert!(patched.contains(
+        "PHOTO;ENCODING=b;TYPE=JPEG:/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwc\r\n"
+    ));
     assert!(patched.contains(" oADAMBAAIRAxEAPwCdABmX/9k=\r\n"));
 }
 

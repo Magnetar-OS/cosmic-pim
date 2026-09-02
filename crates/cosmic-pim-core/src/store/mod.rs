@@ -69,10 +69,15 @@ impl From<crate::atomic::Error> for StoreError {
 }
 
 /// What an import did, so the UI can say so.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportSummary {
     pub added: usize,
     pub updated: usize,
+    /// The file names written, relative to the collection's directory — what a
+    /// caller needs to queue the imported entries for upload to a server the
+    /// collection is bound to. Storage itself never queues; see
+    /// `cosmic_pim_sync::queue_save` for the other half.
+    pub files: Vec<String>,
 }
 
 impl ImportSummary {
@@ -80,6 +85,21 @@ impl ImportSummary {
     pub fn total(&self) -> usize {
         self.added + self.updated
     }
+}
+
+/// What [`Store::split_series`] did.
+#[derive(Clone, Debug)]
+pub enum SplitOutcome {
+    /// The cut landed on or before the first instance, or the event does not
+    /// recur — there is nothing before the cut to keep, so no split happened.
+    /// The caller should apply its edit to the whole series instead.
+    WholeSeries,
+    /// The series was split. The value is the successor's master — the event
+    /// covering the cut instance and everything after it — for the caller to
+    /// apply its edit to and save. Both the truncated master's file and the
+    /// successor's file were written; a caller bound to a server must queue
+    /// writeback for both.
+    Split(Event),
 }
 
 /// Makes a UID safe to use as a file name.
@@ -435,6 +455,119 @@ impl Store {
         Ok(false)
     }
 
+    /// Splits a series at `instant` — the write side of editing "this and all
+    /// following" occurrences.
+    ///
+    /// The master keeps everything before the cut, truncated exactly as
+    /// [`Self::truncate_series`] truncates it. A successor series under a fresh
+    /// UID takes over from the cut instance: the same properties, the same rule
+    /// with any `COUNT` reduced by the instances the master keeps, the
+    /// exclusions at or past the cut, and every override at or past the cut
+    /// re-homed onto it rather than deleted.
+    ///
+    /// The successor's file is written before the master is truncated, so a
+    /// crash between the two writes leaves duplicated instances — a visible,
+    /// recoverable state — never lost ones.
+    ///
+    /// The successor anchors at the cut instance, which the caller obtained
+    /// from a generated occurrence, so the rule keeps its phase: a
+    /// `FREQ=WEEKLY;INTERVAL=2` series split on one of its own Tuesdays
+    /// continues on the same alternating Tuesdays.
+    pub fn split_series(
+        &mut self,
+        calendar_id: &str,
+        uid: &str,
+        instant: DateTime<Utc>,
+    ) -> Result<SplitOutcome, StoreError> {
+        let Some(master) = self.index.event(calendar_id, uid)? else {
+            tracing::warn!(uid, "no master to split");
+            return Ok(SplitOutcome::WholeSeries);
+        };
+        let Some(rule) = master.rrule.clone() else {
+            return Ok(SplitOutcome::WholeSeries);
+        };
+        if instant <= master.start.to_utc(self.local) {
+            return Ok(SplitOutcome::WholeSeries);
+        }
+
+        // Times in the value space the series iterates in — the space EXDATEs
+        // and wall-clock durations live in.
+        fn own_naive(t: crate::model::EventTime) -> chrono::NaiveDateTime {
+            match t {
+                crate::model::EventTime::Date(d) => d.and_time(NaiveTime::MIN),
+                crate::model::EventTime::Floating(dt) | crate::model::EventTime::Zoned(dt, _) => dt,
+            }
+        }
+
+        let cut = crate::model::naive_in_series_zone(master.start, instant, self.local);
+        let start = crate::model::rid_for(master.start, instant, self.local);
+        // Wall-clock duration, so a 09:00–10:00 meeting stays an hour on the
+        // clock across a DST boundary, matching how the series itself iterates.
+        let wall = own_naive(master.end) - own_naive(master.start);
+        let end = master.end.with_naive(own_naive(start) + wall);
+
+        // COUNT bounds the generated set *before* EXDATE removal (RFC 5545), so
+        // the instances the master keeps are counted with exclusions cleared.
+        let successor_rule = match crate::model::count_of(&rule) {
+            Some(count) => {
+                let mut probe = master.clone();
+                probe.exdates.clear();
+                let elapsed = crate::model::expand(
+                    &probe,
+                    master.start.to_utc(self.local),
+                    instant,
+                    self.local,
+                )
+                .len() as u32;
+                crate::model::with_count(&rule, count.saturating_sub(elapsed).max(1))
+            }
+            None => rule,
+        };
+
+        let now = Utc::now();
+        let mut successor = master.clone();
+        successor.uid = format!("{}@cosmic-pim", uuid::Uuid::new_v4());
+        successor.file_name = format!("{}.ics", successor.uid);
+        successor.start = start;
+        successor.end = end;
+        successor.rrule = Some(successor_rule);
+        successor.exdates = master
+            .exdates
+            .iter()
+            .copied()
+            .filter(|e| *e >= cut)
+            .collect();
+        successor.sequence = 0;
+        successor.created = Some(now);
+        successor.last_modified = Some(now);
+
+        let rehomed: Vec<Event> = self
+            .index
+            .events_with_uid(calendar_id, uid)?
+            .into_iter()
+            .filter(|e| {
+                e.recurrence_id
+                    .and_then(|rid| crate::model::instant_of(rid, self.local))
+                    .is_some_and(|rid| rid >= instant)
+            })
+            .map(|mut over| {
+                over.uid = successor.uid.clone();
+                over.file_name = successor.file_name.clone();
+                over
+            })
+            .collect();
+
+        self.save(&successor)?;
+        for over in &rehomed {
+            self.save(over)?;
+        }
+        // Truncation also deletes the master's overrides at/past the cut — the
+        // copies that now live on under the successor.
+        self.truncate_series(calendar_id, uid, instant)?;
+
+        Ok(SplitOutcome::Split(successor))
+    }
+
     /// Removes one override component, restoring the master's generated
     /// instance for that slot.
     ///
@@ -528,6 +661,7 @@ impl Store {
 
             event.calendar_id = calendar_id.to_owned();
             vdir::write_event(&meta, &event)?;
+            summary.files.push(event.file_name.clone());
         }
 
         self.index.sync_calendar(&meta)?;
@@ -863,6 +997,181 @@ mod tests {
             vec![day(2026, 8, 4), day(2026, 8, 11)],
             "the orphaned override leaked past the cut"
         );
+    }
+
+    #[test]
+    fn splitting_keeps_every_instance_exactly_once() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+        let cut = instance_on(&store, day(2026, 8, 18));
+
+        let outcome = store
+            .split_series(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+        let SplitOutcome::Split(successor) = outcome else {
+            panic!("a mid-series cut must split");
+        };
+
+        // All four Tuesdays survive, each exactly once.
+        assert_eq!(
+            instants(&store),
+            vec![
+                day(2026, 8, 4),
+                day(2026, 8, 11),
+                day(2026, 8, 18),
+                day(2026, 8, 25)
+            ]
+        );
+
+        // The first two belong to the old series, the rest to the successor.
+        let occurrences = store
+            .occurrences(day(2026, 8, 1), day(2026, 9, 1), &HashSet::new())
+            .unwrap();
+        let uids: Vec<&str> = occurrences.iter().map(|o| o.uid.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec![
+                master.uid.as_str(),
+                master.uid.as_str(),
+                successor.uid.as_str(),
+                successor.uid.as_str()
+            ]
+        );
+
+        // The old master ends before the cut; an unbounded rule stays unbounded
+        // on the successor.
+        let old = store
+            .event(&master.calendar_id, &master.uid)
+            .unwrap()
+            .unwrap();
+        assert!(old.rrule.unwrap().contains("UNTIL="));
+        let new_rule = successor.rrule.clone().unwrap();
+        assert!(!new_rule.contains("UNTIL="), "{new_rule}");
+        assert!(!new_rule.contains("COUNT="), "{new_rule}");
+    }
+
+    #[test]
+    fn splitting_reduces_a_count_by_the_instances_the_master_keeps() {
+        let (_dir, mut store) = store();
+        let (_cal, mut master) = weekly_series(&mut store);
+        master.rrule = Some("FREQ=WEEKLY;INTERVAL=1;COUNT=4".into());
+        store.save(&master).unwrap();
+
+        let cut = instance_on(&store, day(2026, 8, 18));
+        let SplitOutcome::Split(successor) = store
+            .split_series(&master.calendar_id, &master.uid, cut)
+            .unwrap()
+        else {
+            panic!("a mid-series cut must split");
+        };
+
+        // Part order is not stable across a parse round-trip, so assert on the
+        // parts themselves.
+        let rule = successor.rrule.clone().unwrap();
+        assert!(rule.contains("FREQ=WEEKLY"), "{rule}");
+        assert!(rule.contains("COUNT=2"), "{rule}");
+        assert!(!rule.contains("UNTIL="), "{rule}");
+
+        // COUNT=4 in total: nothing may leak into September.
+        let wide = store
+            .occurrences(day(2026, 8, 1), day(2026, 10, 1), &HashSet::new())
+            .unwrap();
+        assert_eq!(wide.len(), 4);
+    }
+
+    #[test]
+    fn splitting_rehomes_an_override_past_the_cut() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+
+        // The 25th was moved to 14:00 by another client.
+        let mut over = master.clone();
+        over.rrule = None;
+        over.summary = "Moved".into();
+        over.start = EventTime::Zoned(day(2026, 8, 25).and_hms_opt(14, 0, 0).unwrap(), store.local);
+        over.end = EventTime::Zoned(day(2026, 8, 25).and_hms_opt(15, 0, 0).unwrap(), store.local);
+        over.recurrence_id = Some(EventTime::Zoned(
+            day(2026, 8, 25).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        ));
+        store.save(&over).unwrap();
+
+        let cut = instance_on(&store, day(2026, 8, 18));
+        let SplitOutcome::Split(successor) = store
+            .split_series(&master.calendar_id, &master.uid, cut)
+            .unwrap()
+        else {
+            panic!("a mid-series cut must split");
+        };
+
+        // The override survived the split, under the successor's identity.
+        let moved = store
+            .occurrences(day(2026, 8, 1), day(2026, 9, 1), &HashSet::new())
+            .unwrap()
+            .into_iter()
+            .find(|o| o.start.date() == day(2026, 8, 25))
+            .expect("the overridden instance survives the split");
+        assert_eq!(moved.uid, successor.uid);
+        assert_eq!(moved.summary, "Moved");
+        assert_eq!(
+            moved.start.time(),
+            NaiveTime::from_hms_opt(14, 0, 0).unwrap()
+        );
+
+        // And it lives in the successor's file: deleting the old series does
+        // not take it down.
+        store.delete(&master.calendar_id, &master.uid).unwrap();
+        assert_eq!(
+            instants(&store),
+            vec![day(2026, 8, 18), day(2026, 8, 25)],
+            "the successor and its override outlive the old master"
+        );
+    }
+
+    #[test]
+    fn splitting_partitions_exclusions_at_the_cut() {
+        let (_dir, mut store) = store();
+        let (_cal, mut master) = weekly_series(&mut store);
+        master.exdates = vec![
+            day(2026, 8, 11).and_hms_opt(9, 0, 0).unwrap(),
+            day(2026, 8, 25).and_hms_opt(9, 0, 0).unwrap(),
+        ];
+        store.save(&master).unwrap();
+
+        let cut = instance_on(&store, day(2026, 8, 18));
+        let SplitOutcome::Split(successor) = store
+            .split_series(&master.calendar_id, &master.uid, cut)
+            .unwrap()
+        else {
+            panic!("a mid-series cut must split");
+        };
+
+        // Both exclusions still hold, each on the side of the cut it belongs to.
+        assert_eq!(instants(&store), vec![day(2026, 8, 4), day(2026, 8, 18)]);
+        assert_eq!(
+            successor.exdates,
+            vec![day(2026, 8, 25).and_hms_opt(9, 0, 0).unwrap()]
+        );
+    }
+
+    #[test]
+    fn splitting_at_the_first_instance_declines() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+        let cut = instance_on(&store, day(2026, 8, 4));
+
+        let outcome = store
+            .split_series(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+        assert!(matches!(outcome, SplitOutcome::WholeSeries));
+
+        // Nothing changed: the series is intact under its own identity.
+        assert_eq!(instants(&store).len(), 4);
+        let unchanged = store
+            .event(&master.calendar_id, &master.uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.rrule.as_deref(), Some("FREQ=WEEKLY;INTERVAL=1"));
     }
 
     #[test]

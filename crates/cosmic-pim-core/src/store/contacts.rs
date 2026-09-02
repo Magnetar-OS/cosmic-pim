@@ -361,6 +361,7 @@ impl ContactStore {
 
             taken.insert(file_name.clone());
             write_contact_raw(&meta, &file_name, &segment)?;
+            summary.files.push(file_name);
         }
         Ok(summary)
     }

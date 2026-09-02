@@ -153,6 +153,39 @@ pub fn truncate_rule(rule: &str, until: &str) -> String {
     parts.join(";")
 }
 
+/// The `COUNT=` value of `rule`, if it carries one.
+#[must_use]
+pub fn count_of(rule: &str) -> Option<u32> {
+    rule.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("COUNT")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+/// `rule` with its `COUNT=` value replaced by `count`.
+///
+/// Everything else passes through verbatim, for the same reason as
+/// [`truncate_rule`]: this edit must not flatten parts the caller does not
+/// understand. A rule without a `COUNT` is returned unchanged — an unbounded
+/// or `UNTIL`-bounded series keeps its own end condition.
+#[must_use]
+pub fn with_count(rule: &str, count: u32) -> String {
+    rule.split(';')
+        .map(|part| {
+            let key = part.split('=').next().unwrap_or("").trim();
+            if key.eq_ignore_ascii_case("COUNT") {
+                format!("COUNT={count}")
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// The instant a `RECURRENCE-ID` names, in the same value space the master's
 /// expansion produces its instants in.
 ///
@@ -338,6 +371,23 @@ mod tests {
             .unwrap()
             .and_hms_opt(h, 0, 0)
             .unwrap()
+    }
+
+    #[test]
+    fn count_is_read_and_rewritten_without_touching_the_rest() {
+        let rule = "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;COUNT=10";
+        assert_eq!(count_of(rule), Some(10));
+        assert_eq!(
+            with_count(rule, 4),
+            "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;COUNT=4"
+        );
+    }
+
+    #[test]
+    fn a_rule_without_count_passes_through_with_count_unchanged() {
+        let rule = "FREQ=WEEKLY;UNTIL=20261231T000000Z";
+        assert_eq!(count_of(rule), None);
+        assert_eq!(with_count(rule, 4), rule);
     }
 
     #[test]

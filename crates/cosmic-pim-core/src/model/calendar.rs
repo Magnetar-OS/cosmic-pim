@@ -116,9 +116,16 @@ impl CalendarMeta {
             .and_then(Rgb::parse)
             .unwrap_or(DEFAULT_CALENDAR_COLOR);
 
-        let read_only = std::fs::metadata(path)
-            .map(|m| m.permissions().readonly())
-            .unwrap_or(true);
+        // An ICS-feed subscription (`cosmic_pim_caldav::feed`, marked by its
+        // state sidecar) is read-only by construction: its contents are
+        // replaced wholesale on every refresh, so an event written into it
+        // would silently vanish. Marking it here makes every write path and
+        // every "writable calendar" picker refuse it without each having to
+        // know what a feed is.
+        let read_only = path.join(".ics-feed.json").exists()
+            || std::fs::metadata(path)
+                .map(|m| m.permissions().readonly())
+                .unwrap_or(true);
 
         Some(Self {
             id,
