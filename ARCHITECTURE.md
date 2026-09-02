@@ -388,6 +388,15 @@ account to send from, and the organizer's `mailto:`. `true` means the reply
 is in Envelope's durable outbox — queued is the promise, not delivered, and
 that is enough: the outbox already owns retries and the honest cancel.
 
+**Encoding.** `ics` is the *transfer-decoded* part as text: base64 or
+quoted-printable undone, then decoded to UTF-8 per the MIME part's declared
+charset (D-Bus `s` carries nothing else). "Verbatim" here means never
+re-serialised through a parser — folding, ordering, and unknown properties
+survive — not raw wire bytes; a part whose charset label lies may carry
+replacement characters in its free text, which is the mislabeled message's
+problem, not the contract's. Nothing about scheduling writes these bytes
+back to a mail server, so DKIM is not in play on this path.
+
 **Degradation is part of the contract.** Each side treats the other's
 well-known name being unowned (no `StartServiceByName` — an invitation must
 not *launch* a mail client) as the feature being absent, not as an error:
