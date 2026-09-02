@@ -39,15 +39,21 @@ work. Last touched 2026-09-02.
   events, tasks, and cards) and both consume `overlaps`/`resolve` in a
   per-property conflict UI. Slate displays the birthday stream. App-side
   open: three-scope recurrence editing UI.
-- **Milestone 4 — both iMIP halves implemented; end-to-end run pending.**
-  The contract is specified (ARCHITECTURE.md, `Scheduling1`, encoding
-  included). Envelope: invitation detection, `DeliverInvitation` caller
-  with NameHasOwner degradation, `SendSchedulingReply` export into the
-  durable outbox, charset handling pinned. Slate: `DeliverInvitation`
-  export, invitation dialog with slot conflict check, `itip::apply`
-  outcomes, REPLY handed back, series-CANCEL queues the server delete.
-  Remaining: the two apps' joint end-to-end run, then organizer send-side
-  and RFC 6638 free/busy.
+- **Milestone 4 — iMIP proven on the wire; two GUI clicks from exit.** Both
+  halves implemented and the joint end-to-end ran green on a real session
+  bus against a stock Dovecot: DeliverInvitation rendered Slate's dialog,
+  SendSchedulingReply queued a contract-shaped reply, the poll drained it
+  over real SMTP with the ics byte-identical to what crossed D-Bus, and the
+  canned invitation synced into Envelope's maildir. Remaining: the user's
+  two staged clicks (Slate's Accept, Envelope's "Open in calendar"), then
+  organizer send-side and RFC 6638 free/busy. The run's findings are fixed:
+  the keychain probe can no longer hang app init (3 s abandonment +
+  `COSMIC_PIM_NO_KEYRING`), and a secret stored to the envelope while the
+  keychain was locked can no longer be stranded (per-slot backend record;
+  an unreachable recorded keychain is an error naming the problem, never a
+  silent miss). Known CI note: the stock Dovecot container's submission
+  proxy lacks `submission_relay_host` — live send legs need a sink beside
+  it.
 - **Milestones 3, 5, 6 — not started**, except items the fleet pulled
   forward (folder management in Envelope exceeds the Geary baseline
   already).
