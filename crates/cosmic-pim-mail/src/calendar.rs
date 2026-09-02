@@ -12,8 +12,11 @@ use mail_parser::{MessageParser, MimeHeaders as _};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invitation {
     /// The decoded `text/calendar` part, exactly as it arrived — transfer
-    /// encoding undone, nothing re-serialised. These are the bytes to hand
-    /// across the process boundary.
+    /// encoding undone, charset-decoded per the part's declaration, nothing
+    /// re-serialised. This is the text to hand across the process boundary,
+    /// and the calendar will store it, so a correctly-labeled latin-1 part
+    /// must arrive with its accents intact (the parser guarantees this; the
+    /// tests pin it).
     pub ics: String,
     /// The iTIP method, uppercased: `REQUEST`, `REPLY`, `CANCEL`, ...
     pub method: String,
@@ -96,6 +99,22 @@ QkVHSU46VkNBTEVOREFSDQpNRVRIT0Q6UkVRVUVTVA0KRU5EOlZDQUxFTkRBUg0K\r\n\
             invitation.ics,
             "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n"
         );
+    }
+
+    #[test]
+    fn a_correctly_labeled_latin_1_invitation_arrives_intact() {
+        // The contract passes the ics as text, charset-decoded per the part's
+        // declaration — the calendar will *store* this text, so a latin-1
+        // part must not arrive with its accents replaced.
+        let raw: &[u8] = b"From: a@example.com\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: text/calendar; method=REQUEST; charset=iso-8859-1\r\n\
+\r\n\
+BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+SUMMARY:Caf\xe9\r\n\
+END:VCALENDAR\r\n";
+        assert!(invitation(raw).unwrap().ics.contains("SUMMARY:Caf\u{e9}"));
     }
 
     #[test]
