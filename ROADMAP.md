@@ -14,6 +14,32 @@ the item-level detail; this file holds the milestones, the parity targets, and
 the exit criteria. Where they conflict, the per-item docs win on *how*, this
 file wins on *when relative to what*.
 
+## Status ledger
+
+Updated as milestones move; the one place a session checks before claiming
+work. Last touched 2026-09-02.
+
+- **Milestone 0 — done.** Docs agree with the code; the Meltemi MPL-2.0 grant
+  exists (per-file, extended as ports continue); all four repos green.
+- **Milestone 1 — done except two in-flight items.** Landed: conflict base
+  capture + automatic three-way merge + per-unit `overlaps`/`resolve`
+  (`core::merge`), mass-delete confirm-on-second-sight, error taxonomy,
+  quirks tables (DAV seeded, IMAP seeded from Dovecot), Windows TZ mapping,
+  local-only collections, birthday synthesis (`core::birthdays`), round-trip
+  corpus, scheduling placeholder (`caldav::itip`). In flight: the RRULE
+  golden suite (`tests/golden.rs`), and the Baïkal/Nextcloud CI legs
+  (Radicale, Xandikos, Dovecot already run).
+- **Milestone 2 — moving.** Substrate side largely ahead of the apps:
+  occurrence overrides (RECURRENCE-ID end to end), server-side drafts
+  mirror, filter rules + List-Id, outbox with scheduled sends and honest
+  cancel, send-as aliases, mbox import (parse side). `PARITY.md` audits
+  exist in all three app repos — data-loss-shaped gaps and ranked ceiling
+  gaps are enumerated there. App-side adoption open: conflict UIs,
+  `queue_save_with_base` at save sites, birthday display, three-scope
+  recurrence editing.
+- **Milestones 3–6 — not started**, except items the fleet pulled forward
+  (folder management in Envelope exceeds the Geary baseline already).
+
 ---
 
 ## The benchmarks
