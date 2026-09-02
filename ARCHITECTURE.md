@@ -346,6 +346,61 @@ Two things from the calendar side deliberately do **not** carry over. Step 4 of
 a WebDAV flavour. And `caldav::patch` has no mail counterpart, because a message
 is never edited in place; the equivalent operation is a rename.
 
+## The one cross-process contract: iMIP hand-off
+
+Everything else the apps share is a library call, because they all link the
+substrate. Invitations are the exception: the *payload* arrives in Envelope
+and the *decision* belongs in Slate, and the two are separate processes. This
+section is the contract; both sides implement it against their existing
+single-instance D-Bus names, so no new daemon exists and nothing changes when
+one app is not installed.
+
+The iTIP semantics — attendee gate, SEQUENCE rule, RECURRENCE-ID-scoped
+CANCEL, reply construction — live in `caldav::itip` and are **not** part of
+the contract. The contract only moves bytes and names an account; whichever
+side applies a payload does it through the same library everyone links.
+
+**Interface** `io.github.entro314labs.CosmicPim.Scheduling1`, on the session
+bus, exported at the object path derived from each app's own well-known name
+(`/io/github/entro314labs/Slate`, `/io/github/entro314labs/Envelope`).
+
+The calendar side (Slate) exports:
+
+```
+DeliverInvitation(ics: s, account_id: s) → (accepted: b)
+```
+
+Envelope calls it with the verbatim `text/calendar` part and the suite
+account id the message arrived on. `true` means Slate has the payload and
+will put its invitation view — conflict check for the slot, the three
+PARTSTAT buttons — in front of the user; the decision happens there, later,
+asynchronously. Slate applies the outcome to the vdir via `itip::apply` and
+never talks back about it on this call.
+
+The mailer side (Envelope) exports:
+
+```
+SendSchedulingReply(ics: s, account_id: s, to: s) → (queued: b)
+```
+
+Slate calls it with the `METHOD:REPLY` text `itip::build_reply` produced, the
+account to send from, and the organizer's `mailto:`. `true` means the reply
+is in Envelope's durable outbox — queued is the promise, not delivered, and
+that is enough: the outbox already owns retries and the honest cancel.
+
+**Degradation is part of the contract.** Each side treats the other's
+well-known name being unowned (no `StartServiceByName` — an invitation must
+not *launch* a mail client) as the feature being absent, not as an error:
+Envelope falls back to "save / import this .ics", which works today; Slate
+falls back to storing the PARTSTAT locally and telling the user to reply from
+their mail client. Both fallbacks are the pre-contract behaviour, which is
+what keeps the contract minimal — either app is fully useful alone, and the
+pair is more than the sum only when both are present.
+
+**Versioning.** The `1` suffix is the whole policy: a breaking change is a
+new interface name exported alongside the old one, never a changed signature
+under the same name.
+
 ## Local-only collections
 
 An unbound collection is *not yet* synced; one marked local-only (a
@@ -467,7 +522,7 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 ## Testing
 
-Roughly 830 tests in the substrate, `cargo test --workspace`.
+Roughly 930 tests in the substrate, `cargo test --workspace`.
 
 `caldav/tests/live_server.rs` is the odd one out: it scripts nothing. Gated on
 `COSMIC_PIM_LIVE_CALDAV_URL` and ignored by default, it drives the real engine
