@@ -31,6 +31,7 @@
 //! - [`drafts`] — unsent messages: local records, mirrored to the server.
 //! - [`draft_sync`] — the mirror: replacement without duplication.
 //! - [`rules`] — filter rules: match a message, plan its actions.
+//! - [`dsn`] — delivery status notifications: what a bounce actually says.
 //! - [`smtp`] — sending, and the one failure that must never be auto-retried.
 //! - [`threading`] — JWZ threading with deterministic thread ids.
 //! - [`folder`] — mailbox names, hierarchy, and RFC 6154 special use.
@@ -81,6 +82,7 @@ pub mod auth;
 pub mod compose;
 pub mod discovery;
 pub mod draft_sync;
+pub mod dsn;
 pub mod drafts;
 pub mod error;
 pub mod folder;

@@ -630,7 +630,7 @@ fn forwarded(message: &Message) -> String {
 /// what the standard allows is worse than one that lets the server say no.
 /// This catches "forgot the @" and "typed two", which is what people actually
 /// do.
-fn looks_like_an_address(address: &str) -> bool {
+pub(crate) fn looks_like_an_address(address: &str) -> bool {
     let mut parts = address.split('@');
     let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
