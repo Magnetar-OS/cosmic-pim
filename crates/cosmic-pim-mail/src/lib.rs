@@ -103,6 +103,7 @@ pub mod rules;
 pub mod sasl;
 pub mod search;
 pub mod smtp;
+pub mod snooze;
 pub mod store;
 pub mod text;
 pub mod threading;
