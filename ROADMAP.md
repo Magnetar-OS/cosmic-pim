@@ -37,8 +37,11 @@ work. Last touched 2026-09-02.
   data-loss-shaped gaps and ranked ceiling gaps are enumerated there.
   Both apps adopted `queue_save_with_base` (auto-merge live end to end for
   events, tasks, and cards) and both consume `overlaps`/`resolve` in a
-  per-property conflict UI. Slate displays the birthday stream. App-side
-  open: three-scope recurrence editing UI.
+  per-property conflict UI. Slate displays the birthday stream. Snooze and
+  mbox export landed in the substrate, closing two of the five gaps 04
+  ranked as most-missed (rules and labels remain; OpenPGP/S-MIME after).
+  App-side open: three-scope recurrence editing UI, the snooze UI, and an
+  export-to-mbox action.
 - **Milestone 4 — iMIP proven on the wire; two GUI clicks from exit.** Both
   halves implemented and the joint end-to-end ran green on a real session
   bus against a stock Dovecot: DeliverInvitation rendered Slate's dialog,
