@@ -54,18 +54,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `expect` is the detection outcome, not the product: two of these
+          # servers volunteer no identity at all and must read as Unknown.
+          # See quirks.rs's module docs for the wire evidence.
           - server: radicale
             url: http://127.0.0.1:5232/ci/
             user: ci
             pass: ci
+            expect: Unknown
           - server: xandikos
             url: http://127.0.0.1:5233/ci/
             user: ""
             pass: ""
+            expect: Unknown
           - server: nextcloud
             url: http://127.0.0.1:8081/remote.php/dav/
             user: ci
             pass: ci-password-1
+            expect: Nextcloud
+          - server: baikal
+            url: http://127.0.0.1:8082/dav.php/
+            user: ci
+            pass: ci-password-1
+            expect: Baikal
     steps:
       - uses: actions/checkout@v4
       - name: Show the pinned toolchain
@@ -124,16 +135,87 @@ jobs:
             sleep 2
           done
 
+      # Baïkal has no unattended install: the wizard is the only supported
+      # path, so the job drives it exactly as a browser would — two form posts
+      # for config and database, then an admin login and a user. Scripted here
+      # rather than baked into an image so the version stays whatever the tag
+      # resolves to, and a wizard change breaks the job loudly instead of a
+      # stale fixture hiding it.
+      - name: Start Baikal
+        if: matrix.server == 'baikal'
+        run: |
+          docker run -d --name pim-baikal -p 127.0.0.1:8082:80 ckulka/baikal:nginx
+          for _ in $(seq 1 60); do
+            curl -s -o /dev/null http://127.0.0.1:8082/ && break
+            sleep 2
+          done
+          jar=$(mktemp)
+          token() { grep -oE 'name="CSRF_TOKEN" value="[^"]+"' "$1" | head -1 | sed 's/.*value="//;s/"//'; }
+
+          curl -s -c "$jar" http://127.0.0.1:8082/admin/install/ -o /tmp/bk1.html
+          curl -s -b "$jar" -c "$jar" -X POST http://127.0.0.1:8082/admin/install/ -o /dev/null \
+            --data-urlencode "CSRF_TOKEN=$(token /tmp/bk1.html)" \
+            --data-urlencode "Baikal_Model_Config_Standard::submitted=1" \
+            --data-urlencode "refreshed=0" \
+            --data-urlencode "data[timezone]=UTC" \
+            --data-urlencode "data[card_enabled]=1" \
+            --data-urlencode "data[cal_enabled]=1" \
+            --data-urlencode "data[invite_from]=ci@example.com" \
+            --data-urlencode "data[dav_auth_type]=Basic" \
+            --data-urlencode "data[admin_passwordhash]=ci-password-1" \
+            --data-urlencode "data[admin_passwordhash_confirm]=ci-password-1" \
+            --data-urlencode "witness[timezone]=1" --data-urlencode "witness[card_enabled]=1" \
+            --data-urlencode "witness[cal_enabled]=1" --data-urlencode "witness[invite_from]=1" \
+            --data-urlencode "witness[dav_auth_type]=1" \
+            --data-urlencode "witness[admin_passwordhash]=1" \
+            --data-urlencode "witness[admin_passwordhash_confirm]=1"
+
+          curl -sL -b "$jar" -c "$jar" http://127.0.0.1:8082/admin/install/ -o /tmp/bk2.html
+          curl -s -b "$jar" -c "$jar" -X POST http://127.0.0.1:8082/admin/install/ -o /dev/null \
+            --data-urlencode "CSRF_TOKEN=$(token /tmp/bk2.html)" \
+            --data-urlencode "Baikal_Model_Config_Database::submitted=1" \
+            --data-urlencode "refreshed=0" \
+            --data-urlencode "data[backend]=sqlite" \
+            --data-urlencode "data[sqlite_file]=/var/www/baikal/Specific/db/db.sqlite" \
+            --data-urlencode "witness[backend]=1" --data-urlencode "witness[sqlite_file]=1"
+
+          curl -sL -b "$jar" -c "$jar" -X POST http://127.0.0.1:8082/admin/ -o /dev/null \
+            -d "auth=1" -d "login=admin" -d "password=ci-password-1"
+          curl -sL -b "$jar" -c "$jar" "http://127.0.0.1:8082/admin/?/users/new/1/" -o /tmp/bk3.html
+          curl -s -b "$jar" -c "$jar" -X POST "http://127.0.0.1:8082/admin/?/users/new/1/" -o /dev/null \
+            --data-urlencode "CSRF_TOKEN=$(token /tmp/bk3.html)" \
+            --data-urlencode "Baikal_Model_User::submitted=1" \
+            --data-urlencode "refreshed=0" \
+            --data-urlencode "data[username]=ci" \
+            --data-urlencode "data[displayname]=CI" \
+            --data-urlencode "data[email]=ci@example.com" \
+            --data-urlencode "data[password]=ci-password-1" \
+            --data-urlencode "data[passwordconfirm]=ci-password-1" \
+            --data-urlencode "witness[username]=1" --data-urlencode "witness[displayname]=1" \
+            --data-urlencode "witness[email]=1" --data-urlencode "witness[password]=1" \
+            --data-urlencode "witness[passwordconfirm]=1"
+
+          # The wizard is silent about failure, so prove the account works
+          # before the journey blames the client for a provisioning slip.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-password-1 \
+            -X PROPFIND -H 'Depth: 0' http://127.0.0.1:8082/dav.php/)
+          test "$code" = "207" || { echo "Baikal provisioning failed: PROPFIND $code"; exit 1; }
+
       - name: Live round trip
         env:
           COSMIC_PIM_LIVE_CALDAV_URL: ${{ matrix.url }}
           COSMIC_PIM_LIVE_CALDAV_USER: ${{ matrix.user }}
           COSMIC_PIM_LIVE_CALDAV_PASS: ${{ matrix.pass }}
+          COSMIC_PIM_LIVE_CALDAV_EXPECT: ${{ matrix.expect }}
         run: cargo test -p cosmic-pim-caldav --test live_server -- --ignored
 
       - name: Server log on failure
         if: failure() && matrix.server == 'nextcloud'
         run: docker logs pim-nextcloud | tail -100
+
+      - name: Server log on failure
+        if: failure() && matrix.server == 'baikal'
+        run: docker logs pim-baikal | tail -100
 
   # The IMAP half of the same argument: the real client against a stock
   # Dovecot, not our own canned responses. Its first local run found two real

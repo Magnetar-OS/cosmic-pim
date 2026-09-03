@@ -1150,6 +1150,12 @@ pub struct CaldavClient {
     /// rather than `&mut self` on every read path: the capture is a side
     /// effect of requests that are otherwise immutable borrows.
     server_header: std::cell::RefCell<Option<String>>,
+    /// The `DAV:` compliance header and `X-Sabre-Version`, captured for the
+    /// same reason and on the same first-seen-wins rule as `server_header`.
+    /// Both exist because the `Server` header identifies neither of the two
+    /// most-deployed CalDAV servers — see `quirks`'s module docs.
+    dav_header: std::cell::RefCell<Option<String>>,
+    sabre_version: std::cell::RefCell<Option<String>>,
 }
 
 impl CaldavClient {
@@ -1197,23 +1203,32 @@ impl CaldavClient {
             principal_url: None,
             calendar_home_url: None,
             server_header: std::cell::RefCell::new(None),
+            dav_header: std::cell::RefCell::new(None),
+            sabre_version: std::cell::RefCell::new(None),
         }
     }
 
     /// The server this client turned out to be talking to.
     ///
-    /// Best-effort, from the `Server` header captured during earlier requests
-    /// plus the base URL's host; [`crate::quirks::Server::Unknown`] before any
-    /// request has been made or when nothing identifiable was volunteered.
+    /// Best-effort, from the headers captured during earlier requests plus the
+    /// base URL's host; [`crate::quirks::Server::Unknown`] before any request
+    /// has been made or when nothing identifiable was volunteered.
     #[must_use]
     pub fn detected_server(&self) -> crate::quirks::Server {
-        let header = self.server_header.borrow();
+        let server = self.server_header.borrow();
+        let dav = self.dav_header.borrow();
+        let sabre = self.sabre_version.borrow();
         let host = self
             .base_url
             .split("//")
             .nth(1)
             .and_then(|rest| rest.split(['/', ':']).next());
-        crate::quirks::detect(header.as_deref(), host)
+        crate::quirks::detect(crate::quirks::Fingerprint {
+            server: server.as_deref(),
+            host,
+            dav: dav.as_deref(),
+            sabre_version: sabre.as_deref(),
+        })
     }
 
     /// The same client, speaking CardDAV.
@@ -1320,14 +1335,20 @@ impl CaldavClient {
             }
 
             // Captured once for quirks detection; later responses through
-            // proxies sometimes scrub it, so first-seen wins.
-            if self.server_header.borrow().is_none()
-                && let Some(server) = resp
-                    .headers()
-                    .get("server")
-                    .and_then(|value| value.to_str().ok())
-            {
-                *self.server_header.borrow_mut() = Some(server.to_owned());
+            // proxies sometimes scrub them, so first-seen wins. The `DAV:`
+            // header only appears on responses to DAV methods, which is why
+            // each is captured independently rather than as one snapshot.
+            for (name, slot) in [
+                ("server", &self.server_header),
+                ("dav", &self.dav_header),
+                ("x-sabre-version", &self.sabre_version),
+            ] {
+                if slot.borrow().is_none()
+                    && let Some(value) =
+                        resp.headers().get(name).and_then(|value| value.to_str().ok())
+                {
+                    *slot.borrow_mut() = Some(value.to_owned());
+                }
             }
 
             let content_type = resp

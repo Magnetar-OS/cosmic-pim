@@ -77,6 +77,27 @@ fn a_full_round_trip_against_a_real_server() {
     let calendar_url_direct = format!("{home}/ci-e2e/");
     let event_url = format!("{calendar_url_direct}ci-round-trip.ics");
 
+    // Finding #8: not one of these four servers announces itself in its
+    // `Server` header — they name Apache, nginx, WSGIServer, aiohttp. Two are
+    // identifiable by other headers (Nextcloud brands the `DAV:` compliance
+    // list, Baïkal exposes `X-Sabre-Version`); two are not identifiable at
+    // all, and guessing from `aiohttp` or `WSGIServer` would claim unrelated
+    // servers, so they stay Unknown deliberately.
+    //
+    // Each CI leg therefore declares the detection outcome it expects —
+    // `Unknown` included. That makes the limit itself a tested fact: if a
+    // release starts volunteering its identity, this fails and the ledger
+    // gets upgraded on purpose rather than by accident. Unset outside CI,
+    // where the journey does not know who it is talking to.
+    if let Ok(expected) = std::env::var("COSMIC_PIM_LIVE_CALDAV_EXPECT") {
+        let detected = format!("{:?}", client.detected_server());
+        assert!(
+            detected.eq_ignore_ascii_case(&expected),
+            "detected {detected}, expected {expected} — the server changed \
+             what it volunteers, or detection regressed"
+        );
+    }
+
     // Finding #1: a PUT into a missing collection is a 409, not an implicit
     // create — which also live-confirms the taxonomy's 409 → Reconcile.
     // MKCALENDAR first, and a second one must read as success (findings #2

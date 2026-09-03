@@ -30,12 +30,41 @@
 //!
 //! # Detection
 //!
-//! From the `Server` response header the client captured during discovery,
-//! plus the URL's host as a fallback for the hosted providers that hide their
-//! software behind proxies. Detection is best-effort by construction: an
-//! unrecognised server gets [`Server::Unknown`] and the same defended-
-//! everywhere behaviour as everyone else, which is exactly why misdetection
-//! is cheap.
+//! From a [`Fingerprint`]: the headers one response volunteered, plus the
+//! URL's host as a fallback for the hosted providers that hide their software
+//! behind proxies.
+//!
+//! **The `Server` header identifies almost nobody.** This was the module's own
+//! founding assumption and the CI matrix demolished it on 2026-09-03. All four
+//! servers, read off the wire:
+//!
+//! | Server | `Server:` header | What actually identifies it |
+//! |---|---|---|
+//! | Radicale 3.7 | `WSGIServer/0.2 CPython/3.14.7` | nothing |
+//! | Xandikos 0.4 | `Python/3.14 aiohttp/3.14.3` | nothing |
+//! | Nextcloud 34 | `Apache/2.4.68 (Debian)` | `DAV:` tokens `nc-*`, `nextcloud-*` |
+//! | Baïkal 0.10 | `nginx/1.29.3` | `X-Sabre-Version` |
+//!
+//! Every one of them names the *web server or language runtime* it happens to
+//! be running on. This module previously shipped unit tests asserting header
+//! strings like `Apache/2.4.57 (Debian) Nextcloud` and `Radicale/3.1.8` —
+//! shapes nobody had observed, which is the exact failure the discipline above
+//! forbids, committed by this module against itself.
+//!
+//! So detection reads three signals, and for two of the four the honest answer
+//! is still [`Server::Unknown`]. That is not a gap to paper over: a heuristic
+//! on `WSGIServer` or `aiohttp` would match any unrelated Python DAV server
+//! and put *wrong* facts into a ledger whose whole value is being right. The
+//! live matrix asserts the outcome per server — including the two Unknowns —
+//! so if a future release starts announcing itself, the test fails and the
+//! ledger gets upgraded deliberately.
+//!
+//! Detection is best-effort by construction: an unrecognised server gets
+//! [`Server::Unknown`] and the same defended-everywhere behaviour as everyone
+//! else. That is exactly why two Unknowns cost nothing today — every entry in
+//! this table is currently a fact with an *unconditional* defence, so nothing
+//! is skipped for want of a name. The day an entry needs a runtime branch is
+//! the day the Unknowns start to matter.
 
 /// The servers this suite has met, in the field or in CI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,13 +85,54 @@ pub enum Server {
     Unknown,
 }
 
+/// What one response volunteered about the server behind it.
+///
+/// A struct rather than a widening parameter list because the signals are
+/// peers, not a primary plus fallbacks: for the two most-deployed servers the
+/// `Server` header is the one that says nothing useful. Every field is
+/// optional — a proxy may scrub any of them, and detection degrades to
+/// [`Server::Unknown`] rather than guessing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fingerprint<'a> {
+    /// The `Server` response header.
+    pub server: Option<&'a str>,
+    /// The request URL's host, for hosted providers behind scrubbing proxies.
+    pub host: Option<&'a str>,
+    /// The `DAV:` compliance-class header. Nextcloud brands its own extensions
+    /// here, which is the only identity it volunteers.
+    pub dav: Option<&'a str>,
+    /// The `X-Sabre-Version` header. sabre/dav sets it on every DAV response,
+    /// and behind nginx it is all Baïkal offers.
+    pub sabre_version: Option<&'a str>,
+}
+
 /// Detects the server from what the wire volunteered.
 ///
-/// `server_header` is the `Server` response header; `host` is the request
-/// URL's host, for the hosted providers whose proxies scrub the header.
+/// Ordered most specific first: a product's own extension tokens beat a
+/// product name in the `Server` header, which beats the underlying library,
+/// which beats the host. Nextcloud is checked before sabre/dav because
+/// Nextcloud *is* sabre/dav with additions, and the additions are the answer.
 #[must_use]
-pub fn detect(server_header: Option<&str>, host: Option<&str>) -> Server {
-    if let Some(header) = server_header {
+pub fn detect(fingerprint: Fingerprint<'_>) -> Server {
+    let Fingerprint {
+        server,
+        host,
+        dav,
+        sabre_version,
+    } = fingerprint;
+
+    // The DAV compliance header, where a server lists the extensions it
+    // implements. Products that extend the protocol name themselves here and
+    // nowhere else.
+    if let Some(dav) = dav {
+        let dav = dav.to_ascii_lowercase();
+        if dav.contains("nextcloud-") || dav.contains("nc-calendar") || dav.contains("nc-paginate")
+        {
+            return Server::Nextcloud;
+        }
+    }
+
+    if let Some(header) = server {
         let header = header.to_ascii_lowercase();
         // Order matters where products stack: Nextcloud answers through
         // Apache or nginx, so the product token is searched before the
@@ -96,6 +166,14 @@ pub fn detect(server_header: Option<&str>, host: Option<&str>) -> Server {
         if header.contains("microsoft") || header.contains("exchange") {
             return Server::Exchange;
         }
+    }
+
+    // sabre/dav announces itself on every DAV response even when the front
+    // end's `Server` header says only nginx or Apache. Reached only after the
+    // product checks above, so a sabre-based product that named itself keeps
+    // its own identity.
+    if sabre_version.is_some() {
+        return Server::Baikal;
     }
 
     if let Some(host) = host {
@@ -213,6 +291,12 @@ pub fn quirks_for(server: Server) -> Quirks {
             quirks.sloppy_hrefs = true;
         }
         Server::Radicale => {
+            // CI (2026-09-03): under its built-in server it announces
+            // `Server: WSGIServer/0.2 CPython/3.14.7` — no product token, so
+            // `detect` returns Unknown for a real Radicale. Everything below
+            // was learned from the journey, not from detection, and is
+            // defended unconditionally, so the blind spot costs nothing yet.
+            //
             // CI, first live run (2026-08-25): MKCALENDAR on an existing
             // collection answers 409 + DAV:resource-must-be-null rather than
             // 405, and a PUT into a missing collection is a 409 rather than
@@ -221,13 +305,33 @@ pub fn quirks_for(server: Server) -> Quirks {
             // classified Reconcile.
         }
         Server::Xandikos => {
+            // CI (2026-09-03): announces `Server: Python/3.14 aiohttp/3.14.3`
+            // and sends no `DAV:` header on PROPFIND at all, so like Radicale
+            // it detects as Unknown. Recorded rather than guessed around: an
+            // "aiohttp means Xandikos" heuristic would claim every unrelated
+            // aiohttp server in the world.
+            //
             // CI, first live run (2026-08-25): MKCALENDAR on an existing
             // collection answers 403 + resource-must-be-null — a third
             // spelling of "already exists". Defended everywhere: `mkcalendar`
             // keys on the precondition element, not the status.
         }
+        Server::Baikal => {
+            // CI, first live run (2026-09-03, Baïkal 0.10 / sabre-dav 4.7.0
+            // behind nginx): announces `Server: nginx/1.29.3` and nothing
+            // else — no sabre token, no product name. The only identity it
+            // volunteers is `X-Sabre-Version`, which `detect` now reads.
+            // Nothing else about the journey differed from the Python
+            // servers, which is itself worth recording: the most-deployed
+            // sabre stack needed no defence the engine did not already have.
+        }
         Server::Nextcloud => {
             // CI, first live run (2026-09-03, Nextcloud 34.0.3 / sabre-dav):
+            // announces `Server: Apache/2.4.68 (Debian)` with no product
+            // token anywhere in it. Its identity is in the `DAV:` compliance
+            // header — `nc-paginate`, `nextcloud-checksum-update`,
+            // `nc-calendar-search` — which is where `detect` now looks.
+            //
             // a 201 to PUT carries no ETag header at all — the value only
             // appears on a later HEAD or in a PROPFIND listing. Defended
             // everywhere by a rule that predates the finding: `drain`
@@ -240,7 +344,7 @@ pub fn quirks_for(server: Server) -> Quirks {
         }
         // The field has not put anything on record for these yet. That is the
         // healthy state: the engine's unconditional defences have been enough.
-        Server::Baikal | Server::Fastmail => {}
+        Server::Fastmail => {}
         Server::Unknown => {}
     }
     quirks
@@ -250,38 +354,96 @@ pub fn quirks_for(server: Server) -> Quirks {
 mod tests {
     use super::*;
 
+    /// A fingerprint carrying only a `Server` header — the shape most of
+    /// these assertions want.
+    fn from_server(header: &str) -> Fingerprint<'_> {
+        Fingerprint {
+            server: Some(header),
+            ..Fingerprint::default()
+        }
+    }
+
+    fn from_host(host: &str) -> Fingerprint<'_> {
+        Fingerprint {
+            host: Some(host),
+            ..Fingerprint::default()
+        }
+    }
+
     #[test]
-    fn detection_reads_the_product_through_the_web_server() {
-        // Nextcloud answers through Apache; the web-server token must not
-        // shadow the product token.
-        assert_eq!(
-            detect(Some("Apache/2.4.57 (Debian) Nextcloud"), None),
-            Server::Nextcloud
-        );
-        assert_eq!(detect(Some("Radicale/3.1.8"), None), Server::Radicale);
-        assert_eq!(detect(Some("sabre/dav 4.4.0"), None), Server::Baikal);
-        assert_eq!(detect(Some("SOGo/5.9.0"), None), Server::Sogo);
-        assert_eq!(detect(Some("Cyrus-HTTP/3.8"), None), Server::Cyrus);
+    fn a_product_token_in_the_server_header_is_still_read_when_present() {
+        // None of these shapes has been observed in CI — every server there
+        // announces its web server instead (see the module docs). They are
+        // kept because a reverse proxy can be configured to forward a product
+        // token, and reading one costs nothing; they are NOT evidence that
+        // any particular server sends one.
+        assert_eq!(detect(from_server("Radicale/3.1.8")), Server::Radicale);
+        assert_eq!(detect(from_server("sabre/dav 4.4.0")), Server::Baikal);
+        assert_eq!(detect(from_server("SOGo/5.9.0")), Server::Sogo);
+        assert_eq!(detect(from_server("Cyrus-HTTP/3.8")), Server::Cyrus);
+    }
+
+    #[test]
+    fn the_two_biggest_servers_are_not_in_their_server_header_at_all() {
+        // Live-observed in CI, 2026-09-03. Both of these were previously
+        // undetectable, and one of them was "covered" by a test asserting a
+        // header string no Nextcloud has ever sent. The bytes below are
+        // copied from the wire.
+        let nextcloud = Fingerprint {
+            server: Some("Apache/2.4.68 (Debian)"),
+            dav: Some(
+                "1, 3, extended-mkcol, access-control, \
+                 calendarserver-principal-property-search, nc-paginate, \
+                 nextcloud-checksum-update, nc-calendar-search, \
+                 nc-enable-birthday-calendar, 2",
+            ),
+            ..Fingerprint::default()
+        };
+        assert_eq!(detect(nextcloud), Server::Nextcloud);
+
+        let baikal = Fingerprint {
+            server: Some("nginx/1.29.3"),
+            sabre_version: Some("4.7.0"),
+            dav: Some("1, 3, extended-mkcol, access-control, calendar-access"),
+            ..Fingerprint::default()
+        };
+        assert_eq!(detect(baikal), Server::Baikal);
+    }
+
+    #[test]
+    fn a_named_product_beats_the_library_underneath_it() {
+        // Nextcloud is sabre/dav with additions, so a response carrying both
+        // signals must not come back as Baïkal.
+        let both = Fingerprint {
+            server: Some("Apache/2.4.68 (Debian)"),
+            dav: Some("1, 3, nc-paginate"),
+            sabre_version: Some("4.7.0"),
+            ..Fingerprint::default()
+        };
+        assert_eq!(detect(both), Server::Nextcloud);
     }
 
     #[test]
     fn hosted_providers_detect_by_host_when_the_header_is_scrubbed() {
-        assert_eq!(detect(None, Some("caldav.fastmail.com")), Server::Fastmail);
+        assert_eq!(detect(from_host("caldav.fastmail.com")), Server::Fastmail);
         assert_eq!(
-            detect(None, Some("apidata.googleusercontent.com")),
+            detect(from_host("apidata.googleusercontent.com")),
             Server::Google
         );
-        assert_eq!(detect(None, Some("p42-caldav.icloud.com")), Server::ICloud);
-        assert_eq!(detect(None, Some("outlook.office365.com")), Server::Exchange);
+        assert_eq!(detect(from_host("p42-caldav.icloud.com")), Server::ICloud);
+        assert_eq!(detect(from_host("outlook.office365.com")), Server::Exchange);
     }
 
     #[test]
     fn a_lookalike_host_does_not_pass() {
         // Suffix matching has to be on the registrable domain boundary, or
         // fastmail.com.attacker.example detects as Fastmail.
-        assert_eq!(detect(None, Some("fastmail.com.evil.example")), Server::Unknown);
-        assert_eq!(detect(None, Some("evilfastmail.com")), Server::Unknown);
-        assert_eq!(detect(None, Some("notgoogle.com.example")), Server::Unknown);
+        assert_eq!(
+            detect(from_host("fastmail.com.evil.example")),
+            Server::Unknown
+        );
+        assert_eq!(detect(from_host("evilfastmail.com")), Server::Unknown);
+        assert_eq!(detect(from_host("notgoogle.com.example")), Server::Unknown);
     }
 
     #[test]
@@ -289,13 +451,14 @@ mod tests {
         // Misdetection must be cheap: Unknown means "the unconditional
         // defences, nothing special" — which is also what every well-behaved
         // server gets.
-        assert_eq!(detect(None, None), Server::Unknown);
+        assert_eq!(detect(Fingerprint::default()), Server::Unknown);
         assert_eq!(quirks_for(Server::Unknown), Quirks::default());
         assert_eq!(quirks_for(Server::Radicale), Quirks::default());
         // Nextcloud's finding needed no runtime branch either — the defence
         // was already unconditional. An entry with no field set is the
         // ledger working as intended.
         assert_eq!(quirks_for(Server::Nextcloud), Quirks::default());
+        assert_eq!(quirks_for(Server::Baikal), Quirks::default());
     }
 
     #[test]
