@@ -7,9 +7,9 @@
 //! against what we *believe* servers say. This one is the beginning of the
 //! server matrix 00-suite.md asks for: it proves the client against what a
 //! server actually says, which is where the quirks table's entries come from —
-//! its first afternoon produced six. CI runs it against Radicale and Xandikos;
-//! Baïkal and Nextcloud can join as containers later, and
-//! Fastmail/Google/iCloud stay a manual checklist.
+//! its first afternoon produced six, and every server added since has produced
+//! more. CI runs it against Radicale, Xandikos and Nextcloud; Baïkal can join
+//! as a container later, and Fastmail/Google/iCloud stay a manual checklist.
 //!
 //! Ignored by default and gated on the environment, so `cargo test` stays
 //! offline and deterministic:
@@ -89,7 +89,10 @@ fn a_full_round_trip_against_a_real_server() {
         .mkcalendar(&calendar_url_direct, "CI round trip")
         .expect("a second MKCALENDAR must be tolerated");
 
-    let etag = client
+    // Finding #7 (Nextcloud): a 201 to PUT may carry no ETag header at all —
+    // the engine never trusted it anyway (drain discards it; the next sync's
+    // listing is the source of truth), so nothing in this journey may either.
+    client
         .put_event(&event_url, &event("ci-1@cosmic-pim", "Created live"), None)
         .expect("PUT a new event");
 
@@ -117,7 +120,7 @@ fn a_full_round_trip_against_a_real_server() {
     let _ = mine;
 
     // --- edit locally, push back ------------------------------------------
-    let (file, _etag) = store
+    let (file, first_sync_etag) = store
         .entry_for(&event_url)
         .or_else(|| {
             // Servers are free to rewrite the href; find ours by content.
@@ -169,13 +172,15 @@ fn a_full_round_trip_against_a_real_server() {
     );
 
     // --- delete, guarded then idempotent -----------------------------------
-    // Finding #3 of the first live run: the etag from the original PUT went
-    // stale the moment the edit round-tripped, and Radicale enforces If-Match
-    // on DELETE as strictly as on PUT. Optimistic concurrency covers removal
-    // too — a client deleting over a stale etag would be deleting a version
-    // it has never seen.
+    // Finding #3 of the first live run: an etag goes stale the moment the
+    // edit round-trips, and servers enforce If-Match on DELETE as strictly as
+    // on PUT. Optimistic concurrency covers removal too — a client deleting
+    // over a stale etag would be deleting a version it has never seen. The
+    // stale value is the *first sync's* etag, which every server provided in
+    // its listing — not the PUT response's, which finding #7 says may not
+    // exist.
     let stale_delete = client
-        .delete_event(&event_url, etag.as_deref())
+        .delete_event(&event_url, Some(&first_sync_etag))
         .expect_err("a stale-etag DELETE was accepted");
     assert_eq!(stale_delete.disposition(), Disposition::Reconcile);
 

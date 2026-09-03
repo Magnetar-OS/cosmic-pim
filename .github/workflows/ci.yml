@@ -41,9 +41,12 @@ jobs:
   # The server matrix 00-suite.md asks for: the real sync engine against real
   # CalDAV servers, exercising discovery, MKCALENDAR, listing, multiget,
   # writeback, the 412 path and guarded deletes against something nobody
-  # canned. Two independent codebases already; Baïkal and Nextcloud can join
-  # as containers later. The journey each job runs has been validated locally
-  # against both servers before ever reaching CI.
+  # canned. Three independent codebases — Radicale (Python), Xandikos
+  # (Python, unrelated), Nextcloud (sabre/dav, PHP) — which is the point: a
+  # single server proves the client against one set of habits, and every leg
+  # added so far has produced findings the others could not. The journey each
+  # job runs is validated locally against that server, twice, before it
+  # reaches CI.
   live-caldav:
     name: live CalDAV (${{ matrix.server }})
     runs-on: ubuntu-latest
@@ -59,6 +62,10 @@ jobs:
             url: http://127.0.0.1:5233/ci/
             user: ""
             pass: ""
+          - server: nextcloud
+            url: http://127.0.0.1:8081/remote.php/dav/
+            user: ci
+            pass: ci-password-1
     steps:
       - uses: actions/checkout@v4
       - name: Show the pinned toolchain
@@ -98,12 +105,35 @@ jobs:
             sleep 0.2
           done
 
+      # The official image installs itself from these env vars — no wizard,
+      # no occ, no fixture. SQLite because the journey touches a handful of
+      # events and a database container would only add a second thing to wait
+      # for.
+      - name: Start Nextcloud
+        if: matrix.server == 'nextcloud'
+        run: |
+          docker run -d --name pim-nextcloud -p 127.0.0.1:8081:80 \
+            -e SQLITE_DATABASE=nextcloud \
+            -e NEXTCLOUD_ADMIN_USER=ci \
+            -e NEXTCLOUD_ADMIN_PASSWORD=ci-password-1 \
+            nextcloud:latest
+          # Installation is what takes the time, not the port opening, so the
+          # wait is on status.php reporting installed rather than on a socket.
+          for _ in $(seq 1 120); do
+            curl -s http://127.0.0.1:8081/status.php | grep -q '"installed":true' && break
+            sleep 2
+          done
+
       - name: Live round trip
         env:
           COSMIC_PIM_LIVE_CALDAV_URL: ${{ matrix.url }}
           COSMIC_PIM_LIVE_CALDAV_USER: ${{ matrix.user }}
           COSMIC_PIM_LIVE_CALDAV_PASS: ${{ matrix.pass }}
         run: cargo test -p cosmic-pim-caldav --test live_server -- --ignored
+
+      - name: Server log on failure
+        if: failure() && matrix.server == 'nextcloud'
+        run: docker logs pim-nextcloud | tail -100
 
   # The IMAP half of the same argument: the real client against a stock
   # Dovecot, not our own canned responses. Its first local run found two real

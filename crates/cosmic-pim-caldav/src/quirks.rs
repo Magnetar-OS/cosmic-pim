@@ -17,7 +17,8 @@
 //! # The discipline
 //!
 //! A fact enters this table from one of two sources: the CI server matrix
-//! (`tests/live_server.rs` — Radicale and Xandikos so far), or a field report
+//! (`tests/live_server.rs` — Radicale, Xandikos and Nextcloud so far), or a
+//! field report
 //! with the wire traffic to back it. Not from documentation — the entire reason the
 //! table exists is that servers do not match their documentation.
 //!
@@ -225,9 +226,21 @@ pub fn quirks_for(server: Server) -> Quirks {
             // spelling of "already exists". Defended everywhere: `mkcalendar`
             // keys on the precondition element, not the status.
         }
+        Server::Nextcloud => {
+            // CI, first live run (2026-09-03, Nextcloud 34.0.3 / sabre-dav):
+            // a 201 to PUT carries no ETag header at all — the value only
+            // appears on a later HEAD or in a PROPFIND listing. Defended
+            // everywhere by a rule that predates the finding: `drain`
+            // discards the PUT response's etag and lets the next listing be
+            // the source of truth, precisely because a response etag is
+            // optional (RFC 4918 §8.6 recommends it; nothing requires it) and
+            // may describe a body the server transformed. The finding
+            // confirmed the rule rather than changing it — and it *did* find
+            // a test that had quietly relied on the header.
+        }
         // The field has not put anything on record for these yet. That is the
         // healthy state: the engine's unconditional defences have been enough.
-        Server::Nextcloud | Server::Baikal | Server::Fastmail => {}
+        Server::Baikal | Server::Fastmail => {}
         Server::Unknown => {}
     }
     quirks
@@ -279,6 +292,10 @@ mod tests {
         assert_eq!(detect(None, None), Server::Unknown);
         assert_eq!(quirks_for(Server::Unknown), Quirks::default());
         assert_eq!(quirks_for(Server::Radicale), Quirks::default());
+        // Nextcloud's finding needed no runtime branch either — the defence
+        // was already unconditional. An entry with no field set is the
+        // ledger working as intended.
+        assert_eq!(quirks_for(Server::Nextcloud), Quirks::default());
     }
 
     #[test]
