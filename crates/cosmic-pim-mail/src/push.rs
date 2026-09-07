@@ -219,6 +219,59 @@ pub trait Writeback {
     fn store_flags(&mut self, uid: u32, flags: Flags) -> crate::Result<()>;
     fn move_message(&mut self, uid: u32, destination: &str) -> crate::Result<()>;
     fn delete_message(&mut self, uid: u32) -> crate::Result<()>;
+
+    /// The flags the server currently holds for one message.
+    ///
+    /// Needed because [`Self::store_flags`] *replaces* the whole set — it
+    /// sends `FLAGS.SILENT`, which is right for the queue (it carries the
+    /// user's final intent, not a delta) and wrong for anything that means to
+    /// change one flag and leave the rest. Without a read first, clearing
+    /// `\Seen` also clears the star the user put on the message.
+    ///
+    /// `Ok(None)` means this backend cannot answer per-UID; see
+    /// [`Self::mark_unread`] for what a caller does about that.
+    fn flags_for(&mut self, _uid: u32) -> crate::Result<Option<Flags>> {
+        Ok(None)
+    }
+
+    /// Clears `\Seen` and disturbs nothing else.
+    ///
+    /// The operation snooze's wake needs, and any other "put this back in
+    /// front of me" verb: a message that returns already-read returns
+    /// invisible. It lives here rather than in each engine because the two
+    /// hazards are the kind every implementation rediscovers the hard way:
+    ///
+    /// - **Read before write.** `FLAGS.SILENT` replaces the set, so the
+    ///   current flags have to be fetched or the message loses whatever else
+    ///   it carried.
+    /// - **Before the move, never after.** RFC 6851 `MOVE` does not report
+    ///   the destination UID, and the fallback COPY does not either, so once
+    ///   a message has moved there is no handle left to address it with.
+    ///
+    /// Returns whether the message is now unread. `false` means the backend
+    /// could not read the flags back ([`Self::flags_for`] answered `None`) and
+    /// nothing was written — deliberately not a best-effort blind write,
+    /// which would trade a silent invisible message for a silently lost star.
+    /// A caller that would rather have the message back read than not at all
+    /// can say so explicitly by calling [`Self::store_flags`] itself.
+    fn mark_unread(&mut self, uid: u32) -> crate::Result<bool> {
+        let Some(flags) = self.flags_for(uid)? else {
+            return Ok(false);
+        };
+        if !flags.seen {
+            // Already unread: no round trip, and no needless MODSEQ bump for
+            // every other client to re-sync.
+            return Ok(true);
+        }
+        self.store_flags(
+            uid,
+            Flags {
+                seen: false,
+                ..flags
+            },
+        )?;
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -406,6 +459,8 @@ mod tests {
         /// Errors to return, newest last; `None` means succeed.
         script: Vec<Option<Error>>,
         calls: Vec<PushOp>,
+        /// What the server currently holds, for the read-modify-write paths.
+        flags: std::collections::HashMap<u32, Flags>,
     }
 
     impl FakeServer {
@@ -413,6 +468,7 @@ mod tests {
             Self {
                 script: vec![Some(error)],
                 calls: Vec::new(),
+                flags: std::collections::HashMap::new(),
             }
         }
 
@@ -425,6 +481,9 @@ mod tests {
     }
 
     impl Writeback for FakeServer {
+        fn flags_for(&mut self, uid: u32) -> crate::Result<Option<Flags>> {
+            Ok(self.flags.get(&uid).copied())
+        }
         fn store_flags(&mut self, uid: u32, flags: Flags) -> crate::Result<()> {
             self.calls.push(PushOp::SetFlags { uid, flags });
             self.next()
@@ -451,6 +510,83 @@ mod tests {
 
     fn set_flags(uid: u32) -> PushOp {
         PushOp::SetFlags { uid, flags: seen() }
+    }
+
+    /* ---------------- mark_unread ---------------- */
+
+    /// The hazard the helper exists for: `FLAGS.SILENT` replaces the set, so
+    /// clearing `\Seen` without reading first would take the user's star
+    /// with it.
+    #[test]
+    fn marking_unread_keeps_every_other_flag() {
+        let mut server = FakeServer::default();
+        server.flags.insert(
+            7,
+            Flags {
+                seen: true,
+                flagged: true,
+                answered: true,
+                ..Flags::default()
+            },
+        );
+
+        assert!(server.mark_unread(7).unwrap());
+        assert_eq!(
+            server.calls,
+            vec![PushOp::SetFlags {
+                uid: 7,
+                flags: Flags {
+                    seen: false,
+                    flagged: true,
+                    answered: true,
+                    ..Flags::default()
+                },
+            }],
+            "the star or the answered mark was clobbered"
+        );
+    }
+
+    #[test]
+    fn marking_an_already_unread_message_writes_nothing() {
+        let mut server = FakeServer::default();
+        server.flags.insert(7, Flags::default());
+
+        assert!(server.mark_unread(7).unwrap());
+        assert!(
+            server.calls.is_empty(),
+            "a needless write bumped MODSEQ for every other client"
+        );
+    }
+
+    /// A backend that cannot read flags back writes nothing rather than
+    /// guessing: a blind write trades an invisible message for a lost star,
+    /// and the caller is the one entitled to make that trade.
+    #[test]
+    fn a_backend_that_cannot_read_flags_declines_rather_than_guessing() {
+        struct Blind(Vec<PushOp>);
+        impl Writeback for Blind {
+            fn store_flags(&mut self, uid: u32, flags: Flags) -> crate::Result<()> {
+                self.0.push(PushOp::SetFlags { uid, flags });
+                Ok(())
+            }
+            fn move_message(&mut self, _uid: u32, _destination: &str) -> crate::Result<()> {
+                Ok(())
+            }
+            fn delete_message(&mut self, _uid: u32) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut blind = Blind(Vec::new());
+        assert!(!blind.mark_unread(7).unwrap());
+        assert!(blind.0.is_empty(), "a blind write happened anyway");
+    }
+
+    #[test]
+    fn a_message_another_client_expunged_is_not_an_error() {
+        let mut server = FakeServer::default();
+        assert!(!server.mark_unread(404).unwrap());
+        assert!(server.calls.is_empty());
     }
 
     #[test]

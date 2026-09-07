@@ -9,6 +9,9 @@
 //! nothing: [`Schedule::due`] hands the caller [`Wake`] plans, the caller
 //! applies them through the same writeback verbs every other change takes,
 //! and [`Schedule::woke`] retires a record once the move actually happened.
+//! Apply one in the order the plan implies — mark unread *first* (with
+//! [`crate::push::Writeback::mark_unread`], which preserves the other flags),
+//! then move — because a moved message has no UID left to address.
 //! That split is what keeps snooze testable without a socket and identical
 //! across IMAP, JMAP, Gmail and Graph.
 //!
@@ -105,6 +108,12 @@ pub struct Wake {
     /// Always true: a message that returns already-read returns invisible,
     /// which defeats the entire point of asking for it back. The field exists
     /// so the intent is stated at the call site rather than assumed.
+    ///
+    /// Honour it with [`crate::push::Writeback::mark_unread`] rather than a
+    /// bare `store_flags`, and **before** applying the move: that helper
+    /// reads the current flags first (so the user's star survives) and the
+    /// move destroys the handle the write needs (`MOVE` never reports the
+    /// destination UID).
     pub mark_unread: bool,
 }
 

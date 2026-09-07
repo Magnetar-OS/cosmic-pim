@@ -24,7 +24,7 @@ use std::thread;
 use cosmic_pim_mail::imap::{Endpoint, Security, Session, SyncOptions, Watched, sync_mailbox};
 use cosmic_pim_mail::maildir::MaildirStore;
 use cosmic_pim_mail::model::{Flags, Message};
-use cosmic_pim_mail::push::{PushOp, PushQueue};
+use cosmic_pim_mail::push::{PushOp, PushQueue, Writeback as _};
 use cosmic_pim_mail::store::MailStore;
 
 /// One message the fake server holds.
@@ -304,6 +304,61 @@ fn a_full_cycle_lands_messages_in_a_maildir_readable_by_anything() {
     let cursor = store.state().expect("state").cursor;
     assert_eq!(cursor.last_uid, 2);
     assert_eq!(cursor.uid_validity, 42);
+}
+
+/// Waking a snoozed message clears `\Seen` and nothing else — and the only
+/// place that can be proven is the wire, because `FLAGS.SILENT` replaces the
+/// whole set and a client that skipped the read would look identical from the
+/// outside until the user noticed their star was gone.
+#[test]
+fn marking_unread_reads_the_flags_before_it_writes_them() {
+    let server = FakeServer::start(Scenario {
+        messages: vec![ServerMessage {
+            uid: 1,
+            flags: "\\Seen \\Flagged",
+            body: HELLO,
+        }],
+        ..Scenario::default()
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut session = connect(&server);
+
+    // A wake runs inside a sync pass, which is what selects the mailbox.
+    sync_mailbox(
+        &mut session,
+        "INBOX",
+        &mut store(&dir),
+        SyncOptions::default(),
+        0,
+    )
+    .expect("sync");
+    let _ = server.commands(); // drain, so what follows is the wake's alone
+
+    assert!(session.mark_unread(1).expect("mark unread"));
+
+    let commands = server.commands();
+    let fetch = commands
+        .iter()
+        .position(|c| c.to_ascii_uppercase().contains("UID FETCH"))
+        .expect("the flags were never read back");
+    let store_at = commands
+        .iter()
+        .position(|c| c.to_ascii_uppercase().contains("UID STORE"))
+        .expect("nothing was written");
+
+    assert!(
+        fetch < store_at,
+        "the write went out before the read, so it wrote a guess: {commands:?}"
+    );
+    let written = &commands[store_at];
+    assert!(
+        written.contains("\\Flagged"),
+        "the star was clobbered: {written}"
+    );
+    assert!(
+        !written.to_ascii_uppercase().contains("\\SEEN"),
+        "the message stayed read: {written}"
+    );
 }
 
 #[test]

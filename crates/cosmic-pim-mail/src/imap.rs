@@ -381,6 +381,20 @@ impl Session {
 }
 
 impl Writeback for Session {
+    /// One UID's flags, or `None` if the server no longer lists it — a
+    /// message expunged by another client between the queue's decision and
+    /// this call is gone, not an error.
+    fn flags_for(&mut self, uid: u32) -> Result<Option<Flags>> {
+        let fetches = self
+            .inner
+            .uid_fetch(uid.to_string(), "(FLAGS)")
+            .map_err(imap_error)?;
+        Ok(fetches
+            .iter()
+            .find(|fetch| fetch.uid == Some(uid))
+            .map(|fetch| Flags::from_imap(fetch.flags())))
+    }
+
     fn store_flags(&mut self, uid: u32, flags: Flags) -> Result<()> {
         // `FLAGS.SILENT` sets the whole set rather than adding to it, which is
         // what the queue stores: the user's final intent, not a delta.
