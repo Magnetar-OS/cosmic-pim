@@ -285,13 +285,14 @@ impl Account {
     #[must_use]
     pub fn identities(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = self.from_identity().into_iter().collect();
-        let primary_name = out.first().map(|(name, _)| name.clone()).unwrap_or_default();
+        let primary_name = out
+            .first()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default();
         if let Some(mail) = self.mail.as_ref() {
             for alias in &mail.aliases {
                 let address = alias.address.trim();
-                if address.is_empty()
-                    || out.iter().any(|(_, a)| a.eq_ignore_ascii_case(address))
-                {
+                if address.is_empty() || out.iter().any(|(_, a)| a.eq_ignore_ascii_case(address)) {
                     continue;
                 }
                 let name = Some(alias.name.trim())

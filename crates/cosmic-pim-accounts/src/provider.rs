@@ -273,7 +273,11 @@ impl Provider {
         let mut account = crate::Account::new(&self.name, "", username);
         account.provider = Some(self.id.clone());
         account.url = self.calendar_url(username).unwrap_or_default();
-        account.mail = self.services.mail.as_ref().map(|m| m.endpoint_for(username));
+        account.mail = self
+            .services
+            .mail
+            .as_ref()
+            .map(|m| m.endpoint_for(username));
         account
     }
 }
@@ -642,7 +646,13 @@ mod tests {
         // details stay filled in so switching back is one field.
         let registry = Registry::load_from(Path::new("/nonexistent"));
 
-        let google = registry.get("google").unwrap().services.mail.as_ref().unwrap();
+        let google = registry
+            .get("google")
+            .unwrap()
+            .services
+            .mail
+            .as_ref()
+            .unwrap();
         assert_eq!(google.protocol, MailProtocol::Gmail);
         assert_eq!(google.imap_host, "imap.gmail.com");
 
@@ -665,11 +675,26 @@ mod tests {
 
         let google = registry.get("google").unwrap().oauth.as_ref().unwrap();
         assert!(google.scopes.iter().any(|s| s.contains("gmail.modify")));
-        assert!(google.scopes.iter().any(|s| s == "https://mail.google.com/"));
+        assert!(
+            google
+                .scopes
+                .iter()
+                .any(|s| s == "https://mail.google.com/")
+        );
 
         let microsoft = registry.get("microsoft").unwrap().oauth.as_ref().unwrap();
-        assert!(microsoft.scopes.iter().any(|s| s.contains("Mail.ReadWrite")));
-        assert!(microsoft.scopes.iter().any(|s| s.contains("IMAP.AccessAsUser")));
+        assert!(
+            microsoft
+                .scopes
+                .iter()
+                .any(|s| s.contains("Mail.ReadWrite"))
+        );
+        assert!(
+            microsoft
+                .scopes
+                .iter()
+                .any(|s| s.contains("IMAP.AccessAsUser"))
+        );
     }
 
     #[test]
@@ -690,7 +715,10 @@ mod tests {
 
         let mail = account.mail.expect("mail endpoints");
         assert_eq!(mail.protocol, MailProtocol::Jmap);
-        assert_eq!(mail.jmap_session_url.as_deref(), Some("https://api.fastmail.com/jmap/session"));
+        assert_eq!(
+            mail.jmap_session_url.as_deref(),
+            Some("https://api.fastmail.com/jmap/session")
+        );
         // …and the IMAP details are still filled in, because a user who
         // prefers IMAP changes one field rather than typing four.
         assert_eq!(mail.imap_host, "imap.fastmail.com");
