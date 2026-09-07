@@ -389,3 +389,59 @@ fn the_drafts_mirror_replaces_rather_than_accumulates_on_a_real_server() {
     );
     let _ = session.logout();
 }
+
+#[test]
+fn keywords_round_trip_against_a_real_server() {
+    use cosmic_pim_mail::store::MailStore as _;
+
+    let Some((base, credentials)) = server() else {
+        eprintln!("PIM_TEST_IMAP not set; skipping the live keywords test");
+        return;
+    };
+    let endpoint = fresh_user(&base);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut session = connect(&endpoint, &credentials);
+
+    session
+        .append("INBOX", MESSAGE, Flags::default())
+        .expect("APPEND");
+    let mut store = MaildirStore::open(dir.path().join("INBOX")).expect("maildir");
+    sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0).expect("sync");
+    let uid = *store.state().expect("state").entries.keys().next().expect("a message");
+
+    // Label it: intern locally, queue the flag write, drain via a cycle.
+    let bit = store.intern_keyword("travel").expect("intern");
+    let flags = store.state().expect("state").entries[&uid].with_keyword(bit, true);
+    store.set_flags(uid, flags).expect("set");
+    store
+        .enqueue(PushOp::SetFlags { uid, flags })
+        .expect("enqueue");
+    sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0).expect("push cycle");
+
+    // A second client, fresh maildir: the keyword must come back by name and
+    // land in its own mapping.
+    let mut other = connect(&endpoint, &credentials);
+    let other_dir = tempfile::tempdir().expect("tempdir");
+    let mut other_store = MaildirStore::open(other_dir.path().join("INBOX")).expect("maildir");
+    sync_mailbox(
+        &mut other,
+        "INBOX",
+        &mut other_store,
+        SyncOptions::default(),
+        0,
+    )
+    .expect("other sync");
+
+    let table = other_store.keywords();
+    let their_bit = table
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("travel"))
+        .expect("the keyword name did not arrive at the second client");
+    let their_flags = other_store.state().expect("state").entries[&uid];
+    assert!(
+        their_flags.keywords & (1 << their_bit) != 0,
+        "the keyword did not survive the round trip: {table:?} {their_flags:?}"
+    );
+    let _ = other.logout();
+    let _ = session.logout();
+}

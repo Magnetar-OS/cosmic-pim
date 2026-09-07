@@ -120,6 +120,10 @@ pub struct Session {
     /// QRESYNC on top of CONDSTORE: the same delta round trip also carries
     /// the deletions, as VANISHED responses.
     qresync: bool,
+    /// Row N names keyword bit N, for spelling [`Flags::keywords`] on the
+    /// wire. Installed by the sync cycle from the store's table before the
+    /// push drain — the session itself has no idea what a bit means.
+    keyword_table: Vec<String>,
 }
 
 impl std::fmt::Debug for Session {
@@ -206,6 +210,7 @@ impl Session {
             selected: None,
             condstore,
             qresync,
+            keyword_table: Vec::new(),
         })
     }
 
@@ -305,6 +310,12 @@ impl Session {
         Ok(uids)
     }
 
+    /// Installs the selected mailbox's keyword table, so a STORE can spell
+    /// [`Flags::keywords`] as the names the server knows.
+    pub fn set_keyword_table(&mut self, table: Vec<String>) {
+        self.keyword_table = table;
+    }
+
     /// SELECTs `mailbox` for callers outside the sync cycle — the drafts
     /// mirror, which addresses a folder no cycle has selected for it.
     pub fn select_mailbox(&mut self, mailbox: &str) -> Result<imap::types::Mailbox> {
@@ -398,7 +409,20 @@ impl Writeback for Session {
     fn store_flags(&mut self, uid: u32, flags: Flags) -> Result<()> {
         // `FLAGS.SILENT` sets the whole set rather than adding to it, which is
         // what the queue stores: the user's final intent, not a delta.
-        let names = flags.to_imap().join(" ");
+        let mut names: Vec<&str> = flags.to_imap();
+        // The keyword bits, spelled through the installed table. A bit the
+        // table cannot name is dropped from the wire rather than invented:
+        // it stays in the maildir filename, which is where it came from.
+        for bit in flags.keyword_bits() {
+            if let Some(name) = self
+                .keyword_table
+                .get(usize::from(bit))
+                .filter(|name| !name.is_empty())
+            {
+                names.push(name);
+            }
+        }
+        let names = names.join(" ");
         self.inner
             .uid_store(uid.to_string(), format!("FLAGS.SILENT ({names})"))
             .map(|_| ())
@@ -539,6 +563,10 @@ pub fn sync_mailbox(
         .any(|flag| matches!(flag, imap::types::Flag::MayCreate));
 
     // --- Push, before anything reads the server's version of the flags ------
+    // The queue's flag bits are spelled through the store's keyword table;
+    // installed here so a labelled message enqueued offline goes out with
+    // its names.
+    session.set_keyword_table(store.keywords());
     outcome.pushed = push::drain(session, store, now_ms);
     // A move or delete the drain just performed leaves the store now, on the
     // strength of the server's own OK. Waiting for the reconciliation to
@@ -556,9 +584,10 @@ pub fn sync_mailbox(
     let mut highest_seen = cursor.last_uid;
     for batch in to_fetch.chunks(FETCH_BATCH) {
         let fetched = fetch_batch(session, batch)?;
-        for message in &fetched {
+        for (mut message, names) in fetched {
+            message.flags = intern_names(store, message.flags, &names);
             highest_seen = highest_seen.max(message.uid);
-            store.upsert(message)?;
+            store.upsert(&message)?;
             outcome.fetched += 1;
         }
         // A UID the server listed but would not return is not retried
@@ -575,8 +604,9 @@ pub fn sync_mailbox(
         match fetch_flag_deltas(session, cursor.highest_modseq) {
             Ok((deltas, vanished)) => {
                 let held = store.state()?.entries;
-                for (uid, flags) in deltas {
+                for (uid, flags, names) in deltas {
                     if let Some(local) = held.get(&uid) {
+                        let flags = intern_names(store, flags, &names);
                         let merged = flags.with_local_only_from(*local);
                         if merged != *local {
                             store.set_flags(uid, merged)?;
@@ -612,7 +642,10 @@ pub fn sync_mailbox(
 
     // --- Full reconciliation ------------------------------------------------
     if options.reconcile {
-        let listing = fetch_all_flags(session)?;
+        let listing: Vec<(u32, Flags)> = fetch_all_flags(session)?
+            .into_iter()
+            .map(|(uid, flags, names)| (uid, intern_names(store, flags, &names)))
+            .collect();
         let local = store.state()?.entries;
         let reconciled = plan::plan_reconcile(&listing, &local);
         outcome.guard_tripped = reconciled.guard_tripped;
@@ -622,9 +655,10 @@ pub fn sync_mailbox(
             outcome.reflagged += 1;
         }
         for batch in reconciled.to_fetch.chunks(FETCH_BATCH) {
-            for message in &fetch_batch(session, batch)? {
+            for (mut message, names) in fetch_batch(session, batch)? {
+                message.flags = intern_names(store, message.flags, &names);
                 cursor.last_uid = cursor.last_uid.max(message.uid);
-                store.upsert(message)?;
+                store.upsert(&message)?;
                 outcome.fetched += 1;
             }
         }
@@ -679,7 +713,7 @@ fn discover(
     Ok(uids)
 }
 
-fn fetch_batch(session: &mut Session, uids: &[u32]) -> Result<Vec<RemoteMessage>> {
+fn fetch_batch(session: &mut Session, uids: &[u32]) -> Result<Vec<(RemoteMessage, Vec<String>)>> {
     if uids.is_empty() {
         return Ok(Vec::new());
     }
@@ -695,8 +729,9 @@ fn fetch_batch(session: &mut Session, uids: &[u32]) -> Result<Vec<RemoteMessage>
     Ok(fetches.iter().filter_map(remote_message).collect())
 }
 
-/// What one CHANGEDSINCE window reported: `(flag deltas, vanished UIDs)`.
-type FlagWindow = (Vec<(u32, Flags)>, Vec<u32>);
+/// What one CHANGEDSINCE window reported: `(flag deltas with their keyword
+/// names, vanished UIDs)`.
+type FlagWindow = (Vec<(u32, Flags, Vec<String>)>, Vec<u32>);
 
 /// Every flag change since `modseq` — and, with QRESYNC, every deletion —
 /// in one round trip.
@@ -711,7 +746,13 @@ fn fetch_flag_deltas(session: &mut Session, modseq: u64) -> Result<FlagWindow> {
     let fetches = session.inner.uid_fetch("1:*", query).map_err(imap_error)?;
     let deltas = fetches
         .iter()
-        .filter_map(|fetch| Some((fetch.uid?, Flags::from_imap(fetch.flags()))))
+        .filter_map(|fetch| {
+            Some((
+                fetch.uid?,
+                Flags::from_imap(fetch.flags()),
+                custom_keywords(fetch.flags()),
+            ))
+        })
         .collect();
 
     // VANISHED (EARLIER) arrives as an unsolicited response alongside the
@@ -730,26 +771,61 @@ fn fetch_flag_deltas(session: &mut Session, modseq: u64) -> Result<FlagWindow> {
 
 /// The complete UID set with flags — the authoritative listing a full
 /// reconciliation needs.
-fn fetch_all_flags(session: &mut Session) -> Result<Vec<(u32, Flags)>> {
+fn fetch_all_flags(session: &mut Session) -> Result<Vec<(u32, Flags, Vec<String>)>> {
     let fetches = session
         .inner
         .uid_fetch("1:*", "(FLAGS)")
         .map_err(imap_error)?;
     Ok(fetches
         .iter()
-        .filter_map(|fetch| Some((fetch.uid?, Flags::from_imap(fetch.flags()))))
+        .filter_map(|fetch| {
+            Some((
+                fetch.uid?,
+                Flags::from_imap(fetch.flags()),
+                custom_keywords(fetch.flags()),
+            ))
+        })
         .collect())
 }
 
-fn remote_message(fetch: &Fetch<'_>) -> Option<RemoteMessage> {
-    Some(RemoteMessage {
-        uid: fetch.uid?,
-        flags: Flags::from_imap(fetch.flags()),
-        raw: fetch.body()?.to_vec(),
-        internal_date_ms: fetch
-            .internal_date()
-            .map_or(0, |date| date.timestamp_millis()),
-    })
+fn remote_message(fetch: &Fetch<'_>) -> Option<(RemoteMessage, Vec<String>)> {
+    Some((
+        RemoteMessage {
+            uid: fetch.uid?,
+            flags: Flags::from_imap(fetch.flags()),
+            raw: fetch.body()?.to_vec(),
+            internal_date_ms: fetch
+                .internal_date()
+                .map_or(0, |date| date.timestamp_millis()),
+        },
+        custom_keywords(fetch.flags()),
+    ))
+}
+
+/// The custom keyword names in a FETCH's flag list — everything that is not
+/// a system flag, `$`-prefixed conventions included, because Dovecot interns
+/// those in the same mapping and hiding them here would strand them.
+fn custom_keywords(flags: &[imap::types::Flag<'_>]) -> Vec<String> {
+    flags
+        .iter()
+        .filter_map(|flag| match flag {
+            imap::types::Flag::Custom(name) => Some(name.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Folds a message's keyword names into its flag bits, interning each name
+/// in the store's table. A name the table cannot take — full, or not an
+/// atom — costs that one keyword, never the message.
+fn intern_names(store: &mut impl MailStore, mut flags: Flags, names: &[String]) -> Flags {
+    for name in names {
+        match store.intern_keyword(name) {
+            Ok(bit) => flags = flags.with_keyword(bit, true),
+            Err(why) => tracing::debug!(name, %why, "a server keyword could not be kept"),
+        }
+    }
+    flags
 }
 
 /// `dd-Mon-yyyy`, the only date format RFC 3501 SEARCH accepts.
