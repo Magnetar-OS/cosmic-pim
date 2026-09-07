@@ -45,7 +45,19 @@ work. Last touched 2026-09-07.
   events, tasks, and cards) and both consume `overlaps`/`resolve` in a
   per-property conflict UI. Slate displays the birthday stream. Snooze and
   mbox export landed in the substrate, closing two of the five gaps 04
-  ranked as most-missed (rules and labels remain; OpenPGP/S-MIME after).
+  ranked as most-missed (OpenPGP/S-MIME after; rules landed earlier).
+  **Labels/keywords: substrate landed, Envelope UI in flight — lane held by
+  envelope-1f.** Flags carries a 26-bit keyword mask (Dovecot's letter
+  scheme), the maildir owns the `dovecot-keywords` mapping, every IMAP
+  fetch path interns names before merging (pinned in tests after two
+  review passes independently derived the erase-on-merge hazard), the
+  live Dovecot suite proves the two-client round trip and the reconcile
+  leg, and `label:`/`tag:`/`keyword:` parse in the query language. Still
+  ahead in the same lane: Envelope's chips, the label picker, and the
+  search-side filter. Housekeeping disclosure: a `--amend` in this shared
+  checkout misfired — 66f2960 (caldav itip) also carries the one-hunk
+  search-test fix for `label:`; content is correct, atomicity is not.
+  Rule adopted: fix forward only, never amend here.
   App-side open: three-scope recurrence editing UI and an export-to-mbox
   action; Envelope's snooze UI shipped and has since been migrated onto the
   substrate engine, deleting its app-local scheduler.
