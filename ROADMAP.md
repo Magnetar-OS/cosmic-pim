@@ -412,6 +412,33 @@ listed in the COSMIC store.
   auto-merge, an inference budget anywhere. The one flagged reversal (opt-in
   sanitized HTML view) is argued above, in the open.
 
+### Working a shared checkout
+
+Several sessions edit this one working tree at once. Each rule below is here
+because ignoring it cost something real on 2026-09-07.
+
+- **Stage explicit paths. Never `git add -A`, `git add .`, or `git add
+  <crate>/`.** A formatting sweep staged a whole crate and swept a peer's
+  uncommitted work in with it: `73f9f78`, titled `style: cargo fmt`, also
+  contains a behavioural IMAP fix (`mark_unread` moving to a delta `-FLAGS`
+  STORE so a full-set write can no longer strip a message's keywords) and
+  the wire test that proves it. The change is correct and the history now
+  hides it — a reader skips `style:`, and a bisect for behaviour skips it
+  too. Nobody can fix that afterwards without rewriting shared history,
+  which is worse.
+- **Never `--amend` or rebase here.** An amend landed one seat's fix inside
+  another seat's commit (`66f2960`). Fix forward; a follow-up commit costs
+  nothing and says what happened.
+- **Verify before reporting a defect in someone else's crate.** `git log -1`
+  and a `cargo check` first. Two separate findings were written up today
+  against code that had already been fixed between the read and the report —
+  the tree moves under every read, so a trace is only true at a commit.
+- **Lanes are crates, not session names.** Four sessions concluded the
+  labels work was unowned because it sits in `cosmic-pim-mail` while its
+  owner is named for an app repository. Anyone reasoning about ownership
+  from a session name will make the same mistake; announce a lane by the
+  crates it touches.
+
 ## Risks, suite level
 
 - **The server zoo dominates post-CI-matrix maintenance** — the quirks-table
