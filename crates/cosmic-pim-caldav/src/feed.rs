@@ -47,10 +47,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use cosmic_pim_core::atomic;
 use cosmic_pim_core::model::{CalendarMeta, Rgb};
 use cosmic_pim_core::patch::{ContentLine, logical_lines, terminator_of};
 use cosmic_pim_core::store::vdir;
-use cosmic_pim_core::atomic;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -248,10 +248,7 @@ pub fn refresh(collection: &Path, now_ms: i64) -> Result<FeedOutcome> {
         });
     }
     if !(200..300).contains(&status) {
-        return Err(Error::status(
-            status,
-            format!("feed {}", state.url),
-        ));
+        return Err(Error::status(status, format!("feed {}", state.url)));
     }
 
     let etag = response
@@ -426,18 +423,15 @@ pub fn split_by_uid(body: &str) -> Vec<(String, String)> {
                     depth -= 1;
                     if depth == 0 {
                         debug_assert_eq!(&ended, name, "unbalanced component nesting");
-                        let (name, collected) =
-                            inside.take().expect("just matched Some");
+                        let (name, collected) = inside.take().expect("just matched Some");
                         if name == "VTIMEZONE" {
                             timezones.push(collected);
                         } else {
                             match uid_of(&collected) {
-                                Some(uid) => {
-                                    match components.iter_mut().find(|(u, _)| *u == uid) {
-                                        Some((_, blocks)) => blocks.push(collected),
-                                        None => components.push((uid, vec![collected])),
-                                    }
-                                }
+                                Some(uid) => match components.iter_mut().find(|(u, _)| *u == uid) {
+                                    Some((_, blocks)) => blocks.push(collected),
+                                    None => components.push((uid, vec![collected])),
+                                },
                                 None => {
                                     tracing::warn!(
                                         component = name,
@@ -553,7 +547,11 @@ END:VCALENDAR\r\n";
         let split = split_by_uid(FEED);
 
         assert_eq!(split.len(), 2);
-        let recurring = &split.iter().find(|(uid, _)| uid == "recurring@example.com").unwrap().1;
+        let recurring = &split
+            .iter()
+            .find(|(uid, _)| uid == "recurring@example.com")
+            .unwrap()
+            .1;
         assert_eq!(recurring.matches("BEGIN:VEVENT").count(), 2);
         assert!(recurring.contains("RECURRENCE-ID"));
     }
@@ -565,8 +563,14 @@ END:VCALENDAR\r\n";
         // for.
         for (uid, text) in split_by_uid(FEED) {
             assert!(text.contains("BEGIN:VTIMEZONE"), "{uid} lost its timezone");
-            assert!(text.contains("TZID:Europe/Athens"), "{uid} lost the zone id");
-            assert!(text.contains("PRODID:-//Example//Feed//EN"), "{uid} lost the header");
+            assert!(
+                text.contains("TZID:Europe/Athens"),
+                "{uid} lost the zone id"
+            );
+            assert!(
+                text.contains("PRODID:-//Example//Feed//EN"),
+                "{uid} lost the header"
+            );
             assert!(text.starts_with("BEGIN:VCALENDAR\r\n"));
             assert!(text.ends_with("END:VCALENDAR\r\n"));
         }
@@ -577,7 +581,11 @@ END:VCALENDAR\r\n";
         // The split copies lines, it does not re-serialise them; a re-folded
         // summary would be the second serialiser this suite does not have.
         let split = split_by_uid(FEED);
-        let single = &split.iter().find(|(uid, _)| uid == "single@example.com").unwrap().1;
+        let single = &split
+            .iter()
+            .find(|(uid, _)| uid == "single@example.com")
+            .unwrap()
+            .1;
 
         assert!(
             single.contains("folded acros\r\n s two"),
@@ -591,7 +599,11 @@ END:VCALENDAR\r\n";
         // reading identity out of it would file the event under the alarm.
         let split = split_by_uid(FEED);
         assert!(split.iter().any(|(uid, _)| uid == "single@example.com"));
-        assert!(!split.iter().any(|(uid, _)| uid.contains("alarm-not-the-event")));
+        assert!(
+            !split
+                .iter()
+                .any(|(uid, _)| uid.contains("alarm-not-the-event"))
+        );
     }
 
     #[test]
@@ -601,7 +613,10 @@ END:VCALENDAR\r\n";
 
         assert_eq!(split.len(), 1);
         assert!(split[0].1.contains("BEGIN:VCALENDAR\nVERSION:2.0\n"));
-        assert!(!split[0].1.contains("\r\n"), "the terminator was rewritten to CRLF");
+        assert!(
+            !split[0].1.contains("\r\n"),
+            "the terminator was rewritten to CRLF"
+        );
     }
 
     #[test]
@@ -619,11 +634,23 @@ END:VCALENDAR\r\n";
 
     #[test]
     fn webcal_normalises_to_https() {
-        assert_eq!(normalise_url("webcal://example.com/f.ics"), "https://example.com/f.ics");
-        assert_eq!(normalise_url("webcals://example.com/f.ics"), "https://example.com/f.ics");
-        assert_eq!(normalise_url("https://example.com/f.ics"), "https://example.com/f.ics");
+        assert_eq!(
+            normalise_url("webcal://example.com/f.ics"),
+            "https://example.com/f.ics"
+        );
+        assert_eq!(
+            normalise_url("webcals://example.com/f.ics"),
+            "https://example.com/f.ics"
+        );
+        assert_eq!(
+            normalise_url("https://example.com/f.ics"),
+            "https://example.com/f.ics"
+        );
         // Explicit http is the escape hatch and is left alone.
-        assert_eq!(normalise_url("http://old.example/f.ics"), "http://old.example/f.ics");
+        assert_eq!(
+            normalise_url("http://old.example/f.ics"),
+            "http://old.example/f.ics"
+        );
     }
 
     #[test]

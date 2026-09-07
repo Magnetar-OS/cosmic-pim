@@ -11,8 +11,8 @@
 //! - the split files are read back by the ordinary store, so `khal` and the
 //!   calendar index see a feed exactly as they see any other collection.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cosmic_pim_caldav::feed::{self, FeedState};
 use cosmic_pim_core::model::Rgb;
