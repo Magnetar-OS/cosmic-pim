@@ -64,9 +64,16 @@ work. Last touched 2026-09-07.
   bus against a stock Dovecot: DeliverInvitation rendered Slate's dialog,
   SendSchedulingReply queued a contract-shaped reply, the poll drained it
   over real SMTP with the ics byte-identical to what crossed D-Bus, and the
-  canned invitation synced into Envelope's maildir. Remaining: the user's
-  two staged clicks (Slate's Accept, Envelope's "Open in calendar"), then
-  organizer send-side and RFC 6638 free/busy. The run's findings are fixed:
+  canned invitation synced into Envelope's maildir. The substrate side is
+  now complete: organizer send-side (`itip::with_method` — an invitation is
+  the stored event plus one line, so nothing an attendee receives is
+  re-serialised — plus `bump_sequence`, `send_invitation`,
+  `send_cancellation`) and RFC 6638 free/busy (`discover_scheduling` keeps
+  the outbox URL it probes for, `post_scheduling` runs the exchange,
+  `itip::query_availability` answers "when are these people busy" per
+  attendee, with "would not say" distinguished from "free"). Remaining is
+  app-side only: the user's two staged clicks (Slate's Accept, Envelope's
+  "Open in calendar"). The run's findings are fixed:
   the keychain probe can no longer hang app init (3 s abandonment +
   `COSMIC_PIM_NO_KEYRING`), and a secret stored to the envelope while the
   keychain was locked can no longer be stranded (per-slot backend record;
