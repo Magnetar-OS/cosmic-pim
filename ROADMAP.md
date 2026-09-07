@@ -46,8 +46,7 @@ work. Last touched 2026-09-07.
   per-property conflict UI. Slate displays the birthday stream. Snooze and
   mbox export landed in the substrate, closing two of the five gaps 04
   ranked as most-missed (OpenPGP/S-MIME after; rules landed earlier).
-  **Labels/keywords: substrate landed, Envelope UI in flight — lane held by
-  envelope-1f.** Flags carries a 26-bit keyword mask (Dovecot's letter
+  **Labels/keywords: done end to end — lane envelope-1f, released.** Flags carries a 26-bit keyword mask (Dovecot's letter
   scheme), the maildir owns the `dovecot-keywords` mapping, every IMAP
   fetch path interns names before merging (pinned in tests after two
   review passes independently derived the erase-on-merge hazard), the
