@@ -59,13 +59,14 @@ impl Mailbox {
     }
 }
 
-/// The IMAP system flags (RFC 3501 §2.3.2) plus maildir's `P` (passed).
+/// The IMAP system flags (RFC 3501 §2.3.2) plus maildir's `P` (passed) —
+/// and the custom keywords, as bits over the mailbox's keyword table.
 ///
-/// Deliberately a struct of bools rather than a set of strings: these five are
-/// the flags with defined semantics, every server has them, and both the
-/// maildir filename and the IMAP wire form are fixed vocabularies. Custom
-/// keywords are a different thing with a different lifetime and are not
-/// modelled here — see [`crate::maildir`] for why they are not in the filename.
+/// Deliberately a struct of bools plus a bitmask rather than a set of
+/// strings: the five system flags are fixed vocabulary on both the maildir
+/// filename and the IMAP wire, and a keyword is one of at most 26 letters
+/// whose *name* is mailbox-level state, not per-message state — see
+/// [`crate::maildir`] for the `dovecot-keywords` mapping that names them.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -228,6 +229,13 @@ impl Flags {
     /// Used when the server is authoritative for the five system flags but the
     /// local file is the only place `P` exists. Without this, every flag
     /// reconciliation would quietly clear it.
+    ///
+    /// Keywords are deliberately **not** carried across: the server states
+    /// the complete keyword set in every FETCH, and carrying local bits over
+    /// would make an unlabel on another client impossible to receive. The
+    /// obligation this creates sits with the caller: intern the wire's
+    /// keyword names into bits *before* merging, as every sync path does —
+    /// wire flags merged without interning erase the letters.
     #[must_use]
     pub fn with_local_only_from(mut self, other: Self) -> Self {
         self.passed = other.passed;
@@ -536,17 +544,50 @@ Body text.\r\n";
     }
 
     #[test]
+    fn server_flags_without_keyword_bits_erase_letters_which_is_why_callers_intern_first() {
+        // The contract two review passes worried at: `with_local_only_from`
+        // carries only `passed`, so keywords are the *server* value's to
+        // state. A caller that merges wire flags without interning the
+        // keyword names first erases the letters — which is exactly what
+        // letting the server unlabel requires, and exactly why every sync
+        // path interns before it merges.
+        let local = Flags {
+            seen: true,
+            ..Flags::default()
+        }
+        .with_keyword(0, true);
+        let server_uninterned = Flags {
+            seen: false,
+            ..Flags::default()
+        };
+        assert_eq!(
+            server_uninterned.with_local_only_from(local).keywords,
+            0,
+            "keywords silently survived a merge they must not survive"
+        );
+
+        let server_interned = server_uninterned.with_keyword(0, true);
+        assert_eq!(
+            server_interned.with_local_only_from(local).keywords,
+            local.keywords
+        );
+    }
+
+    #[test]
     fn keyword_bits_stay_inside_the_letter_space() {
-        let flags = Flags::default().with_keyword(25, true).with_keyword(26, true);
+        let flags = Flags::default()
+            .with_keyword(25, true)
+            .with_keyword(26, true);
         assert_eq!(
             flags.keyword_bits().collect::<Vec<_>>(),
             vec![25],
             "a bit outside a–z was accepted"
         );
         assert_eq!(flags.to_maildir_info(), "z");
-        assert!(!Flags::default().with_keyword(3, true).with_keyword(3, false).keywords != 0 || true);
         assert_eq!(
-            Flags::default().with_keyword(3, true).with_keyword(3, false),
+            Flags::default()
+                .with_keyword(3, true)
+                .with_keyword(3, false),
             Flags::default(),
             "clearing a keyword did not clear it"
         );

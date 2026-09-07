@@ -378,7 +378,10 @@ fn the_drafts_mirror_replaces_rather_than_accumulates_on_a_real_server() {
     // --- Discard: the tombstone retires the server copy -------------------
     drafts.delete(&id).expect("delete");
     let report = draft_sync::sweep(&mut session, drafts_wire, &drafts, "example.com", 4);
-    assert_eq!(report.retired, 1, "the discarded draft survived: {report:?}");
+    assert_eq!(
+        report.retired, 1,
+        "the discarded draft survived: {report:?}"
+    );
     session.select_mailbox(drafts_wire).expect("select");
     assert!(
         session
@@ -407,7 +410,13 @@ fn keywords_round_trip_against_a_real_server() {
         .expect("APPEND");
     let mut store = MaildirStore::open(dir.path().join("INBOX")).expect("maildir");
     sync_mailbox(&mut session, "INBOX", &mut store, SyncOptions::default(), 0).expect("sync");
-    let uid = *store.state().expect("state").entries.keys().next().expect("a message");
+    let uid = *store
+        .state()
+        .expect("state")
+        .entries
+        .keys()
+        .next()
+        .expect("a message");
 
     // Label it: intern locally, queue the flag write, drain via a cycle.
     let bit = store.intern_keyword("travel").expect("intern");
@@ -441,6 +450,25 @@ fn keywords_round_trip_against_a_real_server() {
     assert!(
         their_flags.keywords & (1 << their_bit) != 0,
         "the keyword did not survive the round trip: {table:?} {their_flags:?}"
+    );
+
+    // And a full reconciliation must not strip it — the path where a merge
+    // of un-interned wire flags would erase the letter.
+    sync_mailbox(
+        &mut session,
+        "INBOX",
+        &mut store,
+        SyncOptions {
+            reconcile: true,
+            ..SyncOptions::default()
+        },
+        0,
+    )
+    .expect("reconcile cycle");
+    let after = store.state().expect("state").entries[&uid];
+    assert!(
+        after.keywords & (1 << bit) != 0,
+        "a full reconciliation stripped the keyword: {after:?}"
     );
     let _ = other.logout();
     let _ = session.logout();
