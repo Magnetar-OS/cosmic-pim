@@ -17,18 +17,24 @@ file wins on *when relative to what*.
 ## Status ledger
 
 Updated as milestones move; the one place a session checks before claiming
-work. Last touched 2026-09-02.
+work. Last touched 2026-09-07.
 
 - **Milestone 0 — done.** Docs agree with the code; the Meltemi MPL-2.0 grant
   exists (per-file, extended as ports continue); all four repos green.
-- **Milestone 1 — done except one in-flight item.** Landed: conflict base
-  capture + automatic three-way merge + per-unit `overlaps`/`resolve`
-  (`core::merge`), mass-delete confirm-on-second-sight, error taxonomy,
-  quirks tables (DAV seeded, IMAP seeded from Dovecot), Windows TZ mapping,
-  local-only collections, birthday synthesis (`core::birthdays`), round-trip
-  corpus, the RRULE golden suite, scheduling semantics (`caldav::itip`).
-  In flight: the Baïkal/Nextcloud CI legs (Radicale, Xandikos, Dovecot
-  already run).
+- **Milestone 1 — done.** Landed: conflict base capture + automatic three-way
+  merge + per-unit `overlaps`/`resolve` (`core::merge`), mass-delete
+  confirm-on-second-sight, error taxonomy, quirks tables (DAV seeded, IMAP
+  seeded from Dovecot), Windows TZ mapping, local-only collections, birthday
+  synthesis (`core::birthdays`), round-trip corpus, the RRULE golden suite,
+  scheduling semantics (`caldav::itip`). The DAV server matrix is complete:
+  Radicale, Xandikos, Nextcloud and Baïkal all run the full journey, plus
+  Dovecot for IMAP — every leg validated locally twice before landing.
+  Findings #7 and #8 came out of the last two: Nextcloud answers PUT with no
+  ETag header at all, and *none* of the four servers announces itself in its
+  `Server` header, which had left `detect` blind to all of them. Detection
+  now reads the `DAV:` compliance list and `X-Sabre-Version`; the two servers
+  that volunteer nothing stay `Unknown` on purpose, and each CI leg asserts
+  the detection outcome it expects so that limit is a tested fact.
 - **Milestone 2 — moving.** Substrate side largely ahead of the apps:
   occurrence overrides (RECURRENCE-ID end to end), server-side drafts
   mirror, filter rules + List-Id, outbox with scheduled sends and honest
@@ -155,10 +161,11 @@ server without touching protocol code; the golden-suite gates below exist.
 
 **Engineering gates opened here** (they guard everything after):
 
-- Server-matrix CI: containerized Radicale, Baïkal, Nextcloud (DAV) and
-  Dovecot (IMAP) driving the real engines — 412 paths, tombstones,
-  token-expiry, UIDVALIDITY bump. Fastmail/Google/iCloud/Exchange stay a
-  manual conformance checklist feeding the quirks table.
+- Server-matrix CI — **open**: containerized Radicale, Xandikos, Nextcloud and
+  Baïkal (DAV) plus Dovecot (IMAP) driving the real engines — 412 paths,
+  tombstones, guarded deletes, UIDVALIDITY bump, and each server's detection
+  outcome. Fastmail/Google/iCloud/Exchange stay a manual conformance
+  checklist feeding the quirks table.
 - RRULE golden suite against libical expansions: DST transitions
   (Europe/Athens + one US zone), COUNT vs UNTIL, EXDATE + RECURRENCE-ID,
   monthly-on-31st, BYSETPOS.
