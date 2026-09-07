@@ -57,10 +57,14 @@ work. Last touched 2026-09-07.
   checkout misfired — 66f2960 (caldav itip) also carries the one-hunk
   search-test fix for `label:`; content is correct, atomicity is not.
   Rule adopted: fix forward only, never amend here.
-  OpenPGP's read path landed (verify, decrypt, five verdicts — signing on
-  send is the unclaimed second slice), which closes the last of the five
-  gaps 04 ranked most-missed: rules, labels, snooze, mbox import and PGP are
-  all in.
+  OpenPGP's read path landed and is user-visible end to end: the substrate
+  verifies and decrypts (five verdicts, keys passed in), and Envelope reads
+  its ring from `.keys/<address>.asc` beside the maildirs — address-as-stem
+  is the binding — rendering each verdict under its display contract. That
+  closes the last of the five gaps 04 ranked most-missed: rules, labels,
+  snooze, mbox import and PGP are all in. Two slices deliberately unclaimed:
+  signing/encrypting on send, and the decrypt UI (which needs secret-key
+  storage and passphrase prompting).
   App-side open: three-scope recurrence editing UI and an export-to-mbox
   action; Envelope's snooze UI shipped and has since been migrated onto the
   substrate engine, deleting its app-local scheduler.
