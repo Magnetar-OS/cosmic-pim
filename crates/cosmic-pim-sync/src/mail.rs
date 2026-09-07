@@ -220,8 +220,7 @@ fn drain_outbox_with(
     now_ms: i64,
     submit: impl FnMut(&cosmic_pim_mail::Draft) -> cosmic_pim_mail::Outcome,
 ) -> Result<Drained> {
-    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id))
-        .map_err(Error::Mail)?;
+    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id)).map_err(Error::Mail)?;
     let outcome = outbox.drain_with(submit, now_ms).map_err(Error::Mail)?;
     Ok(Drained {
         sent: outcome.sent.len(),
@@ -590,8 +589,7 @@ fn drain_outbox(
     now_ms: i64,
     session: &mut Session,
 ) -> Result<(usize, usize)> {
-    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id))
-        .map_err(Error::Mail)?;
+    let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id)).map_err(Error::Mail)?;
 
     let outcome = outbox
         .drain(&smtp_endpoint(account, mail), credentials, now_ms)
