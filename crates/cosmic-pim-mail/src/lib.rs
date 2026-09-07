@@ -96,6 +96,7 @@ pub mod maildir;
 pub mod mbox;
 pub mod model;
 pub mod outbox;
+pub mod pgp;
 pub mod plan;
 pub mod pop3;
 pub mod push;
