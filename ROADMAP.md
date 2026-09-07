@@ -57,6 +57,10 @@ work. Last touched 2026-09-07.
   checkout misfired — 66f2960 (caldav itip) also carries the one-hunk
   search-test fix for `label:`; content is correct, atomicity is not.
   Rule adopted: fix forward only, never amend here.
+  OpenPGP's read path landed (verify, decrypt, five verdicts — signing on
+  send is the unclaimed second slice), which closes the last of the five
+  gaps 04 ranked most-missed: rules, labels, snooze, mbox import and PGP are
+  all in.
   App-side open: three-scope recurrence editing UI and an export-to-mbox
   action; Envelope's snooze UI shipped and has since been migrated onto the
   substrate engine, deleting its app-local scheduler.
