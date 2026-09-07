@@ -189,8 +189,8 @@ mod tests {
         // Somebody typing a colon means a colon far more often than they mean a
         // syntax nobody told them about, and a search that returns nothing with
         // no explanation is worse than one that searches for what was typed.
-        let query = parse("label:work re:2024");
-        assert_eq!(query.terms, ["label:work", "re:2024"]);
+        let query = parse("size:huge re:2024");
+        assert_eq!(query.terms, ["size:huge", "re:2024"]);
     }
 
     #[test]

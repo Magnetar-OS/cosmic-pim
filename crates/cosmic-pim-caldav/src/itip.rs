@@ -271,6 +271,176 @@ pub fn strip_method(ics: &str) -> String {
     out
 }
 
+/// Adds a `METHOD` to a stored calendar object — the exact inverse of
+/// [`strip_method`], and the whole of "turn this event into an invitation".
+///
+/// The organizer's REQUEST *is* the stored event, byte for byte, with one
+/// line added. Rebuilding it from a parsed model instead is how an
+/// invitation arrives missing the VALARM the organizer set, the VTIMEZONE
+/// the attendee's client needs, and every X- property the two of them were
+/// silently exchanging. Nothing here is re-serialised: the METHOD goes in at
+/// the VCALENDAR level after the last of VERSION/PRODID/CALSCALE, which is
+/// where RFC 5545 §3.6 expects it and where a reader will not be surprised
+/// by it, and every other byte passes through untouched.
+///
+/// An existing METHOD is replaced rather than duplicated — two METHOD lines
+/// are invalid, and a REQUEST accidentally still carrying `METHOD:REPLY`
+/// would be applied backwards by the receiver.
+#[must_use]
+pub fn with_method(ics: &str, method: &str) -> String {
+    let method_line = format!("METHOD:{}", method.trim().to_ascii_uppercase());
+    let terminator = terminator_of(ics);
+    let lines = logical_lines(ics);
+
+    // Where the METHOD belongs: after the calendar-level preamble, before the
+    // first component. Falling back to "right after BEGIN:VCALENDAR" keeps a
+    // preamble-less object valid rather than refusing it.
+    let mut depth = 0usize;
+    let mut insert_at = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(name) = line.begins() {
+            depth += 1;
+            if depth == 1 && name == "VCALENDAR" {
+                insert_at = Some(index + 1);
+                continue;
+            }
+            if depth == 2 {
+                // A component started; the preamble is over.
+                break;
+            }
+            continue;
+        }
+        if line.ends().is_some() {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth == 1 && matches!(line.name().as_str(), "VERSION" | "PRODID" | "CALSCALE") {
+            insert_at = Some(index + 1);
+        }
+    }
+    let Some(insert_at) = insert_at else {
+        // Not a VCALENDAR at all. Returning it unchanged rather than wrapping
+        // it: a caller that handed us the wrong bytes needs to see that.
+        return ics.to_owned();
+    };
+
+    let mut out = String::with_capacity(ics.len() + method_line.len() + 2);
+    let mut depth = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        if index == insert_at {
+            fold(&method_line, terminator, &mut out);
+        }
+        if line.begins().is_some() {
+            depth += 1;
+        } else if line.ends().is_some() {
+            depth = depth.saturating_sub(1);
+        } else if depth == 1 && line.name() == "METHOD" {
+            continue;
+        }
+        out.push_str(line.raw());
+    }
+    out
+}
+
+/// Raises the `SEQUENCE` of every VEVENT in a stored object by one.
+///
+/// RFC 5546 §3.2.2: the organizer increments SEQUENCE when a change matters
+/// to attendees — a moved time, a changed location — and leaves it alone
+/// when it does not, because attendees whose clients see a raised sequence
+/// are asked to answer again. Every VEVENT in the file moves together: a
+/// master and its overrides are one scheduling object, and bumping only some
+/// of them leaves the series answering at two different versions.
+///
+/// Byte-preserving like everything else here — only the SEQUENCE values are
+/// rewritten, and a VEVENT without one gains `SEQUENCE:1`, since absent means
+/// zero (RFC 5545 §3.8.7.4).
+#[must_use]
+pub fn bump_sequence(ics: &str) -> String {
+    let terminator = terminator_of(ics);
+    let lines = logical_lines(ics);
+
+    // Which VEVENTs lack a SEQUENCE, so one can be inserted before END.
+    let mut out = String::with_capacity(ics.len() + 16);
+    let mut depth = 0usize;
+    let mut in_event_at: Option<usize> = None;
+    let mut event_had_sequence = false;
+
+    for line in &lines {
+        if let Some(name) = line.begins() {
+            depth += 1;
+            if name == "VEVENT" && in_event_at.is_none() {
+                in_event_at = Some(depth);
+                event_had_sequence = false;
+            }
+            out.push_str(line.raw());
+            continue;
+        }
+        if line.ends().is_some() {
+            if in_event_at == Some(depth) {
+                if !event_had_sequence {
+                    fold("SEQUENCE:1", terminator, &mut out);
+                }
+                in_event_at = None;
+            }
+            depth = depth.saturating_sub(1);
+            out.push_str(line.raw());
+            continue;
+        }
+
+        if in_event_at == Some(depth) && line.name() == "SEQUENCE" {
+            event_had_sequence = true;
+            let current: i64 = line.value().trim().parse().unwrap_or(0);
+            fold(
+                &format!("SEQUENCE:{}", current.max(0).saturating_add(1)),
+                terminator,
+                &mut out,
+            );
+            continue;
+        }
+        out.push_str(line.raw());
+    }
+    out
+}
+
+/// Sends a stored event to its attendees as an invitation (RFC 6638 §3.2).
+///
+/// `ics` is the event exactly as it sits in the vdir. It is wrapped with
+/// `METHOD:REQUEST` and POSTed to the organizer's Outbox; the server fans it
+/// out and returns a verdict per attendee.
+///
+/// This is the server-scheduling path, and it is the one to prefer when
+/// `discover_scheduling` offers an outbox: the server knows which attendees
+/// are local, handles the ones that are not over iMIP or iSchedule, and files
+/// its own copy of what it sent. Where there is no outbox, the same bytes go
+/// to Envelope to be mailed — which is why this returns the wrapped payload's
+/// verdicts rather than hiding the transport.
+///
+/// Bump the sequence first ([`bump_sequence`]) when re-sending a change
+/// attendees must answer again; this call does not decide that, because only
+/// the caller knows whether the edit was significant.
+pub fn send_invitation(
+    client: &crate::dav::CaldavClient,
+    outbox_url: &str,
+    ics: &str,
+) -> Result<Vec<crate::dav::ScheduleResponse>> {
+    client.post_scheduling(outbox_url, &with_method(ics, "REQUEST"))
+}
+
+/// Withdraws a stored event from its attendees (RFC 5546 §3.2.5).
+///
+/// The event's own bytes with `METHOD:CANCEL`, which is what makes the
+/// receiver's [`apply`] scope the cancellation correctly: a payload carrying
+/// RECURRENCE-ID cancels that instance, one without cancels the series. The
+/// caller controls which by passing the master or a single override — the
+/// same distinction, from the sending side.
+pub fn send_cancellation(
+    client: &crate::dav::CaldavClient,
+    outbox_url: &str,
+    ics: &str,
+) -> Result<Vec<crate::dav::ScheduleResponse>> {
+    client.post_scheduling(outbox_url, &with_method(ics, "CANCEL"))
+}
+
 /// What applying one payload did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -974,6 +1144,162 @@ pub fn query_availability(
             request_status: response.request_status,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod organizer_tests {
+    use super::*;
+
+    /// A stored event with the cargo an invitation must not lose: a
+    /// VTIMEZONE, a VALARM, and vendor properties nothing here models.
+    const STORED: &str = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//cosmic-pim//EN\r\n\
+CALSCALE:GREGORIAN\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Europe/Athens\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:19701025T040000\r\n\
+TZOFFSETFROM:+0300\r\n\
+TZOFFSETTO:+0200\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:meet-1@example.com\r\n\
+SEQUENCE:2\r\n\
+DTSTART;TZID=Europe/Athens:20270105T100000\r\n\
+DTEND;TZID=Europe/Athens:20270105T110000\r\n\
+SUMMARY:Planning\r\n\
+ORGANIZER:mailto:me@example.com\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:ada@example.com\r\n\
+X-VENDOR-THING:keep me\r\n\
+BEGIN:VALARM\r\n\
+ACTION:DISPLAY\r\n\
+DESCRIPTION:Reminder\r\n\
+TRIGGER:-PT15M\r\n\
+END:VALARM\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    #[test]
+    fn an_invitation_is_the_stored_event_plus_one_line() {
+        // The entire discipline in one assertion: wrapping and unwrapping
+        // must be lossless, so the invitation an attendee receives carries
+        // the organizer's own bytes rather than our idea of them.
+        let request = with_method(STORED, "REQUEST");
+        assert!(request.contains("METHOD:REQUEST\r\n"));
+        assert_eq!(strip_method(&request), STORED);
+    }
+
+    #[test]
+    fn the_method_lands_after_the_preamble_not_inside_a_component() {
+        let request = with_method(STORED, "REQUEST");
+        let method_at = request.find("METHOD:REQUEST").expect("a METHOD");
+        let calscale_at = request.find("CALSCALE:").expect("the preamble");
+        let first_component = request.find("BEGIN:VTIMEZONE").expect("a component");
+        assert!(
+            calscale_at < method_at && method_at < first_component,
+            "METHOD landed outside the calendar preamble"
+        );
+    }
+
+    #[test]
+    fn an_existing_method_is_replaced_never_duplicated() {
+        // A REQUEST still carrying METHOD:REPLY would be applied backwards by
+        // the receiver — it would read our invitation as somebody's answer.
+        let reply = with_method(STORED, "REPLY");
+        let request = with_method(&reply, "REQUEST");
+        assert_eq!(request.matches("METHOD:").count(), 1, "{request}");
+        assert!(request.contains("METHOD:REQUEST"));
+    }
+
+    #[test]
+    fn wrapping_keeps_the_timezone_the_alarm_and_the_vendor_property() {
+        let request = with_method(STORED, "REQUEST");
+        assert!(request.contains("BEGIN:VTIMEZONE"), "the timezone was lost");
+        assert!(request.contains("BEGIN:VALARM"), "the alarm was lost");
+        assert!(
+            request.contains("X-VENDOR-THING:keep me"),
+            "vendor data lost"
+        );
+        assert!(request.contains("DTSTART;TZID=Europe/Athens:20270105T100000"));
+    }
+
+    #[test]
+    fn something_that_is_not_a_calendar_comes_back_untouched() {
+        // Silently wrapping junk in a VCALENDAR would hide the caller's bug
+        // until an attendee's client rejected the result.
+        let junk = "not a calendar at all\r\n";
+        assert_eq!(with_method(junk, "REQUEST"), junk);
+    }
+
+    #[test]
+    fn a_bump_raises_every_vevent_together() {
+        // A master and its overrides are one scheduling object; bumping only
+        // one leaves the series answering at two versions.
+        let two_events = STORED.replace(
+            "END:VEVENT\r\nEND:VCALENDAR",
+            "END:VEVENT\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:meet-1@example.com\r\n\
+             RECURRENCE-ID;TZID=Europe/Athens:20270112T100000\r\n\
+             SEQUENCE:5\r\n\
+             SUMMARY:Planning (moved)\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR",
+        );
+        let bumped = bump_sequence(&two_events);
+        assert!(bumped.contains("SEQUENCE:3\r\n"), "the master did not move");
+        assert!(
+            bumped.contains("SEQUENCE:6\r\n"),
+            "the override did not move"
+        );
+        assert_eq!(bumped.matches("SEQUENCE:").count(), 2);
+    }
+
+    #[test]
+    fn an_event_without_a_sequence_gains_one() {
+        // Absent means zero (RFC 5545 §3.8.7.4), so the first bump is 1 — not
+        // a no-op, which would leave the change unannounced.
+        let no_sequence = STORED.replace("SEQUENCE:2\r\n", "");
+        let bumped = bump_sequence(&no_sequence);
+        assert!(bumped.contains("SEQUENCE:1\r\n"), "{bumped}");
+        // And it goes inside the VEVENT, not after it.
+        let seq_at = bumped.find("SEQUENCE:1").expect("a sequence");
+        let end_at = bumped.find("END:VEVENT").expect("an end");
+        assert!(seq_at < end_at);
+    }
+
+    #[test]
+    fn a_bump_changes_nothing_but_the_sequence() {
+        let bumped = bump_sequence(STORED);
+        assert_eq!(
+            bumped.replace("SEQUENCE:3", "SEQUENCE:2"),
+            STORED,
+            "a bump rewrote something other than the sequence"
+        );
+    }
+
+    #[test]
+    fn a_cancel_keeps_the_recurrence_id_that_scopes_it() {
+        // The sending half of the classic iTIP data-loss bug: a cancel for
+        // one instance must carry its RECURRENCE-ID, or the receiver deletes
+        // the whole series.
+        let one_instance = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+BEGIN:VEVENT\r\nUID:meet-1@example.com\r\n\
+RECURRENCE-ID;TZID=Europe/Athens:20270112T100000\r\n\
+SEQUENCE:2\r\nSUMMARY:Planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let cancel = with_method(one_instance, "CANCEL");
+        assert!(cancel.contains("METHOD:CANCEL\r\n"));
+        assert!(
+            cancel.contains("RECURRENCE-ID;TZID=Europe/Athens:20270112T100000\r\n"),
+            "the instance scope was lost — this cancels the series"
+        );
+        // And it parses back as what we meant to send.
+        let parsed = parse(&cancel).expect("a cancel");
+        assert_eq!(parsed.method, Method::Cancel);
+        assert!(parsed.recurrence_id.is_some());
+    }
 }
 
 #[cfg(test)]
