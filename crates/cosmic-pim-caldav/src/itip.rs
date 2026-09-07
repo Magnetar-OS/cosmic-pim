@@ -452,7 +452,8 @@ fn apply_reply(collection: &Path, itip: &Itip) -> Result<Outcome> {
         let Some(partstat) = attendee.partstat.as_deref() else {
             continue;
         };
-        if let Some(patched) = crate::patch::patch_attendee_partstat(&text, &attendee.email, partstat)
+        if let Some(patched) =
+            crate::patch::patch_attendee_partstat(&text, &attendee.email, partstat)
         {
             text = patched;
             updated += 1;
@@ -619,9 +620,17 @@ fn cancelled_override(itip: &Itip, rid: &str, terminator: &str) -> String {
     let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let mut out = String::new();
     fold("BEGIN:VEVENT", terminator, &mut out);
-    fold(&format!("UID:{}", escape_text(&itip.uid)), terminator, &mut out);
+    fold(
+        &format!("UID:{}", escape_text(&itip.uid)),
+        terminator,
+        &mut out,
+    );
     fold(&recurrence_id_line(rid), terminator, &mut out);
-    fold(&format!("SEQUENCE:{}", itip.sequence.max(0)), terminator, &mut out);
+    fold(
+        &format!("SEQUENCE:{}", itip.sequence.max(0)),
+        terminator,
+        &mut out,
+    );
     fold(&format!("DTSTAMP:{dtstamp}"), terminator, &mut out);
     fold("STATUS:CANCELLED", terminator, &mut out);
     fold("END:VEVENT", terminator, &mut out);
@@ -671,7 +680,11 @@ pub fn build_reply(reply: &Reply<'_>, me_email: &str, me_name: &str) -> String {
     fold("VERSION:2.0", terminator, &mut out);
     fold("METHOD:REPLY", terminator, &mut out);
     fold("BEGIN:VEVENT", terminator, &mut out);
-    fold(&format!("UID:{}", escape_text(reply.uid)), terminator, &mut out);
+    fold(
+        &format!("UID:{}", escape_text(reply.uid)),
+        terminator,
+        &mut out,
+    );
     if let Some(rid) = reply.recurrence_id.filter(|r| !r.trim().is_empty()) {
         fold(&recurrence_id_line(rid), terminator, &mut out);
     }
@@ -713,6 +726,387 @@ pub fn build_reply(reply: &Reply<'_>, me_email: &str, me_name: &str) -> String {
     fold("END:VEVENT", terminator, &mut out);
     fold("END:VCALENDAR", terminator, &mut out);
     out
+}
+
+/// Someone's busy time, as their server reported it.
+///
+/// The window only — no summary, no location, no attendees. That is the whole
+/// point of free/busy: a colleague's server will tell you *when* they are
+/// unavailable without telling you what they are doing, which is why this can
+/// be asked of people whose calendars you cannot read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusyPeriod {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// The `FBTYPE` parameter, uppercased — `BUSY`, `BUSY-TENTATIVE`,
+    /// `BUSY-UNAVAILABLE`. Defaults to `BUSY` per RFC 5545 §3.2.9 when the
+    /// parameter is absent, which is how most servers write it.
+    pub kind: String,
+}
+
+/// One attendee's answer to a free/busy request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Availability {
+    /// As the server spelled it, `mailto:` stripped and lowercased, so it
+    /// compares against the address that was asked for.
+    pub attendee: String,
+    /// The iTIP request-status for this attendee. `2.x` means the periods
+    /// below are an answer; anything else means they are not, and `busy` is
+    /// empty rather than misleadingly free.
+    pub request_status: String,
+    pub busy: Vec<BusyPeriod>,
+}
+
+impl Availability {
+    /// Whether this attendee actually answered.
+    ///
+    /// The distinction that matters to a scheduling UI: "free" and "would not
+    /// say" are different answers, and showing the second as the first books
+    /// meetings on top of people.
+    #[must_use]
+    pub fn answered(&self) -> bool {
+        self.request_status.trim_start().starts_with('2')
+    }
+}
+
+/// Builds the `METHOD:REQUEST` VFREEBUSY that asks when attendees are busy.
+///
+/// RFC 6638 §4.3: the organizer POSTs this to their own scheduling Outbox and
+/// the server fans it out — to local users directly, to remote ones over
+/// iMIP or iSchedule if it can. The UID is fresh per request because a
+/// free/busy question is not an event and nothing should ever be filed
+/// against it.
+#[must_use]
+pub fn build_freebusy_request(
+    organizer_email: &str,
+    attendee_emails: &[String],
+    start_ms: i64,
+    end_ms: i64,
+) -> String {
+    let terminator = "\r\n";
+    let now = chrono::Utc::now();
+    let dtstamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+    // Unique without pulling in a UUID dependency for a value nothing stores:
+    // the timestamp to the nanosecond plus the organizer's own address.
+    let uid = format!(
+        "freebusy-{}-{}@cosmic-pim",
+        now.timestamp_nanos_opt()
+            .unwrap_or_else(|| now.timestamp_millis()),
+        organizer_email.trim()
+    );
+
+    let mut out = String::new();
+    fold("BEGIN:VCALENDAR", terminator, &mut out);
+    fold("PRODID:-//cosmic-pim//itip//EN", terminator, &mut out);
+    fold("VERSION:2.0", terminator, &mut out);
+    fold("METHOD:REQUEST", terminator, &mut out);
+    fold("BEGIN:VFREEBUSY", terminator, &mut out);
+    fold(&format!("UID:{}", escape_text(&uid)), terminator, &mut out);
+    fold(&format!("DTSTAMP:{dtstamp}"), terminator, &mut out);
+    fold(
+        &format!("DTSTART:{}", utc_stamp(start_ms)),
+        terminator,
+        &mut out,
+    );
+    fold(
+        &format!("DTEND:{}", utc_stamp(end_ms)),
+        terminator,
+        &mut out,
+    );
+    fold(
+        &format!("ORGANIZER:mailto:{}", escape_text(organizer_email.trim())),
+        terminator,
+        &mut out,
+    );
+    for attendee in attendee_emails {
+        let attendee = attendee.trim();
+        if attendee.is_empty() {
+            continue;
+        }
+        fold(
+            &format!("ATTENDEE:mailto:{}", escape_text(attendee)),
+            terminator,
+            &mut out,
+        );
+    }
+    fold("END:VFREEBUSY", terminator, &mut out);
+    fold("END:VCALENDAR", terminator, &mut out);
+    out
+}
+
+/// Reads the `FREEBUSY` periods out of a VFREEBUSY reply.
+///
+/// A period is `start/end` or `start/duration` (RFC 5545 §3.8.2.6), and one
+/// property may carry a comma-separated list of them. Anything unparseable is
+/// skipped rather than guessed at: a free/busy view with a missing block
+/// shows a meeting that could be double-booked, but an *invented* block hides
+/// a slot that was actually free, and only one of those is discovered by the
+/// person looking at the grid.
+#[must_use]
+pub fn parse_freebusy(ics: &str) -> Vec<BusyPeriod> {
+    let mut out = Vec::new();
+    for line in logical_lines(ics) {
+        if line.begins().is_some() || line.ends().is_some() || line.name() != "FREEBUSY" {
+            continue;
+        }
+        let kind = param(line.params(), "FBTYPE")
+            .map_or_else(|| "BUSY".to_owned(), |v| v.trim().to_ascii_uppercase());
+        // FREE periods are the absence of busy-ness; recording them as busy
+        // would invert the answer.
+        if kind == "FREE" {
+            continue;
+        }
+        for period in line.value().split(',') {
+            if let Some((start_ms, end_ms)) = parse_period(period.trim()) {
+                out.push(BusyPeriod {
+                    start_ms,
+                    end_ms,
+                    kind: kind.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `start/end` or `start/duration`, both in UTC, to a millisecond range.
+fn parse_period(period: &str) -> Option<(i64, i64)> {
+    let (start, rest) = period.split_once('/')?;
+    let start_ms = parse_utc_stamp(start)?;
+    let end_ms = if rest.starts_with('P') || rest.starts_with("+P") || rest.starts_with("-P") {
+        start_ms + parse_duration_ms(rest)?
+    } else {
+        parse_utc_stamp(rest)?
+    };
+    (end_ms >= start_ms).then_some((start_ms, end_ms))
+}
+
+/// `YYYYMMDDTHHMMSSZ` — the only form RFC 5545 §3.3.5 permits in a period,
+/// and the only one accepted here: a floating or zoned stamp in a free/busy
+/// answer has no defined meaning across the two calendars being compared.
+fn parse_utc_stamp(stamp: &str) -> Option<i64> {
+    let stamp = stamp.trim();
+    if !stamp.ends_with('Z') {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%SZ")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp_millis())
+}
+
+/// An RFC 5545 §3.3.6 duration, restricted to what a period can carry.
+fn parse_duration_ms(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (sign, text) = match text.strip_prefix('-') {
+        Some(rest) => (-1i64, rest),
+        None => (1i64, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let rest = text.strip_prefix('P')?;
+    let mut total_ms = 0i64;
+    let mut in_time = false;
+    let mut digits = String::new();
+
+    for ch in rest.chars() {
+        match ch {
+            'T' => {
+                in_time = true;
+                digits.clear();
+            }
+            '0'..='9' => digits.push(ch),
+            unit => {
+                let value: i64 = digits.parse().ok()?;
+                digits.clear();
+                let ms = match (unit, in_time) {
+                    ('W', false) => value.checked_mul(7 * 24 * 3_600_000)?,
+                    ('D', false) => value.checked_mul(24 * 3_600_000)?,
+                    ('H', true) => value.checked_mul(3_600_000)?,
+                    ('M', true) => value.checked_mul(60_000)?,
+                    ('S', true) => value.checked_mul(1_000)?,
+                    _ => return None,
+                };
+                total_ms = total_ms.checked_add(ms)?;
+            }
+        }
+    }
+    // Trailing digits with no unit ("PT30") are malformed, not a default.
+    digits.is_empty().then_some(sign * total_ms)
+}
+
+fn utc_stamp(ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc.timestamp_millis_opt(ms).single().map_or_else(
+        || "19700101T000000Z".to_owned(),
+        |dt| dt.format("%Y%m%dT%H%M%SZ").to_string(),
+    )
+}
+
+/// Asks the server when `attendees` are busy between `start_ms` and `end_ms`.
+///
+/// The whole RFC 6638 §4.3 exchange: build the VFREEBUSY REQUEST, POST it to
+/// the organizer's own scheduling Outbox, and read one answer per attendee.
+/// Requires a server that runs the scheduling engine — `discover_scheduling`
+/// returns the outbox URL, and `None` there means this cannot be asked at all
+/// rather than that everyone is free.
+///
+/// An attendee the server would not answer for comes back with its
+/// request-status and no periods; see [`Availability::answered`], because
+/// "would not say" must not render as "free".
+pub fn query_availability(
+    client: &crate::dav::CaldavClient,
+    outbox_url: &str,
+    organizer_email: &str,
+    attendee_emails: &[String],
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<Availability>> {
+    let request = build_freebusy_request(organizer_email, attendee_emails, start_ms, end_ms);
+    let responses = client.post_scheduling(outbox_url, &request)?;
+    Ok(responses
+        .into_iter()
+        .map(|response| Availability {
+            attendee: normalise_email(&response.recipient),
+            busy: response
+                .calendar_data
+                .as_deref()
+                .filter(|_| response.succeeded())
+                .map(parse_freebusy)
+                .unwrap_or_default(),
+            request_status: response.request_status,
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod freebusy_tests {
+    use super::*;
+
+    /// What a server answers for someone with two meetings — the second
+    /// written as start/duration, which half of them do.
+    const REPLY: &str = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Server//EN\r\n\
+METHOD:REPLY\r\n\
+BEGIN:VFREEBUSY\r\n\
+UID:freebusy-1@example.com\r\n\
+DTSTAMP:20270104T080000Z\r\n\
+DTSTART:20270104T000000Z\r\n\
+DTEND:20270105T000000Z\r\n\
+ORGANIZER:mailto:me@example.com\r\n\
+ATTENDEE:mailto:ada@example.com\r\n\
+FREEBUSY;FBTYPE=BUSY:20270104T090000Z/20270104T100000Z\r\n\
+FREEBUSY;FBTYPE=BUSY-TENTATIVE:20270104T140000Z/PT1H30M\r\n\
+END:VFREEBUSY\r\n\
+END:VCALENDAR\r\n";
+
+    #[test]
+    fn a_request_names_every_attendee_and_bounds_the_window() {
+        let ics = build_freebusy_request(
+            "me@example.com",
+            &["ada@example.com".into(), "babbage@example.com".into()],
+            1_767_484_800_000,
+            1_767_571_200_000,
+        );
+        assert!(ics.contains("METHOD:REQUEST\r\n"));
+        assert!(ics.contains("BEGIN:VFREEBUSY\r\n"));
+        assert!(ics.contains("ORGANIZER:mailto:me@example.com\r\n"));
+        assert!(ics.contains("ATTENDEE:mailto:ada@example.com\r\n"));
+        assert!(ics.contains("ATTENDEE:mailto:babbage@example.com\r\n"));
+        // The window is what the server answers within; without it a server
+        // is free to answer for a day or a decade.
+        assert!(ics.contains("DTSTART:20260104T000000Z\r\n"), "{ics}");
+        assert!(ics.contains("DTEND:20260105T000000Z\r\n"), "{ics}");
+    }
+
+    #[test]
+    fn an_empty_attendee_is_skipped_rather_than_sent_as_mailto_nothing() {
+        let ics = build_freebusy_request(
+            "me@example.com",
+            &["  ".into(), "ada@example.com".into()],
+            0,
+            1_000,
+        );
+        assert!(!ics.contains("ATTENDEE:mailto:\r\n"), "{ics}");
+        assert_eq!(ics.matches("ATTENDEE:").count(), 1);
+    }
+
+    #[test]
+    fn both_period_forms_parse_to_the_same_kind_of_answer() {
+        let busy = parse_freebusy(REPLY);
+        assert_eq!(busy.len(), 2);
+        assert_eq!(busy[0].kind, "BUSY");
+        assert_eq!(busy[1].kind, "BUSY-TENTATIVE");
+        // start/duration resolves to the same shape as start/end: 14:00 + 1h30.
+        assert_eq!(busy[1].end_ms - busy[1].start_ms, 90 * 60 * 1_000);
+        assert_eq!(busy[0].end_ms - busy[0].start_ms, 60 * 60 * 1_000);
+    }
+
+    #[test]
+    fn a_free_period_is_not_recorded_as_busy() {
+        // FBTYPE=FREE says the opposite of every other value; treating it as
+        // busy would block the exact slots the server offered.
+        let ics = REPLY.replace(
+            "FREEBUSY;FBTYPE=BUSY:20270104T090000Z/20270104T100000Z",
+            "FREEBUSY;FBTYPE=FREE:20270104T090000Z/20270104T100000Z",
+        );
+        let busy = parse_freebusy(&ics);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0].kind, "BUSY-TENTATIVE");
+    }
+
+    #[test]
+    fn a_property_may_carry_several_periods() {
+        let ics = REPLY.replace(
+            "FREEBUSY;FBTYPE=BUSY:20270104T090000Z/20270104T100000Z",
+            "FREEBUSY:20270104T090000Z/20270104T100000Z,20270104T110000Z/20270104T113000Z",
+        );
+        let busy = parse_freebusy(&ics);
+        assert_eq!(busy.len(), 3);
+        // No FBTYPE at all means BUSY (RFC 5545 §3.2.9), not "unknown".
+        assert_eq!(busy[0].kind, "BUSY");
+        assert_eq!(busy[1].kind, "BUSY");
+    }
+
+    #[test]
+    fn unparseable_periods_are_dropped_never_guessed() {
+        // A skipped block risks a double-booking the user can see; an
+        // invented one hides a free slot they cannot. Only one is recoverable.
+        let ics = REPLY.replace(
+            "FREEBUSY;FBTYPE=BUSY:20270104T090000Z/20270104T100000Z",
+            "FREEBUSY:20270104T090000/20270104T100000",
+        );
+        let busy = parse_freebusy(&ics);
+        assert_eq!(busy.len(), 1, "a floating period was accepted: {busy:?}");
+
+        // Backwards periods are refused too — a negative-length busy block
+        // renders as an inverted band in any grid that draws it.
+        let backwards = REPLY.replace(
+            "FREEBUSY;FBTYPE=BUSY:20270104T090000Z/20270104T100000Z",
+            "FREEBUSY:20270104T100000Z/20270104T090000Z",
+        );
+        assert_eq!(parse_freebusy(&backwards).len(), 1);
+    }
+
+    #[test]
+    fn a_reply_with_no_freebusy_lines_means_free_not_broken() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\n\
+                   BEGIN:VFREEBUSY\r\nUID:x@y\r\nDTSTAMP:20270104T080000Z\r\n\
+                   ATTENDEE:mailto:ada@example.com\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n";
+        assert!(parse_freebusy(ics).is_empty());
+    }
+
+    #[test]
+    fn durations_cover_the_units_a_period_may_use() {
+        assert_eq!(parse_duration_ms("PT30M"), Some(30 * 60 * 1_000));
+        assert_eq!(parse_duration_ms("PT1H"), Some(3_600_000));
+        assert_eq!(parse_duration_ms("P1D"), Some(86_400_000));
+        assert_eq!(parse_duration_ms("P1W"), Some(7 * 86_400_000));
+        assert_eq!(parse_duration_ms("PT1H30M"), Some(90 * 60 * 1_000));
+        // Minutes and months share the letter M; only the position tells them
+        // apart, and a period may not carry months at all.
+        assert_eq!(parse_duration_ms("P1M"), None);
+        assert_eq!(parse_duration_ms("PT30"), None);
+        assert_eq!(parse_duration_ms("30M"), None);
+    }
 }
 
 #[cfg(test)]
@@ -787,7 +1181,10 @@ mod tests {
         let itip = parse(&request(0)).expect("an invitation");
 
         assert!(itip.is_addressed_to("ada@example.com"));
-        assert!(itip.is_addressed_to("MAILTO:Ada@Example.COM"), "normalisation failed");
+        assert!(
+            itip.is_addressed_to("MAILTO:Ada@Example.COM"),
+            "normalisation failed"
+        );
         assert!(!itip.is_addressed_to("list@example.com"));
         assert!(!itip.is_addressed_to("ada@example.com.attacker.example"));
         assert!(!itip.is_addressed_to(""));

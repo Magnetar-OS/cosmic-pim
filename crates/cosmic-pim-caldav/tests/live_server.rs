@@ -8,8 +8,9 @@
 //! server matrix 00-suite.md asks for: it proves the client against what a
 //! server actually says, which is where the quirks table's entries come from —
 //! its first afternoon produced six, and every server added since has produced
-//! more. CI runs it against Radicale, Xandikos and Nextcloud; Baïkal can join
-//! as a container later, and Fastmail/Google/iCloud stay a manual checklist.
+//! more. CI runs it against all four: Radicale, Xandikos, Nextcloud and
+//! Baïkal. Fastmail/Google/iCloud stay a manual checklist — they need real
+//! accounts, and a credential in shared CI is a credential in public.
 //!
 //! Ignored by default and gated on the environment, so `cargo test` stays
 //! offline and deterministic:
@@ -37,7 +38,11 @@ struct Live {
 fn live() -> Option<Live> {
     let base = std::env::var("COSMIC_PIM_LIVE_CALDAV_URL").ok()?;
     Some(Live {
-        base: if base.ends_with('/') { base } else { format!("{base}/") },
+        base: if base.ends_with('/') {
+            base
+        } else {
+            format!("{base}/")
+        },
         user: std::env::var("COSMIC_PIM_LIVE_CALDAV_USER").unwrap_or_default(),
         pass: std::env::var("COSMIC_PIM_LIVE_CALDAV_PASS").unwrap_or_default(),
     })
@@ -147,7 +152,9 @@ fn a_full_round_trip_against_a_real_server() {
             // Servers are free to rewrite the href; find ours by content.
             store.state().ok().and_then(|s| {
                 s.entries.keys().find_map(|href| {
-                    href.contains("ci-round-trip").then(|| store.entry_for(href)).flatten()
+                    href.contains("ci-round-trip")
+                        .then(|| store.entry_for(href))
+                        .flatten()
                 })
             })
         })
@@ -162,7 +169,10 @@ fn a_full_round_trip_against_a_real_server() {
     store.queue_put(&href).expect("queue");
 
     let pushed = drain(&client, &mut store, 0);
-    assert_eq!(pushed.succeeded, 1, "the edit did not reach the server: {pushed:?}");
+    assert_eq!(
+        pushed.succeeded, 1,
+        "the edit did not reach the server: {pushed:?}"
+    );
 
     // And the server agrees: a fresh sync into a fresh store sees the edit.
     let meta = vdir::create_collection(dir.path(), "Verify", Rgb(1, 2, 3)).expect("collection");
@@ -251,7 +261,11 @@ fn resolve(base: &str, href: &str) -> String {
     }
     let origin = base
         .find("//")
-        .and_then(|scheme| base[scheme + 2..].find('/').map(|slash| &base[..scheme + 2 + slash]))
+        .and_then(|scheme| {
+            base[scheme + 2..]
+                .find('/')
+                .map(|slash| &base[..scheme + 2 + slash])
+        })
         .unwrap_or(base);
     format!("{}{}", origin, href)
 }

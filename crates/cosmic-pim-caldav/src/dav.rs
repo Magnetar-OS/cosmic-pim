@@ -336,8 +336,51 @@ fn status_line_is_ok(status: &str) -> bool {
 /// RFC 6638 capability answer (see [`CaldavClient::discover_scheduling`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulingInfo {
-    pub supports_scheduling: bool,
+    /// The principal's `schedule-outbox-URL`, or `None` on a server that runs
+    /// no scheduling engine. The URL itself rather than a bare "supported"
+    /// flag, because knowing scheduling exists is useless without the address
+    /// to POST to — see [`CaldavClient::post_scheduling`].
+    pub outbox_url: Option<String>,
     pub default_calendar_url: Option<String>,
+}
+
+impl SchedulingInfo {
+    /// Whether the server runs the RFC 6638 scheduling engine.
+    #[must_use]
+    pub fn supports_scheduling(&self) -> bool {
+        self.outbox_url.is_some()
+    }
+}
+
+/// One recipient's outcome from a scheduling POST (RFC 6638 §3.2.5).
+///
+/// A scheduling POST is a *batch*: the request either fails outright, or
+/// succeeds with a per-recipient verdict for each attendee. A 200 therefore
+/// says nothing about whether any particular attendee was reached, which is
+/// why this carries the status per recipient rather than collapsing to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleResponse {
+    /// The recipient this verdict is about, as the server spelled it —
+    /// usually `mailto:someone@example.com`.
+    pub recipient: String,
+    /// The iTIP request-status (RFC 5546 §3.6), e.g. `2.0;Success` or
+    /// `3.7;Invalid calendar user`.
+    pub request_status: String,
+    /// The `calendar-data` the server returned for this recipient — the
+    /// VFREEBUSY for a free/busy request, absent for a delivery.
+    pub calendar_data: Option<String>,
+}
+
+impl ScheduleResponse {
+    /// Whether this recipient's leg succeeded.
+    ///
+    /// RFC 5546 §3.6 reserves the `2.x` class for success; everything else is
+    /// a refusal with a reason. Matched on the leading digit rather than the
+    /// exact code because servers spell the remainder freely.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.request_status.trim_start().starts_with('2')
+    }
 }
 
 /// A discovered calendar collection.
@@ -1344,8 +1387,10 @@ impl CaldavClient {
                 ("x-sabre-version", &self.sabre_version),
             ] {
                 if slot.borrow().is_none()
-                    && let Some(value) =
-                        resp.headers().get(name).and_then(|value| value.to_str().ok())
+                    && let Some(value) = resp
+                        .headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
                 {
                     *slot.borrow_mut() = Some(value.to_owned());
                 }
@@ -1622,13 +1667,14 @@ impl CaldavClient {
             .clone()
             .ok_or_else(|| Error::protocol("caldav: no principal URL — call discover() first"))?;
         let (final_url, body) = self.propfind(&principal, "0", PROPFIND_SCHEDULING)?;
-        let supports_scheduling = extract_first_href_property(&body, "schedule-outbox-URL")
-            .is_some_and(|h| !h.trim().is_empty());
+        let outbox_url = extract_first_href_property(&body, "schedule-outbox-URL")
+            .filter(|h| !h.trim().is_empty())
+            .map(|h| resolve_url_against(&final_url, &h));
         let default_calendar_url =
             extract_first_href_property(&body, "schedule-default-calendar-URL")
                 .map(|h| resolve_url_against(&final_url, &h));
         Ok(SchedulingInfo {
-            supports_scheduling,
+            outbox_url,
             default_calendar_url,
         })
     }
@@ -1806,12 +1852,227 @@ impl CaldavClient {
         }
         Ok((resp.status, resp.body))
     }
+
+    /// POSTs an iTIP payload to the scheduling Outbox (RFC 6638 §3.2) and
+    /// returns the per-recipient verdicts.
+    ///
+    /// This is the operation `free_busy_query` cannot do. That REPORT reads a
+    /// collection you already have access to, so it can only answer for
+    /// *your own* calendars; an outbox POST asks the server to ask everyone
+    /// else, which is how "when are these four people free" gets answered
+    /// without being able to read four calendars.
+    ///
+    /// The payload carries its own addressing — RFC 6638 dropped the
+    /// `Originator`/`Recipient` headers the earlier caldav-sched draft used
+    /// in favour of the `ORGANIZER` and `ATTENDEE` properties, so a payload
+    /// missing them is refused by the server rather than misdelivered.
+    ///
+    /// A 2xx here means the *batch* was accepted, never that any recipient
+    /// was reached: each [`ScheduleResponse`] carries its own request-status,
+    /// and a perfectly successful POST routinely contains failures for
+    /// individual attendees (unknown address, no free/busy permission). The
+    /// caller must read them.
+    pub fn post_scheduling(&self, outbox_url: &str, ics: &str) -> Result<Vec<ScheduleResponse>> {
+        let resp = self.request(
+            "POST",
+            outbox_url,
+            &[("Content-Type", "text/calendar; charset=utf-8")],
+            ics,
+        )?;
+        if resp.content_type.starts_with("text/html") {
+            return Err(Error::protocol(format!(
+                "caldav: scheduling POST {outbox_url} returned an HTML page \
+                 (content-type {}); refusing to parse",
+                resp.content_type
+            )));
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(Error::status(
+                resp.status,
+                format!(
+                    "caldav: scheduling POST {outbox_url}: {}",
+                    resp.body.chars().take(300).collect::<String>()
+                ),
+            ));
+        }
+        Ok(parse_schedule_response(&resp.body))
+    }
+}
+
+/// Parses an RFC 6638 §3.2.5 `schedule-response` into per-recipient verdicts.
+///
+/// Shaped like the multistatus parsers above and for the same reason: values
+/// are committed only when the element they belong to closes inside a
+/// `<response>`, so a server that interleaves elements or nests an unexpected
+/// one cannot smear one recipient's status onto another's.
+fn parse_schedule_response(xml: &str) -> Vec<ScheduleResponse> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut out = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut buf = String::new();
+
+    let mut recipient: Option<String> = None;
+    let mut request_status: Option<String> = None;
+    let mut calendar_data: Option<String> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                stack.push(local_name(e.name().as_ref()));
+                buf.clear();
+            }
+            Ok(Event::Text(ref e)) => {
+                if let Ok(text) = unescape(e.as_ref()) {
+                    buf.push_str(&text);
+                }
+            }
+            Ok(Event::CData(ref e)) => buf.push_str(e.as_ref()),
+            Ok(Event::End(_)) => {
+                let name = stack.last().cloned().unwrap_or_default();
+                let inside_response = stack.iter().any(|n| n == "response");
+                let value = buf.trim().to_string();
+
+                if inside_response {
+                    match name.as_str() {
+                        // The recipient is an href inside <recipient>.
+                        "href" if stack.iter().rev().nth(1).is_some_and(|n| n == "recipient") => {
+                            if !value.is_empty() {
+                                recipient = Some(value);
+                            }
+                        }
+                        "request-status" if !value.is_empty() => request_status = Some(value),
+                        // Not trimmed: calendar data is bytes, and a VFREEBUSY
+                        // is parsed by the one iCalendar parser downstream.
+                        "calendar-data" if !buf.trim().is_empty() => {
+                            calendar_data = Some(buf.clone());
+                        }
+                        "response" => {
+                            if let Some(recipient) = recipient.take() {
+                                out.push(ScheduleResponse {
+                                    recipient,
+                                    request_status: request_status.take().unwrap_or_default(),
+                                    calendar_data: calendar_data.take(),
+                                });
+                            } else {
+                                // A response naming nobody is unusable; drop
+                                // its parts rather than leaking them into the
+                                // next recipient's verdict.
+                                request_status = None;
+                                calendar_data = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                stack.pop();
+                buf.clear();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /* ---------------- scheduling ---------------- */
+
+    /// What a server answers a free/busy POST with: one recipient who
+    /// answered, one who refused. RFC 6638 §3.2.5's own shape.
+    const SCHEDULE_RESPONSE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<C:schedule-response xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <C:response>
+    <C:recipient><D:href>mailto:ada@example.com</D:href></C:recipient>
+    <C:request-status>2.0;Success</C:request-status>
+    <C:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+METHOD:REPLY
+BEGIN:VFREEBUSY
+UID:fb-1@example.com
+DTSTAMP:20270104T080000Z
+ATTENDEE:mailto:ada@example.com
+FREEBUSY;FBTYPE=BUSY:20270104T090000Z/20270104T100000Z
+END:VFREEBUSY
+END:VCALENDAR
+</C:calendar-data>
+  </C:response>
+  <C:response>
+    <C:recipient><D:href>mailto:nobody@example.com</D:href></C:recipient>
+    <C:request-status>3.7;Invalid calendar user</C:request-status>
+  </C:response>
+</C:schedule-response>"#;
+
+    #[test]
+    fn a_schedule_response_carries_a_verdict_per_recipient() {
+        let responses = parse_schedule_response(SCHEDULE_RESPONSE);
+        assert_eq!(responses.len(), 2);
+
+        assert_eq!(responses[0].recipient, "mailto:ada@example.com");
+        assert!(responses[0].succeeded());
+        assert!(
+            responses[0]
+                .calendar_data
+                .as_ref()
+                .is_some_and(|data| data.contains("FREEBUSY;FBTYPE=BUSY:")),
+            "the answering recipient's calendar data was lost"
+        );
+
+        assert_eq!(responses[1].recipient, "mailto:nobody@example.com");
+        assert!(!responses[1].succeeded(), "3.7 was read as success");
+        assert!(responses[1].calendar_data.is_none());
+    }
+
+    #[test]
+    fn one_recipients_failure_does_not_smear_onto_the_next() {
+        // The bug this pins: parsers that accumulate into shared slots hand
+        // the previous recipient's calendar data to the next one, which shows
+        // a scheduling grid one person's meetings under another's name.
+        let responses = parse_schedule_response(SCHEDULE_RESPONSE);
+        assert_eq!(responses[1].request_status, "3.7;Invalid calendar user");
+        assert!(responses[1].calendar_data.is_none());
+    }
+
+    #[test]
+    fn a_response_naming_nobody_is_dropped_with_its_parts() {
+        // Better to lose an unusable verdict than to attach its status to
+        // whoever happens to be parsed next.
+        let xml = r#"<C:schedule-response xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <C:response><C:request-status>5.1;Service unavailable</C:request-status></C:response>
+  <C:response>
+    <C:recipient><D:href>mailto:ada@example.com</D:href></C:recipient>
+    <C:request-status>2.0;Success</C:request-status>
+  </C:response>
+</C:schedule-response>"#;
+        let responses = parse_schedule_response(xml);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].recipient, "mailto:ada@example.com");
+        assert_eq!(responses[0].request_status, "2.0;Success");
+    }
+
+    #[test]
+    fn scheduling_support_is_the_outbox_url_not_a_flag() {
+        // A server that says it schedules but gives no address to POST to
+        // cannot schedule, and the type should not let a caller believe
+        // otherwise.
+        let none = SchedulingInfo {
+            outbox_url: None,
+            default_calendar_url: Some("https://h/cal/default/".into()),
+        };
+        assert!(!none.supports_scheduling());
+        let some = SchedulingInfo {
+            outbox_url: Some("https://h/cal/outbox/".into()),
+            default_calendar_url: None,
+        };
+        assert!(some.supports_scheduling());
+    }
 
     /* ---------------- URL resolution ---------------- */
 
@@ -2340,8 +2601,14 @@ mod auth_tests {
         );
         let rendered = format!("{client:?}");
 
-        assert!(!rendered.contains("ya29.secret"), "a token leaked into Debug output");
-        assert!(rendered.contains("CardDav"), "the useful part was redacted too");
+        assert!(
+            !rendered.contains("ya29.secret"),
+            "a token leaked into Debug output"
+        );
+        assert!(
+            rendered.contains("CardDav"),
+            "the useful part was redacted too"
+        );
     }
 
     #[test]

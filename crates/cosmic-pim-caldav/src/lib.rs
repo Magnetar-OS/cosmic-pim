@@ -34,15 +34,18 @@ pub mod dav;
 pub mod error;
 pub mod feed;
 pub mod itip;
-pub mod quirks;
 pub mod patch;
 pub mod plan;
 pub mod push;
+pub mod quirks;
 pub mod store;
 pub mod sync;
 pub mod vdir;
 
-pub use dav::{Auth, CalDavEventEntry, CaldavClient, DiscoveredCalendar, Flavor, PropfindEventsResult};
+pub use dav::{
+    Auth, CalDavEventEntry, CaldavClient, DiscoveredCalendar, Flavor, PropfindEventsResult,
+    ScheduleResponse, SchedulingInfo,
+};
 pub use error::{Disposition, Error, Result};
 pub use feed::{FeedOutcome, FeedState};
 pub use plan::{SyncPlan, plan_sync};
