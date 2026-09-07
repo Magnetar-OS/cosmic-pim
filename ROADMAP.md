@@ -46,8 +46,19 @@ work. Last touched 2026-09-07.
   per-property conflict UI. Slate displays the birthday stream. Snooze and
   mbox export landed in the substrate, closing two of the five gaps 04
   ranked as most-missed (rules and labels remain; OpenPGP/S-MIME after).
-  App-side open: three-scope recurrence editing UI, the snooze UI, and an
-  export-to-mbox action.
+  App-side open: three-scope recurrence editing UI and an export-to-mbox
+  action; Envelope's snooze UI shipped and has since been migrated onto the
+  substrate engine, deleting its app-local scheduler.
+
+  One correction to an earlier claim: Circle's photos are **not** done, only
+  half. The write path is; nothing validated photo bytes on the read side,
+  so a card carrying a truncated or non-image `PHOTO` renders as an
+  invisible contact row — iced accepts any byte string and only fails at
+  draw time, producing nothing rather than falling back to initials. Real
+  address books contain such cards, because exporters truncate and
+  `X-ABCROP-RECTANGLE` puts parameters where an image is expected. Magic-
+  number sniffing is written and tested in a session's tree but not yet
+  committed, and the app-side fallback to initials is unbuilt.
 - **Milestone 4 — iMIP proven on the wire; two GUI clicks from exit.** Both
   halves implemented and the joint end-to-end ran green on a real session
   bus against a stock Dovecot: DeliverInvitation rendered Slate's dialog,
@@ -345,17 +356,18 @@ at 15/15 per app, plus what "shipping" means:
   retired first, because it silently masks version skew between apps.
 - CHANGELOGs per release, conventional commits, tagged versions across the
   four repos moving together.
-- **One `cargo fmt --all` sweep, immediately before the first push.**
-  Measured 2026-09-07 at a clean HEAD worktree: 39 hunks across 14 files
-  (accounts, auth, caldav, mail, sync), so `ci.yml`'s `cargo fmt --all --
-  --check` gate fails the first run. It cannot fail anyone sooner —
-  cosmic-pim has no git remote, so nothing triggers the workflow yet — which
-  is why this is a pre-push chore rather than a live breakage, and why it
-  waits for a tree no other session is editing. Doing it piecemeal is worse
-  than not doing it: a whitespace commit across files other seats have open
-  buys conflicts for a gate nobody is currently running. Note
-  `rustfmt.toml`'s `imports_granularity = Module` is nightly-only and
-  ignored on stable, so local and CI agree either way.
+- **The fmt gate, cleared per crate by whoever owns it.** `ci.yml` runs
+  `cargo fmt --all -- --check`, and committed state failed it: 39 hunks
+  across 14 files when measured at a clean HEAD worktree on 2026-09-07.
+  Nothing runs that gate yet — this repository has no git remote — so it is
+  a pre-push chore, not a live breakage. The workable shape turned out to be
+  per-crate rather than one sweep: a package-scoped `cargo fmt -p <crate>`
+  by the seat that already owns that crate touches no file another seat has
+  open, which is the whole hazard. Two crates cleared themselves that way
+  within the hour and the remainder fell to 17 hunks across 10 files.
+  Whatever is left gets one `cargo fmt --all` immediately before the first
+  push. Note `rustfmt.toml`'s `imports_granularity = Module` is nightly-only
+  and ignored on stable, so local and CI agree either way.
 
 **Exit:** a distro packager builds all four repos from the tarballs without
 reading anything but the justfiles; the apps are installable from a repo and
