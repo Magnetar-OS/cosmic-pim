@@ -305,7 +305,12 @@ mod tests {
     #[test]
     fn an_empty_pattern_never_matches() {
         // A half-built rule must do nothing, not everything.
-        for field in [Field::Sender, Field::Recipients, Field::Subject, Field::List] {
+        for field in [
+            Field::Sender,
+            Field::Recipients,
+            Field::Subject,
+            Field::List,
+        ] {
             assert!(
                 !Condition {
                     field,

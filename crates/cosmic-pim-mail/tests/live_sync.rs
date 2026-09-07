@@ -306,16 +306,22 @@ fn a_full_cycle_lands_messages_in_a_maildir_readable_by_anything() {
     assert_eq!(cursor.uid_validity, 42);
 }
 
-/// Waking a snoozed message clears `\Seen` and nothing else — and the only
-/// place that can be proven is the wire, because `FLAGS.SILENT` replaces the
-/// whole set and a client that skipped the read would look identical from the
-/// outside until the user noticed their star was gone.
+/// Waking a snoozed message clears `\Seen` and touches nothing else — and
+/// the only place that can be proven is the wire.
+///
+/// The first version of this test asserted a read-modify-write and passed
+/// while the code was losing data: `FLAGS.SILENT (…)` replaces the whole set,
+/// so a message's custom keywords had to be named in the write or they were
+/// stripped, and the flags read back could not see a keyword this session's
+/// table has no name for. Checking that `\Flagged` survived proved nothing
+/// about the labels. `-FLAGS` says only what changed, so there is nothing to
+/// preserve and nothing to get wrong.
 #[test]
-fn marking_unread_reads_the_flags_before_it_writes_them() {
+fn marking_unread_removes_only_that_flag_and_cannot_touch_the_rest() {
     let server = FakeServer::start(Scenario {
         messages: vec![ServerMessage {
             uid: 1,
-            flags: "\\Seen \\Flagged",
+            flags: "\\Seen \\Flagged important",
             body: HELLO,
         }],
         ..Scenario::default()
@@ -337,27 +343,33 @@ fn marking_unread_reads_the_flags_before_it_writes_them() {
     assert!(session.mark_unread(1).expect("mark unread"));
 
     let commands = server.commands();
-    let fetch = commands
-        .iter()
-        .position(|c| c.to_ascii_uppercase().contains("UID FETCH"))
-        .expect("the flags were never read back");
     let store_at = commands
         .iter()
         .position(|c| c.to_ascii_uppercase().contains("UID STORE"))
         .expect("nothing was written");
+    let written = &commands[store_at];
 
     assert!(
-        fetch < store_at,
-        "the write went out before the read, so it wrote a guess: {commands:?}"
-    );
-    let written = &commands[store_at];
-    assert!(
-        written.contains("\\Flagged"),
-        "the star was clobbered: {written}"
+        written.contains("-FLAGS"),
+        "a replace, not a remove — this write defines the whole flag set and \
+         drops every keyword it does not name: {written}"
     );
     assert!(
-        !written.to_ascii_uppercase().contains("\\SEEN"),
+        written.contains("\\Seen"),
         "the message stayed read: {written}"
+    );
+    for untouched in ["\\Flagged", "important"] {
+        assert!(
+            !written.contains(untouched),
+            "the write names {untouched}, so it is deciding that flag's fate \
+             rather than leaving it alone: {written}"
+        );
+    }
+    assert!(
+        !commands[..store_at]
+            .iter()
+            .any(|c| c.to_ascii_uppercase().contains("UID FETCH")),
+        "the flags were read first, which a remove does not need: {commands:?}"
     );
 }
 

@@ -277,8 +277,9 @@ impl Outbox {
         }
         let text = fs::read_to_string(&claimed)?;
         let _ = fs::remove_file(&claimed);
-        let queued: Queued = serde_json::from_str(&text)
-            .map_err(|why| Error::Draft(format!("the cancelled message could not be read: {why}")))?;
+        let queued: Queued = serde_json::from_str(&text).map_err(|why| {
+            Error::Draft(format!("the cancelled message could not be read: {why}"))
+        })?;
         Ok(Some(queued.draft))
     }
 
@@ -456,7 +457,9 @@ mod tests {
         // `submit` is for sends that start life in the queue — no Outcome,
         // no attempt yet — so the very next drain must try it, not back off.
         let (_dir, outbox) = outbox();
-        outbox.submit("0000feed", &draft("Re: standup"), 1_000).unwrap();
+        outbox
+            .submit("0000feed", &draft("Re: standup"), 1_000)
+            .unwrap();
 
         let queued = outbox.list().unwrap();
         assert_eq!(queued.len(), 1);

@@ -392,9 +392,34 @@ impl Session {
 }
 
 impl Writeback for Session {
+    /// Clears `\\Seen` with `-FLAGS.SILENT`, touching nothing else.
+    ///
+    /// Overrides the trait's read-modify-write default, and must: that
+    /// default exists for backends whose only verb replaces the whole set,
+    /// and IMAP's does not. `FLAGS.SILENT (…)` would have to name every
+    /// keyword the message carries in order to keep them, and
+    /// [`Self::flags_for`] cannot see the ones this session's table has no
+    /// name for — so the replace form silently strips the user's labels
+    /// while preserving the system flags a test would think to check.
+    /// `-FLAGS` says only what changed, which is what was meant, in one
+    /// round trip instead of two.
+    fn mark_unread(&mut self, uid: u32) -> Result<bool> {
+        self.inner
+            .uid_store(uid.to_string(), "-FLAGS.SILENT (\\Seen)")
+            .map(|_| ())
+            .map_err(imap_error)?;
+        Ok(true)
+    }
+
     /// One UID's flags, or `None` if the server no longer lists it — a
     /// message expunged by another client between the queue's decision and
     /// this call is gone, not an error.
+    ///
+    /// System flags only: a custom keyword needs this session's keyword
+    /// table to become a bit, and a name the table does not hold has no
+    /// representation here at all. Do not feed the result to
+    /// [`Self::store_flags`] — that writes the whole set, and the keywords
+    /// this dropped would go with it.
     fn flags_for(&mut self, uid: u32) -> Result<Option<Flags>> {
         let fetches = self
             .inner

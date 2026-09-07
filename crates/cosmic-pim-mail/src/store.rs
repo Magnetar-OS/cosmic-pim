@@ -148,9 +148,10 @@ pub(crate) fn intern_into(table: &mut Vec<String>, name: &str) -> Result<u8> {
     let name = name.trim();
     if name.is_empty()
         || name.len() > 64
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_graphic() && !matches!(c, '(' | ')' | '{' | '}' | '%' | '*' | '"' | '\\' | ']'))
+        || !name.chars().all(|c| {
+            c.is_ascii_graphic()
+                && !matches!(c, '(' | ')' | '{' | '}' | '%' | '*' | '"' | '\\' | ']')
+        })
     {
         return Err(crate::Error::Imap(format!(
             "{name:?} cannot be an IMAP keyword"
