@@ -92,11 +92,12 @@ pub fn resolve(
         .clone();
 
     if account.auth == AuthMethod::Password {
-        let password = accounts
-            .password(account_id)?
-            .ok_or(cosmic_pim_accounts::Error::MissingSecret(
-                account.display_name,
-            ))?;
+        let password =
+            accounts
+                .password(account_id)?
+                .ok_or(cosmic_pim_accounts::Error::MissingSecret(
+                    account.display_name,
+                ))?;
         return Ok(Secret::Password(password));
     }
 
