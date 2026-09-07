@@ -801,6 +801,14 @@ impl MailStore for MemoryMailbox {
         self.queue.entries.clear();
         self.store.reset(uid_validity)
     }
+
+    fn keywords(&self) -> Vec<String> {
+        self.store.keywords()
+    }
+
+    fn intern_keyword(&mut self, name: &str) -> Result<u8> {
+        self.store.intern_keyword(name)
+    }
 }
 
 impl PushQueue for MemoryMailbox {

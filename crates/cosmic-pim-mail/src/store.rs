@@ -122,7 +122,54 @@ pub trait MailStore {
     /// in which the store holds some old-numbering messages and some new ones,
     /// and a crash inside that window is unrecoverable — nothing left on disk
     /// says which numbering each message belonged to.
+    ///
+    /// The keyword table survives a reset on purpose: the names are the
+    /// user's vocabulary, not the server's numbering, and a renumbered
+    /// mailbox re-fetches messages that still carry the same keywords.
     fn reset(&mut self, uid_validity: u32) -> Result<()>;
+
+    /// The mailbox's keyword table: row N names bit N of
+    /// [`Flags::keywords`]. Rows are never renumbered — a bit in a stored
+    /// flag set would silently change meaning.
+    fn keywords(&self) -> Vec<String>;
+
+    /// The bit for a keyword, interning it if the table has never seen it.
+    ///
+    /// Matching is ASCII-case-insensitive, because IMAP keywords are atoms
+    /// and servers differ on the case they echo back; the first-seen
+    /// spelling is the one shown. Errors when all 26 rows are taken — the
+    /// maildir letter space is the honest capacity, and inventing a private
+    /// overflow scheme would break every other tool that reads the mapping.
+    fn intern_keyword(&mut self, name: &str) -> Result<u8>;
+}
+
+/// The shared intern rule, so the implementations cannot drift.
+pub(crate) fn intern_into(table: &mut Vec<String>, name: &str) -> Result<u8> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '(' | ')' | '{' | '}' | '%' | '*' | '"' | '\\' | ']'))
+    {
+        return Err(crate::Error::Imap(format!(
+            "{name:?} cannot be an IMAP keyword"
+        )));
+    }
+    if let Some(row) = table
+        .iter()
+        .position(|existing| existing.eq_ignore_ascii_case(name))
+    {
+        return Ok(row as u8);
+    }
+    if table.len() >= usize::from(crate::model::KEYWORD_SLOTS) {
+        return Err(crate::Error::Imap(
+            "this mailbox already names 26 keywords, which is all the maildir format can hold"
+                .into(),
+        ));
+    }
+    table.push(name.to_owned());
+    Ok((table.len() - 1) as u8)
 }
 
 /// The identity and cursor bookkeeping every id-keyed protocol needs.
@@ -292,6 +339,7 @@ impl RemoteIds {
 pub struct MemoryStore {
     pub cursor: Cursor,
     pub messages: BTreeMap<u32, RemoteMessage>,
+    pub keyword_table: Vec<String>,
 }
 
 impl MailStore for MemoryStore {
@@ -339,5 +387,13 @@ impl MailStore for MemoryStore {
             ..Cursor::default()
         };
         Ok(())
+    }
+
+    fn keywords(&self) -> Vec<String> {
+        self.keyword_table.clone()
+    }
+
+    fn intern_keyword(&mut self, name: &str) -> Result<u8> {
+        intern_into(&mut self.keyword_table, name)
     }
 }

@@ -186,6 +186,7 @@ pub fn flags_from(value: &Value) -> Flags {
         answered: false,
         deleted: false,
         passed: false,
+        keywords: 0,
     }
 }
 

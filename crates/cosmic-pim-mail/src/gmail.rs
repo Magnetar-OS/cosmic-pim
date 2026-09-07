@@ -162,6 +162,7 @@ pub fn flags_from_labels(labels: &[String]) -> Flags {
         answered: false,
         deleted: false,
         passed: false,
+        keywords: 0,
     }
 }
 

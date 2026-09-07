@@ -48,12 +48,14 @@
 //!
 //! # Custom keywords
 //!
-//! Not stored. Dovecot's extension puts `a`–`z` in the flags field and maps
-//! them through a `dovecot-keywords` file in the same directory, which is a
-//! per-server mapping this crate would have to own and keep consistent with a
-//! file another program rewrites. The five system flags are what the UI
-//! exposes; when keywords are wanted, the Dovecot mapping is the thing to
-//! implement, not a private scheme in a sidecar that no other tool can read.
+//! Stored the way Dovecot stores them, because that is the mapping every
+//! other maildir tool reads: the letters `a`–`z` in the flags field, named
+//! by a `dovecot-keywords` file in the maildir root whose line N reads
+//! `N keyword-name`. [`crate::model::Flags::keywords`] carries the letters
+//! as bits; this store owns the mapping file and hands the names out through
+//! [`MailStore::keywords`]. A letter the mapping does not name is preserved
+//! in the filename and simply has no name to show — which is exactly how
+//! Dovecot treats it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -72,6 +74,10 @@ use crate::store::{Cursor, MailStore, MailboxState, RemoteMessage};
 /// dot-prefixed so neither our own scan nor another maildir tool reads it as a
 /// message.
 pub const SIDECAR: &str = ".imap-state.json";
+
+/// The keyword mapping's filename — Dovecot's, letter for letter, because
+/// interoperability is the entire reason to store keywords this way.
+pub const KEYWORDS_FILE: &str = "dovecot-keywords";
 
 /// The `,U=` UID marker, as `offlineimap` and `mbsync` spell it.
 const UID_MARKER: &str = ",U=";
@@ -135,6 +141,9 @@ pub struct MaildirStore {
     /// UID → its flags, kept alongside so `state()` needs no `stat` at all.
     flags: BTreeMap<u32, Flags>,
     pending: Vec<PendingPush>,
+    /// Row N names keyword bit N. Loaded from [`KEYWORDS_FILE`], rewritten
+    /// through the atomic writer when a keyword is interned.
+    keywords: Vec<String>,
 }
 
 impl MaildirStore {
@@ -146,12 +155,14 @@ impl MaildirStore {
             fs::create_dir_all(root.join(sub))?;
         }
         let sidecar = read_sidecar(&root)?;
+        let keywords = read_keywords(&root);
         let mut store = Self {
             root,
             cursor: sidecar.cursor,
             index: BTreeMap::new(),
             flags: BTreeMap::new(),
             pending: sidecar.pending,
+            keywords,
         };
         store.rescan()?;
         Ok(store)
@@ -328,6 +339,19 @@ impl MailStore for MaildirStore {
         };
         self.write_sidecar()
     }
+
+    fn keywords(&self) -> Vec<String> {
+        self.keywords.clone()
+    }
+
+    fn intern_keyword(&mut self, name: &str) -> Result<u8> {
+        let before = self.keywords.len();
+        let bit = crate::store::intern_into(&mut self.keywords, name)?;
+        if self.keywords.len() != before {
+            write_keywords(&self.root, &self.keywords)?;
+        }
+        Ok(bit)
+    }
 }
 
 impl PushQueue for MaildirStore {
@@ -355,6 +379,47 @@ impl PushQueue for MaildirStore {
         crate::push::defer_in(&mut self.pending, uid, failure, error, next_attempt_ms);
         self.write_sidecar()
     }
+}
+
+/// Reads the Dovecot keyword mapping: line N is `N keyword-name`.
+///
+/// Rows can be sparse in a file another tool wrote (`0 a`, `2 c`); the gaps
+/// are kept as empty names so the bit numbering is preserved — renumbering
+/// would silently change what a stored flag set means.
+fn read_keywords(root: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(root.join(KEYWORDS_FILE)) else {
+        return Vec::new();
+    };
+    let mut table: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some((index, name)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        if index >= usize::from(crate::model::KEYWORD_SLOTS) {
+            continue;
+        }
+        if table.len() <= index {
+            table.resize(index + 1, String::new());
+        }
+        table[index] = name.trim().to_owned();
+    }
+    table
+}
+
+/// Writes the mapping back, atomically — a torn mapping renames every
+/// keyword on the next read.
+fn write_keywords(root: &Path, table: &[String]) -> Result<()> {
+    let mut text = String::new();
+    for (index, name) in table.iter().enumerate() {
+        if !name.is_empty() {
+            text.push_str(&format!("{index} {name}\n"));
+        }
+    }
+    atomic::write(&root.join(KEYWORDS_FILE), &text, None)?;
+    Ok(())
 }
 
 fn read_sidecar(root: &Path) -> Result<Sidecar> {
@@ -519,6 +584,82 @@ mod tests {
             store.raw(3).unwrap().unwrap(),
             bytes,
             "the bytes were rewritten"
+        );
+    }
+
+    #[test]
+    fn keywords_intern_once_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MaildirStore::open(dir.path()).unwrap();
+
+        let travel = store.intern_keyword("Travel").unwrap();
+        let work = store.intern_keyword("work").unwrap();
+        assert_eq!((travel, work), (0, 1));
+        // Case-insensitive: the same keyword, the same bit, first spelling kept.
+        assert_eq!(store.intern_keyword("TRAVEL").unwrap(), 0);
+        assert_eq!(store.keywords(), vec!["Travel", "work"]);
+
+        // The mapping is the Dovecot file, readable by anything.
+        let text = std::fs::read_to_string(dir.path().join(KEYWORDS_FILE)).unwrap();
+        assert_eq!(text, "0 Travel\n1 work\n");
+
+        let reopened = MaildirStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.keywords(), vec!["Travel", "work"]);
+    }
+
+    #[test]
+    fn a_sparse_mapping_written_by_another_tool_keeps_its_numbering() {
+        // Renumbering rows would silently change what a stored flag means.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("cur")).unwrap();
+        std::fs::write(dir.path().join(KEYWORDS_FILE), "0 alpha\n2 gamma\n").unwrap();
+
+        let mut store = MaildirStore::open(dir.path()).unwrap();
+        assert_eq!(store.keywords(), vec!["alpha", "", "gamma"]);
+        assert_eq!(store.intern_keyword("gamma").unwrap(), 2);
+        assert_eq!(
+            store.intern_keyword("delta").unwrap(),
+            3,
+            "a new keyword took a gap row and renamed somebody's bit"
+        );
+    }
+
+    #[test]
+    fn the_letter_space_is_the_honest_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MaildirStore::open(dir.path()).unwrap();
+        for n in 0..26 {
+            store.intern_keyword(&format!("kw{n}")).unwrap();
+        }
+        assert!(
+            store.intern_keyword("one-too-many").is_err(),
+            "a 27th keyword has no letter to live in"
+        );
+        for bad in ["", "has space", "par(en", "back\\slash", "brack]et"] {
+            assert!(store.intern_keyword(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_keyword_letter_reaches_the_filename_and_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MaildirStore::open(dir.path()).unwrap();
+        let bit = store.intern_keyword("travel").unwrap();
+        store
+            .upsert(&RemoteMessage {
+                uid: 7,
+                flags: Flags::default().with_keyword(bit, true),
+                raw: b"Subject: x\r\n\r\nbody\r\n".to_vec(),
+                internal_date_ms: 0,
+            })
+            .unwrap();
+
+        let mut reopened = MaildirStore::open(dir.path()).unwrap();
+        reopened.rescan().unwrap();
+        let flags = reopened.state().unwrap().entries[&7];
+        assert!(
+            flags.keywords & (1 << bit) != 0,
+            "the keyword letter did not survive the filename round trip"
         );
     }
 

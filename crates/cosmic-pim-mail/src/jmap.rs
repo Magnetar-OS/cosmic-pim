@@ -921,6 +921,7 @@ fn flags_of(keywords: &Value) -> Flags {
         draft: has("$draft"),
         deleted: false,
         passed: has("$forwarded"),
+        keywords: 0,
     }
 }
 
@@ -1321,10 +1322,8 @@ mod tests {
         let flags = Flags {
             seen: true,
             answered: true,
-            flagged: false,
-            draft: false,
-            deleted: false,
             passed: true,
+            ..Flags::default()
         };
 
         let keywords = keywords_of(flags);

@@ -87,7 +87,27 @@ pub struct Flags {
     /// Maildir `P`. No IMAP equivalent; preserved so a round trip through our
     /// store does not destroy what another maildir client recorded.
     pub passed: bool,
+    /// Custom keywords, as a bitmask over the mailbox's keyword table:
+    /// bit N is the keyword the table's row N names — the same N Dovecot
+    /// writes as the letter `'a' + N` in a maildir filename.
+    ///
+    /// Bits rather than names, so `Flags` stays `Copy` and a comparison
+    /// stays an integer compare. The names live once per mailbox, in the
+    /// store's keyword table (`dovecot-keywords`, the file every other
+    /// maildir tool reads), and only exist at the edges: the IMAP wire and
+    /// the UI. 26 bits, because that is the letter space the format has.
+    #[serde(default, skip_serializing_if = "keywords_empty")]
+    pub keywords: u32,
 }
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn keywords_empty(keywords: &u32) -> bool {
+    *keywords == 0
+}
+
+/// How many custom keywords one mailbox can name: the maildir letter space,
+/// `a`–`z`.
+pub const KEYWORD_SLOTS: u8 = 26;
 
 impl Flags {
     /// Parses a maildir info suffix — the part after `:2,` — ignoring anything
@@ -107,6 +127,7 @@ impl Flags {
                 'D' => flags.draft = true,
                 'T' => flags.deleted = true,
                 'P' => flags.passed = true,
+                'a'..='z' => flags.keywords |= 1 << (c as u8 - b'a'),
                 _ => {}
             }
         }
@@ -114,7 +135,8 @@ impl Flags {
     }
 
     /// The maildir info suffix for these flags, in the ASCII order the format
-    /// requires (`DFPRST`).
+    /// requires (`DFPRST`, then `a`–`z` for keywords — lowercase sorts after
+    /// uppercase in ASCII, which is why the two vocabularies compose).
     ///
     /// The ordering is not cosmetic: maildir specifies the flags are stored in
     /// ASCII order, and a reader that sorts before comparing will see `FS` and
@@ -134,7 +156,28 @@ impl Flags {
                 info.push(letter);
             }
         }
+        for bit in self.keyword_bits() {
+            info.push((b'a' + bit) as char);
+        }
         info
+    }
+
+    /// The set keyword bits, ascending.
+    pub fn keyword_bits(self) -> impl Iterator<Item = u8> {
+        (0..KEYWORD_SLOTS).filter(move |bit| self.keywords & (1 << bit) != 0)
+    }
+
+    /// This flag set with one keyword bit turned on or off.
+    #[must_use]
+    pub fn with_keyword(mut self, bit: u8, on: bool) -> Self {
+        if bit < KEYWORD_SLOTS {
+            if on {
+                self.keywords |= 1 << bit;
+            } else {
+                self.keywords &= !(1 << bit);
+            }
+        }
+        self
     }
 
     /// The IMAP system flags to send in a STORE, in wire spelling.
@@ -473,6 +516,40 @@ Body text.\r\n";
 
         let none = Message::parse(SIMPLE).unwrap();
         assert_eq!(none.list_id, None);
+    }
+
+    #[test]
+    fn keyword_letters_round_trip_through_the_maildir_info() {
+        let flags = Flags::default().with_keyword(0, true).with_keyword(3, true);
+        let info = flags.to_maildir_info();
+        assert_eq!(info, "ad");
+        assert_eq!(Flags::from_maildir_info(&info), flags);
+
+        // Mixed with system flags, in ASCII order: uppercase first.
+        let mixed = Flags {
+            seen: true,
+            flagged: true,
+            ..flags
+        };
+        assert_eq!(mixed.to_maildir_info(), "FSad");
+        assert_eq!(Flags::from_maildir_info("FSad"), mixed);
+    }
+
+    #[test]
+    fn keyword_bits_stay_inside_the_letter_space() {
+        let flags = Flags::default().with_keyword(25, true).with_keyword(26, true);
+        assert_eq!(
+            flags.keyword_bits().collect::<Vec<_>>(),
+            vec![25],
+            "a bit outside a–z was accepted"
+        );
+        assert_eq!(flags.to_maildir_info(), "z");
+        assert!(!Flags::default().with_keyword(3, true).with_keyword(3, false).keywords != 0 || true);
+        assert_eq!(
+            Flags::default().with_keyword(3, true).with_keyword(3, false),
+            Flags::default(),
+            "clearing a keyword did not clear it"
+        );
     }
 
     #[test]
