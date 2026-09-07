@@ -24,6 +24,7 @@
 //! is:unread            unread, starred, or with an attachment
 //! is:starred
 //! has:attachment
+//! label:travel         carrying this keyword
 //! "release plan"       an exact phrase
 //! ```
 //!
@@ -45,6 +46,9 @@ pub struct Query {
     pub unread: bool,
     pub starred: bool,
     pub has_attachment: bool,
+    /// Keywords the message must carry, matched case-insensitively against
+    /// the mailbox's keyword table.
+    pub labels: Vec<String>,
 }
 
 impl Query {
@@ -60,6 +64,7 @@ impl Query {
             && self.subject.is_empty()
             && !self.unread
             && !self.starred
+            && self.labels.is_empty()
             && !self.has_attachment
     }
 
@@ -94,6 +99,7 @@ pub fn parse(input: &str) -> Query {
 
         match prefix.as_str() {
             "from" => query.from.push(value.to_ascii_lowercase()),
+            "label" | "keyword" | "tag" => query.labels.push(value.to_ascii_lowercase()),
             "subject" => query.subject.push(value.to_ascii_lowercase()),
             "is" => match value.to_ascii_lowercase().as_str() {
                 "unread" | "new" => query.unread = true,
@@ -163,6 +169,8 @@ mod tests {
         assert!(parse("is:unread").unread);
         assert!(parse("is:new").unread);
         assert!(parse("is:starred").starred);
+        assert_eq!(parse("label:Travel").labels, vec!["travel"]);
+        assert_eq!(parse("tag:work keyword:home").labels, vec!["work", "home"]);
         assert!(parse("is:flagged").starred);
         assert!(parse("has:attachment").has_attachment);
         assert!(parse("has:file").has_attachment);
