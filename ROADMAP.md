@@ -345,6 +345,17 @@ at 15/15 per app, plus what "shipping" means:
   retired first, because it silently masks version skew between apps.
 - CHANGELOGs per release, conventional commits, tagged versions across the
   four repos moving together.
+- **One `cargo fmt --all` sweep, immediately before the first push.**
+  Measured 2026-09-07 at a clean HEAD worktree: 39 hunks across 14 files
+  (accounts, auth, caldav, mail, sync), so `ci.yml`'s `cargo fmt --all --
+  --check` gate fails the first run. It cannot fail anyone sooner —
+  cosmic-pim has no git remote, so nothing triggers the workflow yet — which
+  is why this is a pre-push chore rather than a live breakage, and why it
+  waits for a tree no other session is editing. Doing it piecemeal is worse
+  than not doing it: a whitespace commit across files other seats have open
+  buys conflicts for a gate nobody is currently running. Note
+  `rustfmt.toml`'s `imports_granularity = Module` is nightly-only and
+  ignored on stable, so local and CI agree either way.
 
 **Exit:** a distro packager builds all four repos from the tarballs without
 reading anything but the justfiles; the apps are installable from a repo and
