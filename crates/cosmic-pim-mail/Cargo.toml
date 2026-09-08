@@ -2,21 +2,23 @@
 name = "cosmic-pim-mail"
 version.workspace = true
 edition.workspace = true
-# MPL-2.0 — see ../../LICENSING.md. NOTE: like cosmic-pim-caldav, parts of this
-# crate are derived from the Meltemi repository, which currently carries no
-# licence declaration. Treat it as internal-only (do not publish, do not
-# upstream) until that is fixed.
+# MPL-2.0 — see ../../LICENSING.md. Like cosmic-pim-caldav, parts of this crate
+# derive from the Meltemi repository, which grants MPL-2.0 on the donor files
+# explicitly (meltemi commit 5c14069) — sync cycle, JWZ threading, HTML-to-text,
+# RFC 8601 parsing, bounce classification, and the PGP/MIME shapes.
 license.workspace = true
 description = "Message model, maildir store, threading, and IMAP sync for the COSMIC PIM suite"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+keywords = ["imap", "maildir", "email", "jmap", "threading"]
+categories = ["email", "network-programming"]
+readme = "../../README.md"
 
 [dependencies]
 # Atomic writes and the Contact model a sender resolves against. The mail crate
 # stands *beside* cosmic-pim-caldav rather than on it: IMAP is not a WebDAV
 # flavour and shares none of its plumbing.
-cosmic-pim-core = { path = "../cosmic-pim-core" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "0.1.0" }
 
 # The parser boundary. `mail-parser` reads; nothing here ever writes a message
 # back through it — the maildir file holds the server's RFC 5322 bytes verbatim,

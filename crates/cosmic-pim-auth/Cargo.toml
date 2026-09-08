@@ -6,13 +6,15 @@ license.workspace = true
 description = "OAuth 2.0 sign-in and token renewal for the COSMIC PIM suite"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+keywords = ["oauth2", "pkce", "authentication", "token"]
+categories = ["authentication", "network-programming"]
+readme = "../../README.md"
 
 [dependencies]
 # Accounts owns the credential shape and the provider manifests; this crate
 # performs the exchange that produces one. The dependency points this way, not
 # the other, so `accounts` keeps its "never opens a socket" property.
-cosmic-pim-accounts = { path = "../cosmic-pim-accounts" }
+cosmic-pim-accounts = { path = "../cosmic-pim-accounts", version = "0.1.0" }
 
 # Token endpoints are ordinary HTTPS form posts. Same major version as the
 # CalDAV client so one TLS stack is linked, not two.

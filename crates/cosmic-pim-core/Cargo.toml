@@ -11,6 +11,9 @@ license.workspace = true
 description = "Shared PIM substrate for COSMIC: vdir storage, SQLite index, filesystem watching"
 repository.workspace = true
 rust-version.workspace = true
+keywords = ["calendar", "vcard", "icalendar", "vdir", "contacts"]
+categories = ["date-and-time", "parser-implementations", "database"]
+readme = "../../README.md"
 
 [dependencies]
 # --- time ---
@@ -39,10 +42,10 @@ rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 notify = "8.2"
 
 # --- misc ---
-uuid = { version = "1.24", features = ["v4"] }
+uuid = { version = "1.26", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
-dirs = "6"
+dirs = "7"
 serde = { version = "1.0.229", features = ["derive"] }
 # The watcher hands debounced bursts to the UI over a tokio channel.
 tokio = { version = "1.53", features = ["sync", "time"] }

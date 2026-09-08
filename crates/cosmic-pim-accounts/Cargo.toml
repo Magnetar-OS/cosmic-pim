@@ -7,13 +7,15 @@ license.workspace = true
 description = "Account metadata and credential storage for the COSMIC PIM suite"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+keywords = ["keychain", "credentials", "accounts", "secret-service"]
+categories = ["authentication", "os::linux-apis"]
+readme = "../../README.md"
 
 [dependencies]
-cosmic-pim-core = { path = "../cosmic-pim-core" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "0.1.0" }
 
 # The OS keychain. On Linux this is secret-service (GNOME Keyring / KWallet).
-keyring = "4.1.6"
+keyring = "4.2.0"
 
 # The envelope fallback, for hosts where the keychain is unusable. XChaCha20's
 # 192-bit nonce is what makes random nonces safe here: with AES-GCM's 96 bits,
@@ -32,7 +34,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
 uuid = { version = "1.26.0", features = ["v4"] }
-dirs = "6"
+dirs = "7"
 thiserror = "2"
 tracing = "0.1"
 

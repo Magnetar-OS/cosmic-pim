@@ -2,18 +2,21 @@
 name = "cosmic-pim-caldav"
 version.workspace = true
 edition.workspace = true
-# MPL-2.0 — see ../../LICENSING.md. NOTE: this crate is derived from the
-# Meltemi repository, which currently carries no licence declaration at all.
-# Treat it as internal-only (do not publish, do not upstream) until that is
-# fixed; LICENSING.md spells out exactly what "fixed" means.
+# MPL-2.0 — see ../../LICENSING.md. This crate derives from the Meltemi
+# repository, which grants MPL-2.0 on the donor files explicitly (meltemi
+# commit 5c14069, derivatives named). That grant is what makes publishing this
+# crate legitimate; the repository as a whole stays all-rights-reserved, so a
+# *future* port must extend the grant table there in the same commit.
 license.workspace = true
 description = "CalDAV client and sync reconciler for the COSMIC PIM suite"
 repository.workspace = true
 rust-version.workspace = true
-publish = false
+keywords = ["caldav", "carddav", "webdav", "calendar", "sync"]
+categories = ["network-programming", "date-and-time"]
+readme = "../../README.md"
 
 [dependencies]
-cosmic-pim-core = { path = "../cosmic-pim-core" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "0.1.0" }
 
 # Synchronous HTTP. The whole protocol layer is blocking by design: a sync
 # cycle is a sequence of dependent round trips with nothing to interleave, so
