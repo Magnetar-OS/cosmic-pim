@@ -10,9 +10,9 @@ on so that a sync bug is fixed once rather than three times.
 
 | Repository | App | What it is | State |
 |---|---|---|---|
-| [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
-| [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
-| [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
+| [slate](https://github.com/Magnetar-OS/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
+| [circle](https://github.com/Magnetar-OS/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
+| [envelope](https://github.com/Magnetar-OS/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
 | **cosmic-pim** | — | This substrate | 1067 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
@@ -90,10 +90,10 @@ git:
 
 ```toml
 [dependencies]
-cosmic-pim-core = { git = "https://github.com/entro314-labs/cosmic-pim", tag = "v0.1.0" }
+cosmic-pim-core = { git = "https://github.com/Magnetar-OS/cosmic-pim", tag = "v0.1.0" }
 
 # Uncomment to develop against a sibling checkout without retagging.
-# [patch.'https://github.com/entro314-labs/cosmic-pim']
+# [patch.'https://github.com/Magnetar-OS/cosmic-pim']
 # cosmic-pim-core = { path = "../cosmic-pim/crates/cosmic-pim-core" }
 ```
 

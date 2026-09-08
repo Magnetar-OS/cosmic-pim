@@ -16,7 +16,7 @@ edition = "2024"
 # and link them without absorbing them — see LICENSING.md for why the split
 # exists and the one trap (Exhibit B) to avoid.
 license = "MPL-2.0"
-repository = "https://github.com/entro314-labs/cosmic-pim"
+repository = "https://github.com/Magnetar-OS/cosmic-pim"
 rust-version = "1.98.0"
 
 [profile.release]
