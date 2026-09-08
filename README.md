@@ -84,7 +84,9 @@ client_id = "…apps.googleusercontent.com"
 
 ## Using these
 
-Not published to crates.io — see [Licensing](#licensing). Depend by git:
+Not yet on crates.io — the licence gate is open (see [Licensing](#licensing));
+what is left is pushing this repository and tagging it. Until then, depend by
+git:
 
 ```toml
 [dependencies]

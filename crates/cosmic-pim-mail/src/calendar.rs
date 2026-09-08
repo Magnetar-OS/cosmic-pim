@@ -1,3 +1,6 @@
+// Copyright 2026 Dominikos Pritis
+// SPDX-License-Identifier: MPL-2.0
+
 //! Finding the iMIP payload in a message.
 //!
 //! An invitation, a reply, a cancellation — RFC 6047 carries them all as a

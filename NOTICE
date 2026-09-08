@@ -67,7 +67,7 @@ gate, SEQUENCE rule, and single-instance CANCEL behaviour from
 In every case the storage half is new rather than ported: the donor drove
 SQLite, these drive a maildir or a vdir.
 
-NOTE: at the time of extraction the Meltemi repository carried no licence
-declaration. Both projects share a copyright holder, so redistribution here
-under MPL-2.0 is authorised by that holder. See LICENSING.md for the
-outstanding action required to make this explicit upstream.
+The Meltemi repository grants MPL-2.0 (Exhibit A only) on each donor file
+named above, in its own LICENSING.md, with these derivatives named. Meltemi
+as a whole remains all-rights-reserved; the grant is per-file, which is
+exactly MPL's boundary. See LICENSING.md here for the full account.
