@@ -693,7 +693,7 @@ mod tests {
     /// Writes a weekly series whose 11 Aug instance is overridden, master and
     /// override in one file — the shape every other CalDAV client produces.
     fn write_series_with_override(cal: &CalendarMeta) -> Event {
-        let master = write(&cal, "Standup", 4, Some("FREQ=WEEKLY"));
+        let master = write(cal, "Standup", 4, Some("FREQ=WEEKLY"));
 
         let mut over = master.clone();
         over.rrule = None;
@@ -719,7 +719,7 @@ mod tests {
                 .unwrap(),
             chrono_tz::UTC,
         ));
-        vdir::write_event(&cal, &over).unwrap();
+        vdir::write_event(cal, &over).unwrap();
         master
     }
 

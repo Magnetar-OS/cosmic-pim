@@ -18,7 +18,7 @@
 
 use chrono::NaiveDate;
 use cosmic_pim_core::Store;
-use cosmic_pim_core::model::{Event, EventTime, Rgb};
+use cosmic_pim_core::model::{Event, Rgb};
 use std::collections::HashSet;
 use std::time::Instant;
 

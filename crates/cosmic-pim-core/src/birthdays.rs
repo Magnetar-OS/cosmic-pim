@@ -147,7 +147,11 @@ mod tests {
     fn leap_day_birthdays_land_on_the_28th_in_common_years() {
         let leapling = contact("Leapling", Some(date(2000, 2, 29)), None);
 
-        let common = in_range(&[leapling.clone()], date(2026, 2, 1), date(2026, 3, 1));
+        let common = in_range(
+            std::slice::from_ref(&leapling),
+            date(2026, 2, 1),
+            date(2026, 3, 1),
+        );
         assert_eq!(common.len(), 1, "the leapling vanished in a common year");
         assert_eq!(common[0].date, date(2026, 2, 28));
 

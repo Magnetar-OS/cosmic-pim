@@ -88,6 +88,11 @@ impl ImportSummary {
 }
 
 /// What [`Store::split_series`] did.
+///
+/// `Split` boxes its `Event` so the enum is a pointer rather than a whole
+/// event: `WholeSeries` carries nothing, and every value of this type — most of
+/// them `WholeSeries`, since most edits are not splits — would otherwise be
+/// sized for the largest variant.
 #[derive(Clone, Debug)]
 pub enum SplitOutcome {
     /// The cut landed on or before the first instance, or the event does not
@@ -99,7 +104,7 @@ pub enum SplitOutcome {
     /// apply its edit to and save. Both the truncated master's file and the
     /// successor's file were written; a caller bound to a server must queue
     /// writeback for both.
-    Split(Event),
+    Split(Box<Event>),
 }
 
 /// Makes a UID safe to use as a file name.
@@ -565,7 +570,7 @@ impl Store {
         // copies that now live on under the successor.
         self.truncate_series(calendar_id, uid, instant)?;
 
-        Ok(SplitOutcome::Split(successor))
+        Ok(SplitOutcome::Split(Box::new(successor)))
     }
 
     /// Removes one override component, restoring the master's generated
