@@ -3,8 +3,8 @@
 //
 // Derived from `apps/desktop/src-tauri/src/atomic_write.rs` in the Anasa
 // project (https://github.com/entro314-labs/anasa), MIT licensed. The original
-// copyright and permission notice are retained in the NOTICE file at the root
-// of this repository, as that licence requires. Do not remove it.
+// copyright and permission notice are retained in the NOTICE file alongside
+// this crate, as that licence requires. Do not remove it.
 
 //! Crash-safe file replacement: temp file → `fsync` → atomic `rename` → `fsync`
 //! the directory, with an optional optimistic-concurrency guard.

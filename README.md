@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/entro314-labs/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/entro314-labs/circle) | **Circle** | Contacts | Reads and searches a real address book; the lossless write path is done, the editing UI is not |
 | [envelope](https://github.com/entro314-labs/envelope) | **Envelope** | Mail | Reads, threads, and syncs a real mailbox over IMAP; no composer yet |
-| **cosmic-pim** | — | This substrate | 930 tests |
+| **cosmic-pim** | — | This substrate | 1067 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
