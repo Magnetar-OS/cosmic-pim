@@ -86,7 +86,7 @@ pub fn sweep(
     // Retractions first: a tombstone's copy must not outlive this sweep just
     // because an upload later in the loop failed.
     for (id, message_id) in drafts.pending_retractions() {
-        match retire(session, &message_id, &[]) {
+        match retire(session, &message_id, Retire::Everything) {
             Ok(retired) => {
                 report.retired += retired;
                 if let Err(why) = drafts.clear_retraction(&id) {
@@ -181,19 +181,33 @@ fn mirror_one(
             .map(|uid| (uid_validity, uid))
     });
 
-    let retired = retire(session, &message_id, &old)?;
+    let retired = retire(session, &message_id, Retire::Exactly(&old))?;
     drafts.mark_mirrored(id, &message_id, landed)?;
     Ok(retired)
 }
 
-/// Deletes every message matching `message_id`, keeping `keep_none_but` —
-/// pass the pre-append listing to delete exactly those, or `&[]` to search
-/// fresh and delete all matches (a retraction).
-fn retire(session: &mut Session, message_id: &str, exactly: &[u32]) -> crate::Result<usize> {
-    let uids = if exactly.is_empty() {
-        session.uids_by_message_id(message_id)?
-    } else {
-        exactly.to_vec()
+/// What a retirement call should delete.
+///
+/// Keeping these apart is the point. An empty *replacement* set means "there
+/// was nothing here before this append, so delete nothing"; a *retraction*
+/// means "whatever the server still holds under this Message-ID, delete all of
+/// it". Both used to be spelled `&[]`, so a first upload — which has no
+/// previous copy — took the retraction branch and deleted the copy it had just
+/// appended. The append is deliberately sequenced after the pre-append search
+/// so the new copy cannot match its own retirement query; that only holds if
+/// an empty set stays empty.
+enum Retire<'a> {
+    /// Delete exactly these, and nothing else. Empty deletes nothing.
+    Exactly(&'a [u32]),
+    /// Search the server fresh and delete every match.
+    Everything,
+}
+
+/// Deletes the copies `what` names, and returns how many went.
+fn retire(session: &mut Session, message_id: &str, what: Retire<'_>) -> crate::Result<usize> {
+    let uids = match what {
+        Retire::Exactly(uids) => uids.to_vec(),
+        Retire::Everything => session.uids_by_message_id(message_id)?,
     };
     let mut retired = 0;
     for uid in uids {
