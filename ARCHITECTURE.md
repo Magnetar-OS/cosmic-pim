@@ -360,9 +360,9 @@ CANCEL, reply construction — live in `caldav::itip` and are **not** part of
 the contract. The contract only moves bytes and names an account; whichever
 side applies a payload does it through the same library everyone links.
 
-**Interface** `io.github.entro314labs.CosmicPim.Scheduling1`, on the session
+**Interface** `com.magnetaros.CosmicPim.Scheduling1`, on the session
 bus, exported at the object path derived from each app's own well-known name
-(`/io/github/entro314labs/Slate`, `/io/github/entro314labs/Envelope`).
+(`/com/magnetaros/Slate`, `/com/magnetaros/Envelope`).
 
 The calendar side (Slate) exports:
 
