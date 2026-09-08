@@ -1,0 +1,18 @@
+cosmic-pim-accounts
+Copyright (c) 2026 Dominikos Pritis and contributors
+
+This crate's own files are under the Mozilla Public License 2.0 (see LICENSE).
+The notice below is an obligation inherited from code this crate derives from,
+and it travels with the distributed crate rather than with the repository the
+code happens to live in — which is why this file is here and not only at the
+root of the source repository.
+
+
+--------------------------------------------------------------------------
+Meltemi (https://github.com/entro314-labs/meltemi)
+--------------------------------------------------------------------------
+
+`src/secret.rs` is derived from `src-tauri/src/secrets.rs` in the Meltemi
+project. Meltemi grants MPL-2.0 (Exhibit A only) on that file, naming this
+derivative, in its own LICENSING.md. Meltemi as a whole remains
+all-rights-reserved; the grant is per-file, which is exactly MPL's boundary.

@@ -1,0 +1,49 @@
+cosmic-pim-mail
+Copyright (c) 2026 Dominikos Pritis and contributors
+
+This crate's own files are under the Mozilla Public License 2.0 (see LICENSE).
+The notices below are obligations inherited from code this crate derives from,
+and they travel with the distributed crate rather than with the repository the
+code happens to live in — which is why this file is here and not only at the
+root of the source repository.
+
+
+--------------------------------------------------------------------------
+Meltemi (https://github.com/entro314-labs/meltemi)
+--------------------------------------------------------------------------
+
+The following are ported from the Meltemi project:
+
+  sync cycle and folder handling      from `src-tauri/src/mail_sync.rs`
+  JWZ threading                       from `src-tauri/src/threading.rs`
+  HTML-to-visible-text extraction     from `src-tauri/src/model_text.rs`
+  RFC 8601 Authentication-Results     from `src-tauri/src/auth_results.rs`
+  bounce parsing and classification   from `src-tauri/src/dsn.rs`
+  PGP/MIME shapes, detached-signature byte range, and the verdict ladder
+  (`src/pgp.rs`)                      from `src-tauri/src/pgp_mail.rs`
+
+`src/gmail.rs` takes its label-bits model, its history-expiry decision, and the
+shape of its delta loop from `src-tauri/src/gmail.rs`.
+
+`src/graph.rs` takes its delta-query state machine, its `@removed.reason`
+distinction, and its Exchange datetime fallback ladder from
+`src-tauri/src/graph.rs`.
+
+Meltemi grants MPL-2.0 (Exhibit A only) on each of those donor files, naming
+these derivatives, in its own LICENSING.md. Meltemi as a whole remains
+all-rights-reserved; the grant is per-file, which is exactly MPL's boundary.
+
+In every case the storage half is new rather than ported: the donor drove
+SQLite, this drives a maildir.
+
+
+--------------------------------------------------------------------------
+ratatoskr — Apache-2.0
+--------------------------------------------------------------------------
+
+The Microsoft Graph wire protocol and folder-alias table in `src/graph.rs`
+reach this crate through Meltemi's `src-tauri/src/graph.rs`, which credits
+ratatoskr (Apache-2.0) for them. That attribution carries forward here.
+
+Meltemi additionally records two design ideas taken from ravn as ideas only,
+with no code reproduced. That record carries forward here as well.
