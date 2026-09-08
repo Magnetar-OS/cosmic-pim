@@ -476,6 +476,91 @@ pub enum Photo {
     Uri(String),
 }
 
+/// An image format, identified from the bytes themselves.
+///
+/// Recognised by magic number rather than taken from the card's declared
+/// content type, because the declared type is routinely absent, routinely
+/// wrong, and — the case that matters — stated just as confidently by a payload
+/// that is truncated or is not an image at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    WebP,
+    Bmp,
+    Tiff,
+    Svg,
+}
+
+impl ImageFormat {
+    /// The format `data` actually begins with, or `None` if it is not one we
+    /// recognise.
+    #[must_use]
+    pub fn sniff(data: &[u8]) -> Option<Self> {
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+        if data.starts_with(PNG) {
+            return Some(Self::Png);
+        }
+        // JPEG: SOI marker, then any APPn/marker byte.
+        if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            return Some(Self::Jpeg);
+        }
+        if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+            return Some(Self::Gif);
+        }
+        // RIFF container whose form type is WEBP.
+        if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+            return Some(Self::WebP);
+        }
+        if data.starts_with(b"BM") {
+            return Some(Self::Bmp);
+        }
+        if data.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+            || data.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+        {
+            return Some(Self::Tiff);
+        }
+        // SVG is text, so look past any leading whitespace or XML declaration.
+        let head = data.get(..256).unwrap_or(data);
+        if let Ok(text) = std::str::from_utf8(head) {
+            let trimmed = text.trim_start();
+            if trimmed.starts_with("<svg") || trimmed.starts_with("<?xml") && text.contains("<svg")
+            {
+                return Some(Self::Svg);
+            }
+        }
+        None
+    }
+}
+
+impl Photo {
+    /// The format the inline bytes actually are, if this is an inline photo at
+    /// all and the bytes are a recognised image.
+    #[must_use]
+    pub fn detected_format(&self) -> Option<ImageFormat> {
+        match self {
+            Self::Bytes { data, .. } => ImageFormat::sniff(data),
+            Self::Uri(_) => None,
+        }
+    }
+
+    /// Whether these bytes stand a chance of rendering.
+    ///
+    /// **Check this before handing the bytes to a toolkit's image widget.**
+    /// Iced accepts any byte string and only discovers it cannot decode at
+    /// draw time, at which point it renders *nothing* — so a contact whose card
+    /// carries a truncated or bogus PHOTO becomes an invisible hole in the list
+    /// rather than falling back to generated initials. Real address books
+    /// contain such cards: exporters truncate, and `X-ABCROP-RECTANGLE` entries
+    /// carry parameters where an image is expected.
+    #[must_use]
+    pub fn is_renderable(&self) -> bool {
+        self.detected_format().is_some()
+    }
+}
+
 /// Extracts the photo from a stored card, decoding inline forms to bytes.
 ///
 /// Separate from [`parse_vcards`] on purpose: a photo can be hundreds of
@@ -1642,5 +1727,97 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
             patched.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"),
             "{patched}"
         );
+    }
+}
+
+#[cfg(test)]
+mod photo_format_tests {
+    use super::*;
+
+    #[test]
+    fn real_image_headers_are_recognised() {
+        assert_eq!(
+            ImageFormat::sniff(b"\x89PNG\r\n\x1a\nrest"),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            ImageFormat::sniff(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(ImageFormat::sniff(b"GIF89a...."), Some(ImageFormat::Gif));
+        assert_eq!(
+            ImageFormat::sniff(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some(ImageFormat::WebP)
+        );
+        assert_eq!(ImageFormat::sniff(b"BM\0\0\0\0"), Some(ImageFormat::Bmp));
+        assert_eq!(
+            ImageFormat::sniff(&[0x49, 0x49, 0x2A, 0x00, 0x08]),
+            Some(ImageFormat::Tiff)
+        );
+        assert_eq!(
+            ImageFormat::sniff(b"<svg xmlns=\"http://www.w3.org/2000/svg\">"),
+            Some(ImageFormat::Svg)
+        );
+    }
+
+    #[test]
+    fn garbage_is_not_an_image() {
+        // The exact shape that produced an invisible contact row: base64 that
+        // decodes to a few bytes of nothing in particular.
+        assert_eq!(ImageFormat::sniff(b"\x00\x00\x00\x00\x04\x10"), None);
+        assert_eq!(ImageFormat::sniff(b""), None);
+        assert_eq!(ImageFormat::sniff(b"not an image at all"), None);
+    }
+
+    #[test]
+    fn a_riff_container_that_is_not_webp_is_not_an_image() {
+        // A WAV file is RIFF too; matching on the magic alone would accept it.
+        assert_eq!(ImageFormat::sniff(b"RIFF\0\0\0\0WAVEfmt "), None);
+    }
+
+    #[test]
+    fn a_truncated_riff_header_does_not_panic() {
+        assert_eq!(ImageFormat::sniff(b"RIFF"), None);
+        assert_eq!(ImageFormat::sniff(b"RIFF\0\0\0"), None);
+    }
+
+    #[test]
+    fn a_card_with_an_undecodable_photo_is_flagged_unrenderable() {
+        // has_photo is true — the property exists — but the payload is not an
+        // image, so the UI must fall back to initials rather than draw a hole.
+        let card = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a@t\r\nFN:Ada\r\n\
+                    PHOTO;ENCODING=b:AAAABBBB\r\nEND:VCARD\r\n";
+        let contact = parse_vcards(card, "d", "a.vcf").remove(0);
+        assert!(contact.has_photo, "the property is present");
+
+        let photo = photo(card).expect("a photo value");
+        assert!(
+            !photo.is_renderable(),
+            "undecodable bytes were reported as renderable"
+        );
+    }
+
+    #[test]
+    fn a_card_with_a_real_png_is_renderable() {
+        use base64::Engine as _;
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        let card = format!(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a@t\r\nFN:Ada\r\n\
+             PHOTO;ENCODING=b;TYPE=PNG:{encoded}\r\nEND:VCARD\r\n"
+        );
+
+        let photo = photo(&card).expect("a photo value");
+        assert_eq!(photo.detected_format(), Some(ImageFormat::Png));
+        assert!(photo.is_renderable());
+    }
+
+    #[test]
+    fn a_remote_uri_is_never_renderable_from_bytes_we_hold() {
+        let card = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:a@t\r\nFN:Ada\r\n\
+                    PHOTO:https://example.com/ada.png\r\nEND:VCARD\r\n";
+        let photo = photo(card).expect("a photo value");
+        assert!(matches!(photo, Photo::Uri(_)));
+        assert!(!photo.is_renderable(), "a URI carries no bytes to render");
     }
 }
