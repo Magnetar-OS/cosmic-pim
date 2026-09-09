@@ -143,6 +143,15 @@ pub fn write_contact_raw(
         .map_err(Into::into)
 }
 
+/// Removes a file, treating an already-absent one as success.
+fn remove_file_if_present(path: &Path) -> Result<(), StoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Every address book under `root`.
 #[must_use]
 pub fn books(root: &Path) -> Vec<CalendarMeta> {
@@ -272,7 +281,7 @@ impl ContactStore {
         let Some(group) = read_book(&meta).into_iter().find(|c| c.uid == uid) else {
             return Err(StoreError::UnknownContact(uid.to_owned()));
         };
-        let Some(patched) = crate::vcard::set_members(&group.raw, members) else {
+        let Some(patched) = crate::vcard::set_members(&group.raw, uid, members) else {
             return Err(StoreError::UnknownContact(uid.to_owned()));
         };
         write_contact_raw(&meta, &group.file_name, &patched)
@@ -305,14 +314,38 @@ impl ContactStore {
             .ok_or_else(|| StoreError::UnknownCalendar(book_id.to_owned()))?
             .clone();
 
-        if let Some(contact) = read_book(&meta).into_iter().find(|c| c.uid == uid) {
-            match std::fs::remove_file(meta.path.join(&contact.file_name)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
+        let Some(contact) = read_book(&meta).into_iter().find(|c| c.uid == uid) else {
+            return Ok(());
+        };
+        let path = meta.path.join(&contact.file_name);
+
+        // A file holding several cards — which is what every export from
+        // Google, Apple and Outlook is — must lose one card, not all of them.
+        // Unlinking it here deleted everybody who happened to share the file
+        // with the person being deleted.
+        if contact.raw.matches("BEGIN:VCARD").count() > 1 {
+            let remaining: String = split_vcards(&contact.raw)
+                .into_iter()
+                .filter(|card| {
+                    // Keep every card that is not this one. A card with no UID
+                    // is kept: it cannot be the one asked for by uid, and
+                    // guessing would delete a stranger.
+                    parse_vcards(card, &meta.id, &contact.file_name)
+                        .first()
+                        .is_none_or(|parsed| parsed.uid != uid)
+                })
+                .collect();
+
+            return if remaining.trim().is_empty() {
+                // Every card in it was this contact; the file has nothing left
+                // to hold.
+                remove_file_if_present(&path)
+            } else {
+                write_contact_raw(&meta, &contact.file_name, &remaining)
+            };
         }
-        Ok(())
+
+        remove_file_if_present(&path)
     }
 
     /// Imports the cards from a `.vcf` document into `book_id`.

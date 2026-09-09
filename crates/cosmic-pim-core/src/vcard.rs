@@ -354,10 +354,15 @@ pub fn member_uri(uid: &str) -> String {
 /// Writing RFC 6350 `MEMBER` into an Apple-style 3.0 group is the data-loss
 /// site 03 warns about — Apple clients ignore it and the membership diverges.
 ///
-/// Returns `None` if `raw` contains no VCARD.
+/// The card patched is the one carrying `uid`, not simply the first: a `.vcf`
+/// may hold many, and each `Contact` parsed from such a file carries the whole
+/// file as its `raw`. A single-card document is patched whatever its UID says.
+///
+/// Returns `None` if `raw` contains no VCARD, or holds several and none of
+/// them is this one.
 #[must_use]
-pub fn set_members(raw: &str, members: &[String]) -> Option<String> {
-    use crate::patch::{Edit, patch_component};
+pub fn set_members(raw: &str, uid: &str, members: &[String]) -> Option<String> {
+    use crate::patch::{Edit, patch_nth_component};
     use std::collections::BTreeMap;
 
     // The card's own spelling wins; only a card with no member lines at all
@@ -366,7 +371,7 @@ pub fn set_members(raw: &str, members: &[String]) -> Option<String> {
         .to_ascii_uppercase()
         .contains("X-ADDRESSBOOKSERVER-MEMBER")
         || (!raw.to_ascii_uppercase().contains("\nMEMBER")
-            && declared_version(raw) == WriteVersion::V3);
+            && version_of_card(raw, uid) == WriteVersion::V3);
 
     let property = if apple_spelling {
         "X-ADDRESSBOOKSERVER-MEMBER"
@@ -389,7 +394,7 @@ pub fn set_members(raw: &str, members: &[String]) -> Option<String> {
     };
     edits.insert(other.to_owned(), Edit::remove());
 
-    patch_component(raw, "VCARD", &edits)
+    patch_nth_component(raw, "VCARD", vcard_index_of(raw, uid)?, &edits)
 }
 
 /// Serialises a brand-new group card.
@@ -631,15 +636,20 @@ fn looks_like_uri(s: &str) -> bool {
 /// - 4.0 cards get `PHOTO:data:<mime>;base64,…` (RFC 6350 §6.2.4 via RFC 2397).
 /// - 3.0 cards get `PHOTO;ENCODING=b;TYPE=<subtype>:…` (RFC 2426 §3.1.4).
 ///
-/// Returns `None` if `raw` contains no VCARD.
+/// The card patched is the one carrying `uid`, not simply the first: a `.vcf`
+/// may hold many, and each `Contact` parsed from such a file carries the whole
+/// file as its `raw`. A single-card document is patched whatever its UID says.
+///
+/// Returns `None` if `raw` contains no VCARD, or holds several and none of
+/// them is this one.
 #[must_use]
-pub fn set_photo(raw: &str, data: &[u8], mime: &str) -> Option<String> {
-    use crate::patch::{Edit, patch_component};
+pub fn set_photo(raw: &str, uid: &str, data: &[u8], mime: &str) -> Option<String> {
+    use crate::patch::{Edit, patch_nth_component};
     use base64::Engine as _;
     use std::collections::BTreeMap;
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-    let line = match declared_version(raw) {
+    let line = match version_of_card(raw, uid) {
         WriteVersion::V4 => format!("PHOTO:data:{mime};base64,{encoded}"),
         WriteVersion::V3 => {
             // 3.0's TYPE names the image subtype, uppercased by convention:
@@ -655,20 +665,25 @@ pub fn set_photo(raw: &str, data: &[u8], mime: &str) -> Option<String> {
 
     let mut edits = BTreeMap::new();
     edits.insert("PHOTO".to_owned(), Edit::set(vec![line]));
-    patch_component(raw, "VCARD", &edits)
+    patch_nth_component(raw, "VCARD", vcard_index_of(raw, uid)?, &edits)
 }
 
 /// Removes a card's photo, leaving every other byte alone.
 ///
-/// Returns `None` if `raw` contains no VCARD.
+/// The card patched is the one carrying `uid`, not simply the first: a `.vcf`
+/// may hold many, and each `Contact` parsed from such a file carries the whole
+/// file as its `raw`. A single-card document is patched whatever its UID says.
+///
+/// Returns `None` if `raw` contains no VCARD, or holds several and none of
+/// them is this one.
 #[must_use]
-pub fn remove_photo(raw: &str) -> Option<String> {
-    use crate::patch::{Edit, patch_component};
+pub fn remove_photo(raw: &str, uid: &str) -> Option<String> {
+    use crate::patch::{Edit, patch_nth_component};
     use std::collections::BTreeMap;
 
     let mut edits = BTreeMap::new();
     edits.insert("PHOTO".to_owned(), Edit::remove());
-    patch_component(raw, "VCARD", &edits)
+    patch_nth_component(raw, "VCARD", vcard_index_of(raw, uid)?, &edits)
 }
 
 /* ------------------------------------------------------------------ */
@@ -713,7 +728,7 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     // a 3.0 card is quiet non-conformance a strict server strips, and the
     // preference is then lost remotely. The version comes from the card, not
     // from a caller preference — a patch never converts.
-    let version = declared_version(original);
+    let version = version_of_card(original, &contact.uid);
 
     let set = |edits: &mut BTreeMap<String, Edit>, name: &str, lines: Vec<String>| {
         edits.insert(name.to_owned(), Edit::set(lines));
@@ -860,6 +875,23 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         Some(index) => crate::patch::patch_nth_component(original, "VCARD", index, &edits),
         None => None,
     }
+}
+
+/// The version declared by the card carrying `uid`, rather than by whichever
+/// card happens to come first in the document.
+///
+/// The distinction only exists for a multi-card file, and only bites when the
+/// cards disagree — an export that concatenates a 4.0 card and a 3.0 one. The
+/// dialect has to follow the card being written or a patch converts it by
+/// accident, which is the one thing the patcher promises never to do.
+///
+/// Falls back to the document's own answer when the card cannot be located,
+/// which is the single-card case and the pre-existing behaviour.
+#[must_use]
+pub fn version_of_card(raw: &str, uid: &str) -> WriteVersion {
+    vcard_index_of(raw, uid)
+        .and_then(|index| split_vcards(raw).into_iter().nth(index))
+        .map_or_else(|| declared_version(raw), |card| declared_version(&card))
 }
 
 /// Which VCARD in `text` carries `uid`, in document order.
@@ -1700,11 +1732,11 @@ PHOTO;ENCODING=b;TYPE=JPEG:OLDOLD==\r\nEND:VCARD\r\n";
     fn setting_a_photo_speaks_the_cards_dialect() {
         let png = [0x89, b'P', b'N', b'G'];
 
-        let v4 = set_photo(V4, &png, "image/png").unwrap();
+        let v4 = set_photo(V4, "x", &png, "image/png").unwrap();
         assert!(v4.contains("PHOTO:data:image/png;base64,"), "{v4}");
         assert!(v4.contains("X-KEEP:me"), "{v4}");
 
-        let v3 = set_photo(V3, &png, "image/png").unwrap();
+        let v3 = set_photo(V3, "x", &png, "image/png").unwrap();
         assert!(v3.contains("PHOTO;ENCODING=b;TYPE=PNG:"), "{v3}");
         assert!(!v3.contains("OLDOLD"), "the old photo survived: {v3}");
         assert!(!v3.contains("data:"), "4.0 syntax in a 3.0 card: {v3}");
@@ -1713,7 +1745,7 @@ PHOTO;ENCODING=b;TYPE=JPEG:OLDOLD==\r\nEND:VCARD\r\n";
     #[test]
     fn a_set_photo_reads_back_through_the_photo_accessor() {
         let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a];
-        let card = set_photo(V4, &png, "image/png").unwrap();
+        let card = set_photo(V4, "x", &png, "image/png").unwrap();
         match photo(&card) {
             Some(Photo::Bytes { data, .. }) => assert_eq!(data, png),
             other => panic!("round trip failed: {other:?}"),
@@ -1722,19 +1754,58 @@ PHOTO;ENCODING=b;TYPE=JPEG:OLDOLD==\r\nEND:VCARD\r\n";
 
     #[test]
     fn removing_a_photo_removes_only_the_photo() {
-        let stripped = remove_photo(V3).unwrap();
+        let stripped = remove_photo(V3, "x").unwrap();
         assert!(!stripped.contains("PHOTO"), "{stripped}");
         assert!(stripped.contains("FN:Ada"), "{stripped}");
 
         // Removing from a card with no photo is a no-op, not an error.
-        let unchanged = remove_photo(V4).unwrap();
+        let unchanged = remove_photo(V4, "x").unwrap();
         assert!(unchanged.contains("X-KEEP:me"));
+    }
+
+    /// The same shape as the `patch_vcard` bug, in the photo patcher: a
+    /// `.vcf` holding two people, each `Contact` carrying the whole file as
+    /// its `raw`. Patching index 0 put the second person's photo on the first
+    /// person's card.
+    #[test]
+    fn a_photo_lands_on_its_own_card_in_a_multi_card_file() {
+        let two = format!("{V4}{V3}");
+        let png = [0x89, b'P', b'N', b'G'];
+
+        // Both fixtures say UID:x, so distinguish them first.
+        let two = two.replacen("UID:x", "UID:first", 1);
+        let two = two.replacen("UID:x", "UID:second", 1);
+
+        let patched = set_photo(&two, "second", &png, "image/png").unwrap();
+        let (first, second) = patched.split_once("BEGIN:VCARD\r\nVERSION:3.0").unwrap();
+        assert!(
+            !first.contains("PHOTO:data:"),
+            "the second card's photo landed on the first card: {first}"
+        );
+        assert!(
+            second.contains("PHOTO;ENCODING=b"),
+            "the photo reached the right card but in the wrong dialect — the \
+             version was read from the document's first card, not from this \
+             one: {second}"
+        );
+    }
+
+    /// A contact absent from a multi-card file must be refused, not written
+    /// into whichever card happened to be first.
+    #[test]
+    fn patching_a_card_that_is_not_in_a_multi_card_file_is_refused() {
+        let two = format!("{V4}{V3}")
+            .replacen("UID:x", "UID:first", 1)
+            .replacen("UID:x", "UID:second", 1);
+
+        assert!(set_photo(&two, "nobody", &[1], "image/png").is_none());
+        assert!(remove_photo(&two, "nobody").is_none());
     }
 
     #[test]
     fn garbage_yields_none() {
-        assert!(set_photo("", &[1], "image/png").is_none());
-        assert!(remove_photo("no card here").is_none());
+        assert!(set_photo("", "x", &[1], "image/png").is_none());
+        assert!(remove_photo("no card here", "x").is_none());
     }
 }
 
@@ -1786,7 +1857,7 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
             "urn:uuid:ada@server".to_owned(),
             "urn:uuid:new@server".to_owned(),
         ];
-        let apple = set_members(APPLE_GROUP, &more).unwrap();
+        let apple = set_members(APPLE_GROUP, "g1", &more).unwrap();
         assert_eq!(
             apple.matches("X-ADDRESSBOOKSERVER-MEMBER:").count(),
             2,
@@ -1799,14 +1870,14 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
         assert!(apple.contains("X-CUSTOM:keep-me"), "{apple}");
         assert!(apple.contains("X-ADDRESSBOOKSERVER-KIND:group"), "{apple}");
 
-        let v4 = set_members(V4_GROUP, &more).unwrap();
+        let v4 = set_members(V4_GROUP, "g2", &more).unwrap();
         assert_eq!(v4.matches("\nMEMBER:").count(), 2, "{v4}");
         assert!(!v4.contains("X-ADDRESSBOOKSERVER"), "{v4}");
     }
 
     #[test]
     fn removing_the_last_member_leaves_a_valid_empty_group() {
-        let emptied = set_members(V4_GROUP, &[]).unwrap();
+        let emptied = set_members(V4_GROUP, "g2", &[]).unwrap();
         assert!(!emptied.contains("MEMBER"), "{emptied}");
         assert!(emptied.contains("KIND:group"), "{emptied}");
         let back = parse_vcards(&emptied, "d", "g.vcf").remove(0);
@@ -1836,10 +1907,41 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
     /// A member added to a fresh 3.0 group gets the Apple spelling — the group
     /// was created for a 3.0-first server, so its members must be visible to
     /// the clients that server serves.
+    /// The same shape as the `patch_vcard` bug, in the member patcher: two
+    /// groups in one file, each parsed `Contact` carrying the whole file as
+    /// its `raw`. Patching index 0 put the second group's members on the
+    /// first group's card.
+    #[test]
+    fn members_land_on_their_own_card_in_a_multi_card_file() {
+        let two = format!("{APPLE_GROUP}{V4_GROUP}");
+        // A member neither fixture already carries, so the assertion is
+        // about where this write went and not about what was there before.
+        let patched = set_members(&two, "g2", &[member_uri("zoe@server")]).unwrap();
+        let (apple, v4) = patched.split_once("BEGIN:VCARD\r\nVERSION:4.0").unwrap();
+
+        assert!(
+            !apple.contains("zoe@server"),
+            "the 4.0 group's member landed on the Apple group: {apple}"
+        );
+        assert!(v4.contains("MEMBER:urn:uuid:zoe@server"), "{v4}");
+        assert!(
+            apple.contains("urn:uuid:ada@server"),
+            "the Apple group's own member was lost: {apple}"
+        );
+    }
+
+    /// A group absent from a multi-card file is refused, not written into
+    /// whichever card happened to be first.
+    #[test]
+    fn setting_members_on_a_group_not_in_the_file_is_refused() {
+        let two = format!("{APPLE_GROUP}{V4_GROUP}");
+        assert!(set_members(&two, "nobody", &[]).is_none());
+    }
+
     #[test]
     fn a_fresh_v3_group_gains_members_in_the_apple_spelling() {
         let card = group_vcard("Friends", "g", WriteVersion::V3);
-        let with = set_members(&card, &[member_uri("ada@server")]).unwrap();
+        let with = set_members(&card, "g", &[member_uri("ada@server")]).unwrap();
         assert!(
             with.contains("X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:ada@server"),
             "{with}"
