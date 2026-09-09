@@ -17,7 +17,7 @@ edition = "2024"
 # exists and the one trap (Exhibit B) to avoid.
 license = "MPL-2.0"
 repository = "https://github.com/Magnetar-OS/cosmic-pim"
-rust-version = "1.98.0"
+rust-version = "1.98.1"
 
 [profile.release]
 lto = "thin"
