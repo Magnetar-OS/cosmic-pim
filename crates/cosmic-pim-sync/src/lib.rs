@@ -26,6 +26,7 @@
 pub mod conflict;
 pub mod engine;
 pub mod error;
+pub mod freebusy;
 pub mod mail;
 pub mod provision;
 pub mod writeback;
@@ -33,6 +34,7 @@ pub mod writeback;
 pub use conflict::all as conflicts;
 pub use engine::{AccountReport, CollectionReport, sync_account, sync_all};
 pub use error::{Error, Result};
+pub use freebusy::{Answer, account_for_collection, availability};
 pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};
 pub use provision::{Provisioned, provision_account};
 pub use writeback::{queue_delete, queue_save, queue_save_with_base};

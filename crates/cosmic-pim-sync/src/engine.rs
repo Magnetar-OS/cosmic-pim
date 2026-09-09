@@ -300,7 +300,7 @@ fn sync_provisioned(client: &CaldavClient, entry: &Provisioned, root: &Path) -> 
 
 /// Which service's address is wanted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Service {
+pub(crate) enum Service {
     Calendar,
     Contacts,
 }
@@ -313,7 +313,7 @@ enum Service {
 /// `https://apidata.googleusercontent.com/caldav/v2/` is not something anyone
 /// types from memory, and because the address is a property of the provider
 /// rather than of the account.
-fn service_url(account: &Account, registry: &Registry, service: Service) -> String {
+pub(crate) fn service_url(account: &Account, registry: &Registry, service: Service) -> String {
     if !account.url.trim().is_empty() {
         return account.url.clone();
     }
@@ -330,7 +330,7 @@ fn service_url(account: &Account, registry: &Registry, service: Service) -> Stri
 }
 
 /// The scheme this account's resolved secret is sent with.
-fn dav_auth(account: &Account, secret: &Secret) -> Auth {
+pub(crate) fn dav_auth(account: &Account, secret: &Secret) -> Auth {
     match secret {
         Secret::Password(password) => Auth::Basic {
             username: account.username.clone(),
