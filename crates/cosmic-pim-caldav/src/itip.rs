@@ -568,12 +568,34 @@ fn file_name_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// A file name for `uid` that nothing in `collection` is already using.
+///
+/// `find_by_uid` answering `None` means "no file holds this UID". It does not
+/// mean "this name is free": [`sanitise_stem`] is lossy, so two UIDs derive
+/// one stem easily — `@` cleans to `-`, and any two sharing a 120-character
+/// prefix collide on the truncation. Writing an invitation at an occupied
+/// name replaced an event that had nothing to do with the sender, which is a
+/// stranger deleting your appointment by sending you mail.
+///
+/// The same defence the sync store and the feed splitter already use, for the
+/// same reason; this path was the one that did not have it.
+fn unused_name(collection: &Path, uid: &str) -> String {
+    let stem = sanitise_stem(uid);
+    let mut name = format!("{stem}.ics");
+    let mut n = 2;
+    while collection.join(&name).exists() {
+        name = format!("{stem}-{n}.ics");
+        n += 1;
+    }
+    name
+}
+
 fn apply_request(collection: &Path, ics: &str, itip: &Itip) -> Result<Outcome> {
     let stripped = strip_method(ics);
 
     match find_by_uid(collection, &itip.uid) {
         None => {
-            let file = format!("{}.ics", sanitise_stem(&itip.uid));
+            let file = unused_name(collection, &itip.uid);
             let target = collection.join(&file);
             atomic::write(&target, &stripped, None)
                 .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
@@ -1562,6 +1584,61 @@ mod tests {
 
     fn collection() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn an_invitation_never_overwrites_an_event_whose_name_it_collides_with() {
+        // The create-at-derived-name verb, in this module. `find_by_uid`
+        // answering None means "no file holds this UID" — it does not mean
+        // "this file name is free". Two UIDs derive one stem easily enough
+        // (`@` cleans to `-`, and any two sharing a 120-character prefix
+        // collide on the truncation), and writing the invitation at that name
+        // replaced an unrelated event that had nothing to do with the sender.
+        let dir = collection();
+
+        // An event already stored under the name `a-x.com.ics`.
+        let existing = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Mine//EN\r\n\
+BEGIN:VEVENT\r\nUID:a-x.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\n\
+SUMMARY:My own appointment\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(dir.path().join("a-x.com.ics"), existing).expect("write");
+
+        // An invitation whose UID cleans to the same stem.
+        let invitation = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Org//EN\r\n\
+METHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:a@x.com\r\nSEQUENCE:0\r\n\
+DTSTAMP:20260801T000000Z\r\nDTSTART:20260805T090000Z\r\nDTEND:20260805T100000Z\r\n\
+SUMMARY:Someone else's meeting\r\nORGANIZER:mailto:boss@org.example\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let outcome = apply(dir.path(), invitation, "me@example.com").expect("apply");
+        assert!(matches!(outcome, Outcome::Created { .. }), "{outcome:?}");
+
+        // The appointment that was already there is untouched.
+        let mine = std::fs::read_to_string(dir.path().join("a-x.com.ics")).expect("still there");
+        assert!(
+            mine.contains("SUMMARY:My own appointment"),
+            "an invitation overwrote an unrelated event:\n{mine}"
+        );
+        assert!(mine.contains("UID:a-x.com"));
+
+        // And the invitation landed somewhere of its own.
+        let files: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "the invitation did not get its own file: {files:?}"
+        );
+        let landed = files
+            .iter()
+            .find(|name| *name != "a-x.com.ics")
+            .expect("a second file");
+        let text = std::fs::read_to_string(dir.path().join(landed)).expect("read");
+        assert!(text.contains("UID:a@x.com"), "{text}");
+        assert!(text.contains("SUMMARY:Someone else's meeting"));
     }
 
     #[test]
