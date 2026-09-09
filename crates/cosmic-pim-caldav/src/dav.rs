@@ -203,6 +203,22 @@ fn relativize_for_multiget(request_url: &str, href: &str) -> String {
 /// contain literal `<`/`>`, but `&` is legal in query strings and Exchange
 /// OWA's `CalDAV` bridge really does emit hrefs containing it — splatting one
 /// unescaped into a multiget body 400s the entire batch.
+/// The MKCALENDAR request body.
+///
+/// A free function so it can be parsed in a test. A body assembled inline is
+/// a payload nothing reads back: `xml_escape_text` has its own unit test, but
+/// a correct escaper spliced into a malformed template still produces XML no
+/// server will accept, and the first report would be a failed live run.
+fn mkcalendar_body(display_name: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:set><D:prop><D:displayname>{}</D:displayname></D:prop></D:set>
+</C:mkcalendar>"#,
+        xml_escape_text(display_name)
+    )
+}
+
 fn xml_escape_text(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>')) {
         return std::borrow::Cow::Borrowed(s);
@@ -1726,13 +1742,7 @@ impl CaldavClient {
     /// CalDAV only: an address book is made with extended MKCOL (RFC 5689),
     /// which can join here when a caller needs it.
     pub fn mkcalendar(&self, url: &str, display_name: &str) -> Result<()> {
-        let body = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<C:mkcalendar xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <D:set><D:prop><D:displayname>{}</D:displayname></D:prop></D:set>
-</C:mkcalendar>"#,
-            xml_escape_text(display_name)
-        );
+        let body = mkcalendar_body(display_name);
         let resp = self.request(
             "MKCALENDAR",
             url,
@@ -2180,6 +2190,53 @@ END:VCALENDAR
         assert_eq!(prepare_if_match_etag("  \"abc\"  "), Some("\"abc\"".into()));
         assert_eq!(prepare_if_match_etag(""), None);
         assert_eq!(prepare_if_match_etag("   "), None);
+    }
+
+    /// Reads a request body the way a server would, and fails on anything a
+    /// parser rejects.
+    ///
+    /// `quick_xml` because that is what parses the *responses* — the same
+    /// reader, not a look-alike written to agree with the writer.
+    fn assert_well_formed(xml: &str, what: &str) {
+        let mut reader = quick_xml::Reader::from_str(xml);
+        reader.config_mut().check_end_names = true;
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => return,
+                Ok(_) => {}
+                Err(why) => panic!("{what} is malformed XML: {why}\n{xml}"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_request_body_is_well_formed_xml() {
+        // The static ones: cheap to eyeball once, and this catches the edit
+        // that breaks one later.
+        for body in [
+            PROPFIND_PRINCIPAL,
+            PROPFIND_CALENDAR_HOME,
+            PROPFIND_CALENDARS,
+            PROPFIND_EVENTS,
+            PROPFIND_CTAG,
+            PROPFIND_SCHEDULING,
+            PROPFIND_ADDRESSBOOK_HOME,
+        ] {
+            assert_well_formed(body, "a constant request body");
+        }
+
+        // The assembled ones, with input that would break a template missing
+        // its escaping — Exchange really does serve hrefs containing `&`.
+        let hostile = "/cal/a&b<c>\"d\".ics";
+        for flavor in [Flavor::CalDav, Flavor::CardDav] {
+            let hrefs = format!("  <D:href>{}</D:href>\n", xml_escape_text(hostile));
+            assert_well_formed(&flavor.multiget_body(&hrefs), "a multiget body");
+        }
+        assert_well_formed(&mkcalendar_body("Ada & <Friends>"), "a MKCALENDAR body");
+
+        // The free-busy body interpolates only `%Y%m%dT%H%M%SZ` timestamps,
+        // which cannot carry an XML metacharacter, so it is covered by the
+        // live matrix rather than needing hostile input here.
     }
 
     #[test]

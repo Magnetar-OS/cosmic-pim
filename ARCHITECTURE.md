@@ -235,6 +235,31 @@ An app must mutate its entries in place and must not round-trip a value
 through a display string. Both belong in the app's own tests: the substrate
 cannot see either mistake.
 
+**Fixing one level can make a defect at another worse, not just visible.**
+Every other case here works the same way — repairing a rung reveals the one
+below it, which makes the work cumulative and safe. One did the opposite. A
+contact share wrote a *display* string into `ORG:`, harmless-looking while
+the display was only a company name; the moment department units were
+correctly made visible, the share began filing people under a company named
+`Mathematician, Analytical Engine Co ‣ Research`. Displaying the units was
+right, and it is what turned a latent leak into a worse one. Generally: when
+a value crosses from one representation to another, enriching it at the
+source amplifies any leak downstream in proportion — which is the argument
+for the round-trip test below, since that test is the only check standing at
+the crossing.
+
+**A payload built by hand needs a test that reads it back.** Anything
+assembled outside the normal writer — an iTIP reply, a VFREEBUSY request, a
+calendar export, a DAV request body, a JSON message to an external process —
+tends to be tested with `contains` on text the builder just wrote, which
+re-asserts the format string and cannot tell a valid document from a
+plausible-looking one. Parse it with the *consumer's own reader*: `calcard`
+for calendars, `quick_xml` for DAV bodies, the consumer's real types for
+anything crossing a process boundary. A look-alike struct written to agree
+with the writer proves nothing. The failure these catch has a long fuse — a
+server rejecting an invitation, a launcher that silently finds nothing —
+because there is no test between the mistake and the user.
+
 This table is a record of what has been checked, not a claim that the list is
 complete — that claim was made twice during the sweep and was wrong both
 times. *The boundary of an audit is part of its result*: "I checked every
