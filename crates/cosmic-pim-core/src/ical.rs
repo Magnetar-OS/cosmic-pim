@@ -200,13 +200,40 @@ pub fn attendee_line(attendee: &Attendee, property: &str) -> String {
     if let Some(name) = attendee.name.as_deref().filter(|n| !n.trim().is_empty()) {
         // Quoted, because a display name routinely contains a comma or a
         // colon and either would end the parameter early.
-        line.push_str(&format!(";CN=\"{}\"", name.replace('"', "")));
+        line.push_str(&format!(";CN=\"{}\"", param_text(name)));
     }
     if let Some(partstat) = &attendee.partstat {
-        line.push_str(&format!(";PARTSTAT={partstat}"));
+        line.push_str(&format!(";PARTSTAT={}", param_text(partstat)));
     }
-    line.push_str(&format!(":mailto:{}", attendee.email));
+    line.push_str(&format!(":mailto:{}", param_text(&attendee.email)));
     line
+}
+
+/// Makes a string safe to place inside a quoted parameter value.
+///
+/// A parameter value is not a text value: RFC 5545 §3.2 gives it no escape
+/// sequences at all, so `escape_text`'s `\n` is wrong here — a reader would
+/// show the two characters. What it may not contain is a double quote, which
+/// would end the value, or a control character, which would end the *line*.
+///
+/// That second one was reachable. A display name carrying CRLF — and a
+/// display name can come from a synced vCard, which is to say from a server —
+/// broke the line in two and forged a second property: an extra ATTENDEE, or
+/// an ORGANIZER, in an invitation this app then sent. It also violated the
+/// index's rule that an unfolded content line never contains a newline, which
+/// is what makes its `\n`-joined attendee column safe to split.
+///
+/// Control characters become spaces rather than vanishing, so a name stays
+/// legible and two words do not silently become one.
+fn param_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_control() => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 /// Property names `write_vevent` emits itself. Everything else in a VEVENT is
@@ -2341,6 +2368,102 @@ mod tests {
 #[cfg(test)]
 mod preservation_tests {
     use super::*;
+
+    #[test]
+    fn a_display_name_cannot_forge_a_property() {
+        // A display name reaches this from a synced vCard, which is to say
+        // from a server. Carrying CRLF, it used to break the line in two and
+        // the remainder became a property of its own — an extra ATTENDEE in
+        // an invitation this app then sent, and an ORGANIZER by the same
+        // route, since both go through this function.
+        let attendee = Attendee {
+            email: "ada@example.com".into(),
+            name: Some("Ada\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:attacker@evil.example".into()),
+            partstat: Some("NEEDS-ACTION".into()),
+            raw: None,
+        };
+
+        let line = attendee_line(&attendee, "ATTENDEE");
+
+        assert!(
+            !line.contains('\r') && !line.contains('\n'),
+            "a content line carries a line break: {line:?}"
+        );
+        assert!(
+            !line.contains("attacker@evil.example\r\n"),
+            "the name forged a property: {line:?}"
+        );
+        assert!(line.ends_with(":mailto:ada@example.com"), "{line}");
+
+        // The assertion that matters is what a reader sees, not what the
+        // string contains: the hostile text is still *in* the name, harmlessly,
+        // as data inside a quoted parameter. Put the line in a real event and
+        // parse it back — exactly one attendee, and it is ours.
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+BEGIN:VEVENT\r\nUID:e@x\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:S\r\n\
+{line}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let parsed = parse_ics(&ics, "cal", "e.ics");
+        assert_eq!(parsed.len(), 1, "the line forged a component:\n{ics}");
+        assert_eq!(
+            parsed[0].attendees.len(),
+            1,
+            "the name forged an attendee: {:?}",
+            parsed[0].attendees
+        );
+        assert_eq!(parsed[0].attendees[0].email, "ada@example.com");
+    }
+
+    #[test]
+    fn a_quote_in_a_name_cannot_end_the_parameter() {
+        let attendee = Attendee {
+            email: "ada@example.com".into(),
+            name: Some("Ada \"The Countess\" Lovelace".into()),
+            partstat: None,
+            raw: None,
+        };
+
+        let line = attendee_line(&attendee, "ATTENDEE");
+        // Exactly the two quotes this writer opened and closed.
+        assert_eq!(line.matches('"').count(), 2, "{line}");
+        assert!(
+            line.contains("CN=\"Ada 'The Countess' Lovelace\""),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_synthesised_attendee_keeps_the_index_join_safe() {
+        // The index stores attendee lines joined with `\n` and splits them
+        // back on it, which is only safe while a line cannot contain one.
+        let attendees = [
+            Attendee {
+                email: "a@example.com".into(),
+                name: Some("First\nSecond".into()),
+                partstat: None,
+                raw: None,
+            },
+            Attendee {
+                email: "b@example.com".into(),
+                name: Some("Plain".into()),
+                partstat: None,
+                raw: None,
+            },
+        ];
+        let joined = attendees
+            .iter()
+            .map(|a| attendee_line(a, "ATTENDEE"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            joined.lines().count(),
+            2,
+            "one attendee became two rows: {joined:?}"
+        );
+    }
 
     /// A task file another client wrote: two tasks in one document, a
     /// VTIMEZONE, an alarm, and properties this model has no field for.
