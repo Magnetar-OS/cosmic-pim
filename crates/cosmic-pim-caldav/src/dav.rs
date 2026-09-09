@@ -247,13 +247,28 @@ fn xml_escape_text(s: &str) -> std::borrow::Cow<'_, str> {
 ///   again, wedging the client until a full re-sync;
 /// - already-quoted strong `ETag` → verbatim;
 /// - bare token (legacy rows from before verbatim storage) → wrapped in
-///   quotes so it conforms before going on the wire.
+///   quotes so it conforms before going on the wire;
+/// - anything outside printable US-ASCII → `None`. RFC 7232 §2.3's `etagc`
+///   excludes control characters, and a stored value containing them is one
+///   of two things: a lossily decoded non-ASCII `ETag` — Yahoo, Kerio and
+///   Zimbra have shipped those, and the original bytes are gone, so sending
+///   the replacement characters would 412 forever — or something carrying
+///   CRLF, which the HTTP layer refuses outright and which would otherwise
+///   fail every write to that resource rather than degrading.
+///
+/// That last case was the documentation's claim before it was the code's
+/// behaviour. Three places said the value was skipped — this comment, the
+/// quirks ledger's Zimbra entry, and the warning the capture site logs at the
+/// user — and nothing skipped it.
 fn prepare_if_match_etag(stored: &str) -> Option<String> {
     let s = stored.trim();
     if s.is_empty() {
         return None;
     }
     if s.starts_with("W/") {
+        return None;
+    }
+    if s.chars().any(|c| c.is_control() || !c.is_ascii()) {
         return None;
     }
     if s.starts_with('"') {
@@ -2190,6 +2205,30 @@ END:VCALENDAR
         assert_eq!(prepare_if_match_etag("  \"abc\"  "), Some("\"abc\"".into()));
         assert_eq!(prepare_if_match_etag(""), None);
         assert_eq!(prepare_if_match_etag("   "), None);
+
+        // Not RFC 7232-legal, so the header is skipped and the write degrades
+        // to unconditional — which is what this function's docs, the quirks
+        // ledger and the capture site's warning all already promised.
+        assert_eq!(
+            prepare_if_match_etag("\"caf\u{e9}\""),
+            None,
+            "non-ASCII etag"
+        );
+        assert_eq!(
+            prepare_if_match_etag("\"a\u{fffd}b\""),
+            None,
+            "a lossily decoded etag names bytes we no longer have"
+        );
+        assert_eq!(
+            prepare_if_match_etag("\"a\r\nX-Injected: yes\""),
+            None,
+            "a CRLF etag must never reach the header builder"
+        );
+        // And a value the HTTP layer would accept still passes.
+        assert_eq!(
+            prepare_if_match_etag("\"abc-123\""),
+            Some("\"abc-123\"".to_owned())
+        );
     }
 
     /// Reads a request body the way a server would, and fails on anything a
