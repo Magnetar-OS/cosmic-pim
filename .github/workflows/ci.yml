@@ -27,6 +27,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `rust-version` is a minimum, so a manifest asking for *less* than the
+      # pinned channel builds silently — which is what raising the toolchain
+      # and forgetting the manifest produces. Cargo catches the other
+      # direction on its own; this catches the likely one.
+      - name: The toolchain pin and the manifest agree
+        run: |
+          pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          declared=$(grep -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
+          echo "rust-toolchain.toml: $pinned / Cargo.toml: $declared"
+          test "$pinned" = "$declared" || {
+            echo "::error::rust-toolchain.toml pins $pinned but Cargo.toml declares $declared; raise both together"
+            exit 1
+          }
+
       - name: Formatting
         run: cargo fmt --all -- --check
 

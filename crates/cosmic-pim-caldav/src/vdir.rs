@@ -1250,6 +1250,24 @@ mod conflict_tests {
 
         std::fs::write(store.collection().path.join("a.ics"), LOCAL_EDIT).unwrap();
         store.queue_put(HREF).unwrap();
+
+        // The fixture asserts its own setup, because most of what it feeds is
+        // tested with a *negative*: "no push survived", "nothing is pending".
+        // Such an assertion cannot tell "correctly dropped" from "never
+        // queued", so it passes just as well against a fixture that silently
+        // did nothing — and would go on passing while the feature rotted.
+        // Proving the push exists here makes every emptiness assertion
+        // downstream mean what it says.
+        assert!(
+            !store.pending().is_empty(),
+            "the fixture queued no push, so nothing below can prove one was dropped"
+        );
+        assert_eq!(
+            store.unpushed_local(HREF).unwrap().as_deref(),
+            Some(LOCAL_EDIT),
+            "the fixture wrote no local edit"
+        );
+
         (dir, store)
     }
 

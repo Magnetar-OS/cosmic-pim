@@ -1,8 +1,14 @@
 # Pins the toolchain the workspace is developed and released against, so a
 # contributor and CI compile with the same rustc as the author. Matches
-# `rust-version` in Cargo.toml; raise both together — when they drift, cargo
-# refuses to build at all. (cosmic-conventions.md: "Toolchain pinned in one
-# place".)
+# `rust-version` in Cargo.toml; raise both together.
+#
+# Cargo only catches one direction of drift, and it is not the likely one.
+# `rust-version` is a *minimum*: a manifest asking for more than this channel
+# is refused outright, but a manifest asking for less builds silently — so
+# raising this file and forgetting Cargo.toml leaves the declared minimum
+# quietly wrong, which is exactly the mistake a bump makes. Measured, not
+# assumed. CI compares the two, because nothing else does.
+# (cosmic-conventions.md: "Toolchain pinned in one place".)
 [toolchain]
-channel = "1.98.0"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
