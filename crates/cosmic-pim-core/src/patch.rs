@@ -48,7 +48,7 @@
 //! editor can therefore show a grouped entry and change its value, but cannot
 //! accidentally restructure or orphan one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One logical content line, with its source bytes preserved.
 ///
@@ -381,6 +381,32 @@ pub fn patch_nth_component(
 
     let (start, end) = (start?, end?);
 
+    // Which properties the target already carries, so the rest can be
+    // appended. Computed before emitting rather than during, because the
+    // additions have to be written *inside* the loop — see the splice note at
+    // the END line below.
+    let mut present: BTreeSet<String> = BTreeSet::new();
+    {
+        let mut nested = 0usize;
+        for line in &lines[start + 1..end] {
+            if line.begins().is_some() {
+                nested += 1;
+            } else if line.ends().is_some() {
+                nested = nested.saturating_sub(1);
+            } else if nested == 0 && line.group().is_none() {
+                present.insert(line.name());
+            }
+        }
+    }
+    let mut additions = String::new();
+    for (name, edit) in edits {
+        if !present.contains(name) {
+            for replacement in edit.lines.iter().flatten() {
+                fold(replacement, terminator, &mut additions);
+            }
+        }
+    }
+
     // Which ungrouped occurrences exist, per property, inside the target only.
     let mut emitted: BTreeMap<String, bool> = BTreeMap::new();
     let mut out = String::with_capacity(text.len() + 128);
@@ -391,6 +417,19 @@ pub fn patch_nth_component(
     let mut nested = 0usize;
 
     for (i, line) in lines.iter().enumerate() {
+        if i == end {
+            // Properties the component did not already have go in here, before
+            // its own END line.
+            //
+            // At the END line by index, never by searching the built string
+            // for its text: a document with several components of this name
+            // has several byte-identical END lines, and a search finds the
+            // document's last one rather than this component's. That mistake
+            // spliced an added property into a later sibling — an EXDATE added
+            // to a recurring master landed inside its own override, so the
+            // exclusion silently did nothing.
+            out.push_str(&additions);
+        }
         if i <= start || i >= end {
             out.push_str(line.raw());
             continue;
@@ -444,37 +483,112 @@ pub fn patch_nth_component(
         }
     }
 
-    // Properties the component did not already have get appended before END.
-    let mut additions = String::new();
-    for (name, edit) in edits {
-        if !emitted.contains_key(name) {
-            for replacement in edit.lines.iter().flatten() {
-                fold(replacement, terminator, &mut additions);
-            }
-        }
-    }
-
-    if additions.is_empty() {
-        Some(out)
-    } else {
-        // Splice before the target component's END line.
-        //
-        // `rfind` rather than `find`: a nested component's END may have byte-
-        // identical text (`END:VEVENT` inside a document with several), and the
-        // target's own END is always the last one at or before this point,
-        // because everything after it was copied verbatim from beyond `end`.
-        let end_raw = lines[end].raw();
-        let at = out.rfind(end_raw)?;
-        let mut spliced = String::with_capacity(out.len() + additions.len());
-        spliced.push_str(&out[..at]);
-        spliced.push_str(&additions);
-        spliced.push_str(&out[at..]);
-        Some(spliced)
-    }
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
+
+    /* ---------------- adding a property to the right component ---------------- */
+
+    #[test]
+    fn a_property_added_to_one_component_does_not_land_in_its_sibling() {
+        // The bug this pins: the addition used to be spliced by searching the
+        // built output for the component's END line. Every component of the
+        // same name has a byte-identical END, so the search found the
+        // document's LAST one and the new property was written into a
+        // different record than the one being edited.
+        let two = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:First\r\nEND:VCARD\r\n\
+                   BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Second\r\nEND:VCARD\r\n";
+        let mut edits = BTreeMap::new();
+        edits.insert(
+            "NOTE".to_owned(),
+            Edit::set(vec!["NOTE:for the first".to_owned()]),
+        );
+
+        let out = patch_component(two, "VCARD", &edits).expect("a VCARD");
+        let first_end = out.find("END:VCARD").expect("an end");
+        let note_at = out.find("NOTE:for the first").expect("the note");
+        assert!(
+            note_at < first_end,
+            "the note landed in the second card:\n{out}"
+        );
+        assert_eq!(out.matches("NOTE:").count(), 1);
+    }
+
+    #[test]
+    fn an_addition_reaches_the_nth_component_not_the_last() {
+        let three = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                     BEGIN:VEVENT\r\nUID:a\r\nEND:VEVENT\r\n\
+                     BEGIN:VEVENT\r\nUID:b\r\nEND:VEVENT\r\n\
+                     BEGIN:VEVENT\r\nUID:c\r\nEND:VEVENT\r\n\
+                     END:VCALENDAR\r\n";
+        let mut edits = BTreeMap::new();
+        edits.insert(
+            "SUMMARY".to_owned(),
+            Edit::set(vec!["SUMMARY:the middle one".to_owned()]),
+        );
+
+        let out = patch_nth_component(three, "VEVENT", 1, &edits).expect("a VEVENT");
+        let middle = out.find("UID:b").expect("the middle event");
+        let after_middle = out[middle..].find("END:VEVENT").expect("its end") + middle;
+        let summary = out.find("SUMMARY:the middle one").expect("the summary");
+        assert!(
+            summary > middle && summary < after_middle,
+            "the summary landed outside the targeted component:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_exdate_added_to_a_master_stays_out_of_its_override() {
+        // The shape that found it: excluding one occurrence of a series that
+        // already had an override wrote the EXDATE into the override, so the
+        // exclusion silently did nothing and the instance kept appearing.
+        let series = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                      BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Weekly\r\n\
+                      RRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\n\
+                      BEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID:20260811T090000Z\r\n\
+                      SUMMARY:Moved\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut edits = BTreeMap::new();
+        edits.insert(
+            "EXDATE".to_owned(),
+            Edit::set(vec!["EXDATE:20260811T090000Z".to_owned()]),
+        );
+
+        let out = patch_nth_component(series, "VEVENT", 0, &edits).expect("the master");
+        let master_end = out.find("END:VEVENT").expect("the master's end");
+        let exdate = out.find("EXDATE:").expect("the exdate");
+        assert!(
+            exdate < master_end,
+            "the exdate landed in the override:\n{out}"
+        );
+        assert!(out.contains("SUMMARY:Moved"), "the override was disturbed");
+    }
+
+    #[test]
+    fn an_addition_goes_after_the_components_own_nested_component() {
+        // The END the addition precedes must be the component's, not a nested
+        // one's: appending before a VALARM's END would put the event's
+        // property inside the alarm.
+        let with_alarm = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                          BEGIN:VEVENT\r\nUID:a\r\n\
+                          BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n\
+                          END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut edits = BTreeMap::new();
+        edits.insert(
+            "SUMMARY".to_owned(),
+            Edit::set(vec!["SUMMARY:Added".to_owned()]),
+        );
+
+        let out = patch_component(with_alarm, "VEVENT", &edits).expect("a VEVENT");
+        let alarm_end = out.find("END:VALARM").expect("the alarm's end");
+        let summary = out.find("SUMMARY:Added").expect("the summary");
+        assert!(
+            summary > alarm_end,
+            "the summary landed inside the alarm:\n{out}"
+        );
+        assert!(out.find("END:VEVENT").expect("the event's end") > summary);
+    }
     use super::*;
 
     fn edits(pairs: &[(&str, Edit)]) -> BTreeMap<String, Edit> {
