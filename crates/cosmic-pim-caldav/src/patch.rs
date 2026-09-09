@@ -637,6 +637,40 @@ END:VCALENDAR\r\n";
     }
 
     #[test]
+    fn a_refold_counts_octets_not_characters() {
+        // The limit is 75 *octets* (RFC 5545 §3.1), and Greek is two octets a
+        // character, so a folder counting characters passes an ASCII test and
+        // emits over-long lines the moment a user writes in their own
+        // language. `core::patch` pins this for its own folder; this crate
+        // carries a second implementation, and a rule is only held where it
+        // is tested.
+        let name = "Λ".repeat(60);
+        let ical = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u5\r\n\
+             DTSTART:20260901T100000Z\r\n\
+             ATTENDEE;CN={name};PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+
+        let out = patch_attendee_partstat(&ical, "me@example.com", "ACCEPTED").expect("patched");
+        for line in out.split("\r\n") {
+            assert!(line.len() <= 75, "line over 75 octets: {}", line.len());
+        }
+        // And the name survives the refold intact — a fold that split a
+        // character would corrupt it rather than merely lengthen a line.
+        let unfolded: String = crate::patch::logical_lines(&out)
+            .iter()
+            .map(|line| line.unfolded().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            unfolded.contains(&name),
+            "the refold corrupted the name:\n{unfolded}"
+        );
+        assert!(unfolded.contains("PARTSTAT=ACCEPTED"));
+    }
+
+    #[test]
     fn partstat_patch_unfolds_patches_and_refolds() {
         // The fold boundary splits "PARTSTAT" / "=NEEDS-ACTION" across
         // physical lines - only unfold-then-match can see the parameter.
@@ -656,6 +690,8 @@ END:VCALENDAR\r\n";
         for line in out.split("\r\n") {
             assert!(line.len() <= 75, "line over 75 octets: {}", line.len());
         }
+        // ASCII only above, which cannot tell octets from characters — see
+        // the multibyte test below for the half this one does not reach.
         // The refolded document must still parse, and the patched attendee
         // must survive the refold. Asserted on the unfolded text rather than a
         // parsed attendee list because our Event model deliberately does not

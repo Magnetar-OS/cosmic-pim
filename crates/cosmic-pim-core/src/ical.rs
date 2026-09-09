@@ -1135,17 +1135,10 @@ pub fn escape_text(s: &str) -> String {
 /// the margin costs nothing. Folding is at character boundaries — splitting a
 /// multi-byte character across a fold produces a file no parser can read.
 pub(crate) fn fold_line(line: &str, out: &mut String) {
-    const LIMIT: usize = 73;
-    let mut count = 0;
-    for c in line.chars() {
-        if count + c.len_utf8() > LIMIT {
-            out.push_str("\r\n ");
-            count = 1; // the continuation space counts toward the new line
-        }
-        out.push(c);
-        count += c.len_utf8();
-    }
-    out.push_str("\r\n");
+    // One folder, not a second copy of the rule: this crate had two
+    // implementations of the same loop with the same constant, which is two
+    // places for the octet counting to drift apart.
+    crate::patch::fold(line, "\r\n", out);
 }
 
 /// Rewrites one VEVENT of an existing document, leaving its siblings intact.
