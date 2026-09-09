@@ -39,6 +39,23 @@ pub struct Typed {
     /// place* rather than rewriting it as an ungrouped line, which would orphan
     /// the label. A UI can use it to show that the entry has a custom label.
     pub group: Option<String>,
+
+    /// Every other parameter on this entry's line, as `NAME=value` text.
+    ///
+    /// Provenance, like `group`, and for the same reason: the writer rebuilds
+    /// a modelled line from these fields, so a parameter with nowhere to live
+    /// here is a parameter deleted from the user's card on the next save —
+    /// and pushed to the server, on every device. The loss is not confined to
+    /// vendor extensions: `PID` is RFC 6350's property-level sync identity,
+    /// and `ALTID`, `LANGUAGE` and `MEDIATYPE` are all standard.
+    ///
+    /// Carried per entry rather than reconstructed at write time, which is
+    /// what makes an edited *value* safe. Matching new values against old
+    /// lines would need either an identity this type does not have or
+    /// positional matching, and position is the thing this crate has spent
+    /// its bug history learning not to trust. An entry a UI builds fresh has
+    /// none, which is correct: it came from no line.
+    pub params: Vec<String>,
 }
 
 impl Typed {
@@ -49,6 +66,7 @@ impl Typed {
             types: Vec::new(),
             pref: None,
             group: None,
+            params: Vec::new(),
         }
     }
 
@@ -77,6 +95,10 @@ pub struct Address {
     pub postal_code: String,
     pub country: String,
     pub types: Vec<String>,
+    /// Every other parameter on the `ADR` line, as `NAME=value` text — see
+    /// [`Typed::params`]. `GEO=` and `LABEL=` live here, and both are
+    /// standard.
+    pub params: Vec<String>,
 }
 
 impl Address {
@@ -363,12 +385,14 @@ mod tests {
                 types: vec!["work".into()],
                 pref: Some(10),
                 group: None,
+                params: Vec::new(),
             },
             Typed {
                 value: "first@example.com".into(),
                 types: vec!["home".into()],
                 pref: Some(1),
                 group: None,
+                params: Vec::new(),
             },
         ];
         assert_eq!(

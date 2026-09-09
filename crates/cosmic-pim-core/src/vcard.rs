@@ -151,6 +151,41 @@ fn pref_of(entry: &VCardEntry) -> Option<u8> {
         })
 }
 
+/// The parameters on `entry` that the model does not carry in a field of its
+/// own, as `NAME=value` text.
+///
+/// `TYPE` and `PREF` are excluded because [`Typed`] holds them; everything
+/// else is kept so the writer can put it back. `into_text` covers every
+/// parameter-value variant calcard produces, so nothing is dropped for want
+/// of a rendering.
+fn foreign_params(entry: &VCardEntry) -> Vec<String> {
+    entry
+        .params
+        .iter()
+        .filter(|param| {
+            !matches!(
+                param.name,
+                VCardParameterName::Type | VCardParameterName::Pref
+            )
+        })
+        .map(|param| {
+            let value = param.value.clone().into_text();
+            format!("{}={}", param.name.as_str(), quote_param(&value))
+        })
+        .collect()
+}
+
+/// A parameter value, quoted if it carries a character that would otherwise
+/// end it. RFC 6350 §3.3: `,`, `;` and `:` require the DQUOTE form, which is
+/// how `GEO="geo:37.9,23.7"` survives at all.
+fn quote_param(value: &str) -> String {
+    if value.contains([',', ';', ':']) {
+        format!("\"{}\"", value.replace('"', ""))
+    } else {
+        value.to_owned()
+    }
+}
+
 fn typed_list(card: &VCard, prop: &VCardProperty) -> Vec<Typed> {
     card.properties(prop)
         .filter_map(|entry| {
@@ -173,6 +208,7 @@ fn typed_list(card: &VCard, prop: &VCardProperty) -> Vec<Typed> {
             }
 
             Some(Typed {
+                params: foreign_params(entry),
                 value: value.to_owned(),
                 types,
                 pref,
@@ -232,6 +268,7 @@ fn addresses(card: &VCard) -> Vec<Address> {
             };
 
             Address {
+                params: foreign_params(entry),
                 po_box: at(0),
                 extended: at(1),
                 street: at(2),
@@ -979,11 +1016,15 @@ pub fn vcard_index_of(text: &str, uid: &str) -> Option<usize> {
 }
 
 fn address_line(address: &Address) -> String {
-    let params = if address.types.is_empty() {
+    let mut params = if address.types.is_empty() {
         String::new()
     } else {
         format!(";TYPE={}", address.types.join(","))
     };
+    // `GEO=` and `LABEL=` ride here, and both are standard.
+    for param in &address.params {
+        params.push_str(&format!(";{param}"));
+    }
     format!(
         "ADR{params}:{};{};{};{};{};{};{}",
         escape_text(&address.po_box),
@@ -1147,6 +1188,10 @@ fn typed_line_versioned(property: &str, value: &Typed, version: WriteVersion) ->
     {
         params.push_str(&format!(";PREF={pref}"));
     }
+    // Everything the model does not name, back on the line it came from.
+    for param in &value.params {
+        params.push_str(&format!(";{param}"));
+    }
     format!("{property}{params}:{}", escape_text(&value.value))
 }
 
@@ -1158,6 +1203,92 @@ pub fn default_version() -> VCardVersion {
 
 #[cfg(test)]
 mod tests {
+
+    /* ------------- parameters on lines the writer rebuilds ------------- */
+
+    /// A card whose modelled lines carry parameters the model has no field
+    /// for — three of them standard, one a vendor extension.
+    const PARAMETERISED: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c1\r\n\
+FN:Ada\r\nN:Lovelace;Ada;;;\r\n\
+EMAIL;TYPE=work;X-SERVICE=slack;PID=1.1:ada@work.example\r\n\
+TEL;TYPE=cell;ALTID=1;LANGUAGE=en:+30 690 000 0000\r\n\
+ADR;TYPE=home;GEO=\"geo:37.9,23.7\":;;12 Byron;Athens;;105 55;GR\r\n\
+END:VCARD\r\n";
+
+    #[test]
+    fn editing_a_name_does_not_strip_parameters_from_other_lines() {
+        // The seam this pins: the patcher is verbatim for properties it does
+        // not model and rebuilding for lines it does, and a parameter on a
+        // rebuilt line falls between the two. Editing the *name* used to
+        // delete PID, ALTID, LANGUAGE and GEO from lines the edit never
+        // mentioned — then push the loss to the server on the next sync.
+        let mut contact = parse_vcards(PARAMETERISED, "book", "c.vcf")
+            .into_iter()
+            .next()
+            .expect("a card");
+        contact.display_name = "Ada Lovelace".into();
+
+        let out = patch_vcard(&contact.raw, &contact).expect("patched");
+        for survivor in [
+            "X-SERVICE=slack",
+            // RFC 6350's property-level sync identity.
+            "PID=1.1",
+            "ALTID=1",
+            "LANGUAGE=en",
+            // Quoted because it carries a colon and a comma; unquoted it
+            // would end the parameter early.
+            "GEO=\"geo:37.9,23.7\"",
+        ] {
+            assert!(
+                out.contains(survivor),
+                "editing the name deleted {survivor:?}:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("FN:Ada Lovelace"),
+            "the edit did not land:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_changed_value_keeps_its_own_lines_parameters() {
+        // The case a write-time join could not have handled: the value
+        // changes, so the line cannot be preserved by leaving it alone. The
+        // parameters ride in the entry, so they move with it.
+        let mut contact = parse_vcards(PARAMETERISED, "book", "c.vcf")
+            .into_iter()
+            .next()
+            .expect("a card");
+        contact.emails[0].value = "ada@new.example".into();
+
+        let out = patch_vcard(&contact.raw, &contact).expect("patched");
+        assert!(
+            out.contains("ada@new.example"),
+            "the edit did not land:\n{out}"
+        );
+        assert!(
+            out.contains("X-SERVICE=slack") && out.contains("PID=1.1"),
+            "changing the value dropped the line's parameters:\n{out}"
+        );
+        assert!(!out.contains("ada@work.example"));
+    }
+
+    #[test]
+    fn an_entry_a_ui_builds_has_no_parameters_to_carry() {
+        // Correct rather than unfortunate: an entry that came from no line
+        // has no foreign parameters, and must not inherit another's.
+        let mut contact = parse_vcards(PARAMETERISED, "book", "c.vcf")
+            .into_iter()
+            .next()
+            .expect("a card");
+        contact.emails.push(Typed::new("ada@third.example"));
+
+        let out = patch_vcard(&contact.raw, &contact).expect("patched");
+        assert!(out.contains("EMAIL:ada@third.example"), "{out}");
+        // The new line carries nothing borrowed from the first.
+        assert_eq!(out.matches("X-SERVICE=slack").count(), 1, "{out}");
+        assert_eq!(out.matches("PID=1.1").count(), 1, "{out}");
+    }
 
     /* ------------- editing one card in a file that holds several ------------- */
 
@@ -1379,6 +1510,7 @@ END:VCARD\r\n";
             types: vec!["work".into()],
             pref: Some(1),
             group: None,
+            params: Vec::new(),
         }];
         c.phones = vec![Typed::new("+15551234")];
         c.organisation = Some("Analytical Engines".into());
@@ -1501,6 +1633,7 @@ END:VCARD\r\n";
             types: vec!["work".into()],
             pref: None,
             group: None,
+            params: Vec::new(),
         }];
 
         let out = patch_vcard(&contact.raw.clone(), &contact).expect("patched");
@@ -1680,6 +1813,7 @@ mod version_tests {
             types: vec!["work".into()],
             pref: Some(1),
             group: None,
+            params: Vec::new(),
         }];
         c.birthday = chrono::NaiveDate::from_ymd_opt(1815, 12, 10);
         c
