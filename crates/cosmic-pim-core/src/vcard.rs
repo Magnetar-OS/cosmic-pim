@@ -877,6 +877,21 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     }
 }
 
+/// One card's own text, sliced out of a document that may hold several.
+///
+/// [`parse_vcards`] gives every `Contact` the whole file as its `raw`, because
+/// that is what a patcher needs. Anything that reads a card *out* — an export,
+/// an undo entry, a share — wants only the card, and taking `raw` gives it the
+/// file: an export that concatenates every contact's `raw` emits an N-card
+/// file N times.
+///
+/// Returns `None` if no card in `document` carries that uid.
+#[must_use]
+pub fn card_segment(document: &str, uid: &str) -> Option<String> {
+    let index = vcard_index_of(document, uid)?;
+    split_vcards(document).into_iter().nth(index)
+}
+
 /// Replaces the card carrying `uid` in `document` with `replacement`.
 ///
 /// For updating one person inside a file that holds several — an import

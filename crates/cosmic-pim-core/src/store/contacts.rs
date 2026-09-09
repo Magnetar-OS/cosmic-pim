@@ -447,15 +447,22 @@ impl ContactStore {
 
         let mut out = String::new();
         for contact in read_book(meta) {
-            // `raw` is the file's verbatim text; a card this app created and
-            // never re-read is serialised from the model instead.
-            if contact.raw.trim().is_empty() {
-                out.push_str(&to_vcard_versioned(&contact, WriteVersion::default()));
+            // `raw` is the file's verbatim text, and a file may hold several
+            // cards — so take this contact's own card out of it. Pushing
+            // `raw` emitted an N-card file once per contact in it, which made
+            // a two-person book export as four people.
+            let text = if contact.raw.trim().is_empty() {
+                // A card this app created and never re-read has nothing to
+                // slice; serialising from the model is lossless by definition.
+                to_vcard_versioned(&contact, WriteVersion::default())
             } else {
-                out.push_str(&contact.raw);
-                if !contact.raw.ends_with('\n') {
-                    out.push_str("\r\n");
-                }
+                crate::vcard::card_segment(&contact.raw, &contact.uid)
+                    .unwrap_or_else(|| contact.raw.clone())
+            };
+
+            out.push_str(&text);
+            if !text.ends_with('\n') {
+                out.push_str("\r\n");
             }
         }
         Ok(out)
