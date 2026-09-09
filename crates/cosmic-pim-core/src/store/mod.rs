@@ -33,6 +33,15 @@ pub enum StoreError {
     #[error("“{0}” is read-only")]
     ReadOnly(String),
 
+    /// A contact's file holds several cards and none of them is this contact,
+    /// so there is nothing safe to write: patching cannot find the card, and
+    /// serialising would put one card where many were.
+    #[error("{uid} is not in {file}, which holds several cards — refusing to overwrite them")]
+    Unpatchable {
+        uid: String,
+        file: std::path::PathBuf,
+    },
+
     /// A guarded write lost a race: the file changed between the caller's read
     /// and its write, and the incoming version was parked at `conflict` rather
     /// than being dropped on the floor.

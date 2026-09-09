@@ -687,10 +687,24 @@ pub fn remove_photo(raw: &str) -> Option<String> {
 /// `contact.emails` does not reach them; see [`crate::patch`] for why, and for
 /// how to address one deliberately.
 ///
-/// Returns `None` if `original` contains no VCARD.
+/// The card patched is the one whose `UID` matches `contact`, not simply the
+/// first. A `.vcf` may hold many cards — every export from Google, Apple and
+/// Outlook is one file containing all of them — and `parse_vcards` gives each
+/// resulting `Contact` the *whole file* as its `raw`. Patching index 0
+/// regardless therefore wrote the second contact's name, email and address
+/// over the first contact's card while leaving the first card's UID in place:
+/// one person's record wearing another person's details, and the edit never
+/// reaching the person who made it.
+///
+/// A single-card document is patched whatever its UID says, since there is
+/// nothing it could be confused with.
+///
+/// Returns `None` if `original` contains no VCARD, or holds several and none
+/// of them is this contact — in which case the caller must not fall back to
+/// serialising, because that would write one card over all of them.
 #[must_use]
 pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
-    use crate::patch::{Edit, patch_component};
+    use crate::patch::Edit;
     use std::collections::BTreeMap;
 
     let mut edits: BTreeMap<String, Edit> = BTreeMap::new();
@@ -842,7 +856,54 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         )]),
     );
 
-    patch_component(original, "VCARD", &edits)
+    match vcard_index_of(original, &contact.uid) {
+        Some(index) => crate::patch::patch_nth_component(original, "VCARD", index, &edits),
+        None => None,
+    }
+}
+
+/// Which VCARD in `text` carries `uid`, in document order.
+///
+/// `Some(0)` for a single-card document whatever its UID, because a lone card
+/// is unambiguous and a great many of them carry no UID at all.
+#[must_use]
+pub fn vcard_index_of(text: &str, uid: &str) -> Option<usize> {
+    let mut uids: Vec<Option<String>> = Vec::new();
+    let mut inside = false;
+    let mut nested = 0usize;
+    let mut current: Option<String> = None;
+
+    for line in crate::patch::logical_lines(text) {
+        if let Some(component) = line.begins() {
+            if inside {
+                nested += 1;
+            } else if component.eq_ignore_ascii_case("VCARD") {
+                inside = true;
+                current = None;
+            }
+            continue;
+        }
+        if line.ends().is_some() {
+            if nested > 0 {
+                nested -= 1;
+            } else if inside {
+                uids.push(current.take());
+                inside = false;
+            }
+            continue;
+        }
+        if inside && nested == 0 && line.name() == "UID" {
+            current = Some(line.value().trim().to_owned());
+        }
+    }
+
+    match uids.len() {
+        0 => None,
+        1 => Some(0),
+        _ => uids
+            .iter()
+            .position(|candidate| candidate.as_deref() == Some(uid)),
+    }
 }
 
 fn address_line(address: &Address) -> String {
@@ -1025,6 +1086,84 @@ pub fn default_version() -> VCardVersion {
 
 #[cfg(test)]
 mod tests {
+
+    /* ------------- editing one card in a file that holds several ------------- */
+
+    /// What every mainstream exporter produces: one file, all the contacts.
+    const TWO_CARDS: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:card-1\r\n\
+FN:Ada Lovelace\r\nN:Lovelace;Ada;;;\r\nEMAIL:ada@example.com\r\n\
+X-WHICH:first\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:3.0\r\nUID:card-2\r\nFN:Charles Babbage\r\n\
+N:Babbage;Charles;;;\r\nEMAIL:babbage@example.com\r\nX-WHICH:second\r\n\
+END:VCARD\r\n";
+
+    #[test]
+    fn editing_the_second_card_does_not_rewrite_the_first() {
+        // The bug this pins was identity-level: `parse_vcards` gives every
+        // contact the WHOLE file as its `raw`, and patching index 0 regardless
+        // wrote the second person's name and email over the first person's
+        // card while leaving the first card's UID in place. Ada's record came
+        // back reading "Charles Babbage", and Charles's edit never landed.
+        let mut second = parse_vcards(TWO_CARDS, "book", "both.vcf")
+            .into_iter()
+            .find(|c| c.uid == "card-2")
+            .expect("the second card");
+        second.display_name = "Charles Babbage (edited)".into();
+
+        let out = patch_vcard(&second.raw, &second).expect("a patched document");
+
+        // The first card is untouched, identity and all.
+        assert!(
+            out.contains("FN:Ada Lovelace"),
+            "Ada's card was rewritten:\n{out}"
+        );
+        assert!(out.contains("EMAIL:ada@example.com"));
+        assert!(out.contains("X-WHICH:first"));
+        // And the edit reached the card it was for.
+        assert!(out.contains("FN:Charles Babbage (edited)"), "{out}");
+        assert_eq!(out.matches("BEGIN:VCARD").count(), 2);
+    }
+
+    #[test]
+    fn a_lone_card_is_patched_whatever_its_uid_says() {
+        // Most vdir files hold one card and a great many carry no UID at all,
+        // so a single card must stay patchable by identity or not.
+        let one = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Nobody\r\nEND:VCARD\r\n";
+        let mut contact = parse_vcards(one, "book", "one.vcf")
+            .into_iter()
+            .next()
+            .expect("a card");
+        contact.uid = "an-id-the-card-does-not-carry".into();
+        contact.display_name = "Somebody".into();
+
+        let out = patch_vcard(one, &contact).expect("a lone card is patchable");
+        assert!(out.contains("FN:Somebody"), "{out}");
+    }
+
+    #[test]
+    fn a_card_missing_from_a_multi_card_file_is_refused_not_guessed() {
+        // Returning None here is what stops the caller serialising one card
+        // over a document holding many. Guessing at index 0 is how the bug
+        // above happened.
+        let mut stranger = parse_vcards(TWO_CARDS, "book", "both.vcf")
+            .into_iter()
+            .next()
+            .expect("a card to clone");
+        stranger.uid = "card-99".into();
+
+        assert!(
+            patch_vcard(TWO_CARDS, &stranger).is_none(),
+            "a contact not in the file was patched into somebody else's card"
+        );
+    }
+
+    #[test]
+    fn the_index_lookup_finds_each_card_by_its_own_uid() {
+        assert_eq!(vcard_index_of(TWO_CARDS, "card-1"), Some(0));
+        assert_eq!(vcard_index_of(TWO_CARDS, "card-2"), Some(1));
+        assert_eq!(vcard_index_of(TWO_CARDS, "card-3"), None);
+        assert_eq!(vcard_index_of("", "anything"), None);
+    }
     use super::*;
 
     fn wrap(body: &str) -> String {

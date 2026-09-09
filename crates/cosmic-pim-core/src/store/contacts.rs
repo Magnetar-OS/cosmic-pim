@@ -96,6 +96,17 @@ pub fn write_contact_versioned(
 
     let text = match crate::vcard::patch_vcard(&contact.raw, contact) {
         Some(patched) => patched,
+        None if contact.raw.matches("BEGIN:VCARD").count() > 1 => {
+            // Several cards in the file and none of them is this one. Falling
+            // back to the model here would serialise one card over a document
+            // holding many, deleting everybody else in it — so this refuses
+            // instead. Silent data loss is exactly what this function exists
+            // to prevent.
+            return Err(StoreError::Unpatchable {
+                uid: contact.uid.clone(),
+                file: meta.path.join(&contact.file_name),
+            });
+        }
         None => {
             // No source to patch: a new contact, or a `raw` that holds no
             // VCARD. Building from the model is correct here and lossless by
