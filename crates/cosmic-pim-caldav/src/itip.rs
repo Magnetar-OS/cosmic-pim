@@ -589,6 +589,21 @@ fn apply_request(collection: &Path, ics: &str, itip: &Itip) -> Result<Outcome> {
             let text = match &itip.recurrence_id {
                 // A whole-series update: the organizer's payload is the new
                 // truth for the series, overrides included.
+                //
+                // This is the one place in the suite where writing a whole
+                // document over a file that may hold several components is
+                // CORRECT, and it needs saying because three data-corruption
+                // bugs were fixed in exactly that shape — a task save deleting
+                // its file's other tasks, a contact save overwriting another
+                // person's card, an event save discarding what it did not
+                // model. Those were wrong because the writer owned one record
+                // and destroyed its neighbours. This one is right because RFC
+                // 5546 §3.2.2 makes an organizer's REQUEST without a
+                // RECURRENCE-ID authoritative for the entire series: the
+                // overrides being replaced are ones the organizer is
+                // superseding, and keeping them would resurrect instances the
+                // organizer has just redefined. Do not "fix" this into a
+                // patch; see ARCHITECTURE.md's verbatim-storage section.
                 None => stripped,
                 // One instance changed: the master and the other overrides
                 // stand, and only this override is replaced or added.
