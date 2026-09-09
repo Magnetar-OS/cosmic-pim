@@ -184,6 +184,33 @@ each was found only after someone asked which verbs had *not* been looked at
 | Move between collections | a write plus a delete, and the delete half unlinked | `move_to_calendar`, through `remove_record` |
 | Export | contacts emitted a multi-card file once per card; calendars dropped the VTIMEZONE while keeping the `TZID=` references to it | `export_collection`, `ical::timezones_of` |
 
+**The container is not only the file.** The table above is about documents
+holding several records, and the same question repeats at every level where
+the model is narrower than the format — each level invisible from the one
+above. A *line* holds parameters the model does not name (`PID`, `ALTID`,
+`GEO=`), which the writer dropped while faithfully preserving whole
+properties. A *value* holds components (`ORG:Company;Division;Team`), of
+which the model named the first. A *component* is itself a list, where a
+category written `friends\, close` was re-split on its own escaped comma
+into two. Each was found only after the level above it was fixed and someone
+asked what the next one down was; none of them would have been caught by
+re-examining the level above.
+
+Two rules came out of that. Components are escaped individually, never as one
+joined string — escaping the join writes `Company\;Division\;Team`, a single
+name containing semicolons, which is a different fact about the contact. And
+*assertions about preservation must unfold first*: a 75-octet fold can split
+any value mid-word, and a `contains` that cannot see across the continuation
+reads correct folding as data loss, which is how a correct folder gets
+"fixed".
+
+There is a matching obligation on the application, which the substrate cannot
+enforce. Parameters and components travel *in* the model entry, so an editor
+that rebuilds an entry from its own field state — an ordinary way to write
+one — hands the writer an empty entry and drops everything just as
+thoroughly, with every test here still passing. An app must mutate its
+entries in place, and should pin that with a test of its own.
+
 This table is a record of what has been checked, not a claim that the list is
 complete — that claim was made twice during the sweep and was wrong both
 times. *The boundary of an audit is part of its result*: "I checked every

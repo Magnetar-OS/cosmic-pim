@@ -66,6 +66,7 @@ fn convert(card: &VCard, raw: &str, addressbook_id: &str, file_name: &str) -> Co
         phones: typed_list(card, &VCardProperty::Tel),
         addresses: addresses(card),
         organisation: text_of(card, &VCardProperty::Org),
+        organisation_units: org_units(card),
         title: text_of(card, &VCardProperty::Title),
         note: text_of(card, &VCardProperty::Note),
         birthday,
@@ -98,6 +99,27 @@ fn text_of(card: &VCard, prop: &VCardProperty) -> Option<String> {
 }
 
 /// A property whose value is a comma-separated list, and which may repeat.
+/// The `ORG` components after the first — the units of the hierarchy.
+///
+/// `text_of` takes the first value, which is the organisation name; RFC 6350
+/// §6.6.4 lets the rest name a division and a team beneath it, and dropping
+/// them turned `Analytical Engine Co;Research;Difference Engines` into
+/// `Analytical Engine Co` on the next save.
+fn org_units(card: &VCard) -> Vec<String> {
+    card.properties(&VCardProperty::Org)
+        .next()
+        .map(|entry| {
+            entry
+                .values
+                .iter()
+                .skip(1)
+                .filter_map(VCardValue::as_text)
+                .map(|s| s.trim().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn list_of(card: &VCard, prop: &VCardProperty) -> Vec<String> {
     let mut out = Vec::new();
     for entry in card.properties(prop) {
@@ -110,11 +132,15 @@ fn list_of(card: &VCard, prop: &VCardProperty) -> Vec<String> {
                         .map(|s| s.trim().to_owned())
                         .filter(|s| !s.is_empty()),
                 ),
+                // One value, taken whole. Splitting on commas here re-split
+                // what calcard had already separated correctly, so a category
+                // written `friends\, close` — one category containing a
+                // comma — came back as two, and the escape was gone for good
+                // on the next save.
                 other => {
                     if let Some(text) = other.as_text() {
                         out.extend(
-                            text.split(',')
-                                .map(str::trim)
+                            std::iter::once(text.trim())
                                 .filter(|s| !s.is_empty())
                                 .map(ToOwned::to_owned),
                         );
@@ -846,7 +872,7 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         contact
             .organisation
             .iter()
-            .map(|o| format!("ORG:{}", escape_text(o)))
+            .map(|o| org_line(o, &contact.organisation_units))
             .collect(),
     );
     set(
@@ -1015,6 +1041,20 @@ pub fn vcard_index_of(text: &str, uid: &str) -> Option<usize> {
     }
 }
 
+/// `ORG:Company;Division;Team`, each component escaped on its own.
+///
+/// Escaping the joined string instead would write `Company\;Division\;Team`
+/// — one organisation name that happens to contain semicolons, which is a
+/// different fact about the contact.
+fn org_line(organisation: &str, units: &[String]) -> String {
+    let mut line = format!("ORG:{}", escape_text(organisation));
+    for unit in units {
+        line.push(';');
+        line.push_str(&escape_text(unit));
+    }
+    line
+}
+
 fn address_line(address: &Address) -> String {
     let mut params = if address.types.is_empty() {
         String::new()
@@ -1139,7 +1179,7 @@ pub fn to_vcard_versioned(contact: &Contact, version: WriteVersion) -> String {
     }
 
     if let Some(org) = &contact.organisation {
-        fold_line(&format!("ORG:{}", escape_text(org)), &mut out);
+        fold_line(&org_line(org, &contact.organisation_units), &mut out);
     }
     if let Some(title) = &contact.title {
         fold_line(&format!("TITLE:{}", escape_text(title)), &mut out);
@@ -1203,6 +1243,95 @@ pub fn default_version() -> VCardVersion {
 
 #[cfg(test)]
 mod tests {
+
+    /* ------------- components inside a single value ------------- */
+
+    /// A card whose values are themselves structured: ORG is a hierarchy,
+    /// and one category contains an escaped comma.
+    const STRUCTURED_VALUES: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c1\r\n\
+FN:Ada\r\nN:Lovelace;Ada;;;\r\n\
+ORG:Analytical Engine Co;Research;Difference Engines\r\n\
+CATEGORIES:work,friends\\, close,vip\r\n\
+END:VCARD\r\n";
+
+    /// Assertions about preservation must unfold first. A 75-octet fold can
+    /// split any of these values mid-word, and a `contains` that cannot see
+    /// across the continuation reads correct folding as data loss.
+    fn unfolded(text: &str) -> String {
+        crate::patch::logical_lines(text)
+            .iter()
+            .map(|line| line.unfolded().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn an_org_keeps_its_units() {
+        // RFC 6350 §6.6.4 makes ORG a hierarchy. The model named only the
+        // first component, so editing a contact's *name* turned
+        // `Company;Division;Team` into `Company` — the same shape as the
+        // parameter gap one level up, and the value gap one level down.
+        let mut contact = parse_vcards(STRUCTURED_VALUES, "book", "c.vcf")
+            .into_iter()
+            .next()
+            .expect("a card");
+        assert_eq!(
+            contact.organisation.as_deref(),
+            Some("Analytical Engine Co")
+        );
+        assert_eq!(
+            contact.organisation_units,
+            ["Research", "Difference Engines"]
+        );
+
+        contact.display_name = "Ada Lovelace".into();
+        let out = unfolded(&patch_vcard(&contact.raw, &contact).expect("patched"));
+
+        assert!(
+            out.contains("ORG:Analytical Engine Co;Research;Difference Engines"),
+            "the organisation hierarchy was flattened:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_component_is_escaped_on_its_own_not_as_one_joined_string() {
+        // Escaping the joined hierarchy would write
+        // `Company\;Division\;Team`: one organisation name containing
+        // semicolons, which is a different fact about the contact.
+        let mut contact = parse_vcards(STRUCTURED_VALUES, "book", "c.vcf")
+            .into_iter()
+            .next()
+            .expect("a card");
+        contact.organisation = Some("Engines; Ltd".into());
+        contact.organisation_units = vec!["R&D".into()];
+
+        let out = unfolded(&patch_vcard(&contact.raw, &contact).expect("patched"));
+        // The semicolon *inside* a component is escaped; the one separating
+        // components is not.
+        assert!(out.contains("ORG:Engines\\; Ltd;R&D"), "{out}");
+    }
+
+    #[test]
+    fn a_category_containing_a_comma_stays_one_category() {
+        // calcard unescapes `friends\, close` into a single value correctly;
+        // the parser then re-split it on the comma, so one category became
+        // two and the escape was gone for good on the next save.
+        let contact = parse_vcards(STRUCTURED_VALUES, "book", "c.vcf")
+            .into_iter()
+            .next()
+            .expect("a card");
+        assert_eq!(
+            contact.categories,
+            ["work", "friends, close", "vip"],
+            "a category was split on its own escaped comma"
+        );
+
+        let out = unfolded(&patch_vcard(&contact.raw, &contact).expect("patched"));
+        assert!(
+            out.contains("CATEGORIES:work,friends\\, close,vip"),
+            "the escape was not written back:\n{out}"
+        );
+    }
 
     /* ------------- parameters on lines the writer rebuilds ------------- */
 

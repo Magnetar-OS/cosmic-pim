@@ -184,6 +184,16 @@ pub struct Contact {
     pub phones: Vec<Typed>,
     pub addresses: Vec<Address>,
     pub organisation: Option<String>,
+    /// The `ORG` units beneath the organisation name — RFC 6350 §6.6.4 makes
+    /// ORG a hierarchy, `Company;Division;Team`, and this carries everything
+    /// after the first component.
+    ///
+    /// Separate from `organisation` because a UI wants the company name, not
+    /// a semicolon-joined string, and because the components have to be
+    /// escaped individually: writing the hierarchy back through one field
+    /// would escape its separators and turn three components into one name
+    /// containing semicolons.
+    pub organisation_units: Vec<String>,
     pub title: Option<String>,
     pub note: Option<String>,
     pub birthday: Option<NaiveDate>,
@@ -244,6 +254,7 @@ impl Contact {
             phones: Vec::new(),
             addresses: Vec::new(),
             organisation: None,
+            organisation_units: Vec::new(),
             title: None,
             note: None,
             birthday: None,
