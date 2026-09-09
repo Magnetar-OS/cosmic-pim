@@ -180,6 +180,38 @@ pub fn read_todos(meta: &CalendarMeta) -> Vec<Todo> {
     out
 }
 
+/// Removes one record from its file, deleting the file only when nothing is
+/// left in it.
+///
+/// A `.ics` may hold several records — two tasks, an imported pair of events,
+/// a series beside an unrelated event — so unlinking the file to delete one of
+/// them takes the others with it. Rewrite when something remains; unlink when
+/// nothing does, because an empty calendar document is not worth keeping.
+pub fn remove_record(
+    meta: &CalendarMeta,
+    file_name: &str,
+    component: &str,
+    uid: &str,
+) -> Result<(), StoreError> {
+    if meta.read_only {
+        return Err(StoreError::ReadOnly(meta.name.clone()));
+    }
+    let path = meta.path.join(file_name);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match crate::ical::remove_by_uid(&text, component, uid) {
+            Some(rest) => atomic::write(&path, &rest, None)
+                .map(|_| ())
+                .map_err(Into::into),
+            // Nothing of value would be left, or the record was not in there.
+            None => delete_event(meta, file_name),
+        },
+        // Already gone; deleting what is not there is not an error a user can
+        // act on.
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(why) => Err(why.into()),
+    }
+}
+
 /// Writes a task to its collection, atomically.
 ///
 /// An existing document is patched, never replaced. A `.ics` may hold more

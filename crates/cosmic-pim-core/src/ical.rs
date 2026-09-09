@@ -1461,6 +1461,85 @@ fn exdate_line(event: &Event, exdate: NaiveDateTime) -> String {
     }
 }
 
+/// Removes every `component` carrying `uid`, leaving the rest of the document
+/// byte-for-byte.
+///
+/// `None` when nothing would be left worth keeping — no VEVENT and no VTODO
+/// remain — in which case the caller should delete the file rather than write
+/// an empty calendar. `None` is also returned when no component matched, since
+/// there is then nothing to write.
+///
+/// This exists because deleting a record used to unlink its whole file. A
+/// `.ics` may hold several records: two tasks, an imported pair of events with
+/// different UIDs, a series beside an unrelated event. Unlinking took all of
+/// them, so deleting one task silently deleted another the user never chose.
+/// It is the delete twin of the write bug that [`upsert_vtodo`] fixed, on the
+/// same files, in the opposite direction.
+///
+/// Every component sharing the uid goes: a recurring event's overrides are the
+/// same event as their master, and leaving them behind would resurrect the
+/// series as a scatter of orphaned instances.
+#[must_use]
+pub fn remove_by_uid(text: &str, component: &str, uid: &str) -> Option<String> {
+    let lines = crate::patch::logical_lines(text);
+
+    // One pass to decide, because a component's UID is not known until its
+    // lines have been read, and the decision covers the whole range.
+    let mut ranges: Vec<(usize, usize, bool)> = Vec::new(); // start, end, remove
+    let mut records_kept = 0usize;
+    let mut start = None;
+    let mut is_record = false;
+    let mut matches = false;
+    let mut nested = 0usize;
+
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(name) = line.begins() {
+            if start.is_some() {
+                nested += 1;
+            } else if name.eq_ignore_ascii_case("VEVENT") || name.eq_ignore_ascii_case("VTODO") {
+                start = Some(i);
+                is_record = name.eq_ignore_ascii_case(component);
+                matches = false;
+            }
+            continue;
+        }
+        if line.ends().is_some() {
+            if nested > 0 {
+                nested -= 1;
+            } else if let Some(from) = start.take() {
+                let remove = is_record && matches;
+                if !remove {
+                    records_kept += 1;
+                }
+                ranges.push((from, i, remove));
+            }
+            continue;
+        }
+        if start.is_some() && nested == 0 && line.name() == "UID" && line.value().trim() == uid {
+            matches = true;
+        }
+    }
+
+    if !ranges.iter().any(|(_, _, remove)| *remove) {
+        return None;
+    }
+    if records_kept == 0 {
+        // Nothing left but the calendar wrapper.
+        return None;
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        let dropped = ranges
+            .iter()
+            .any(|(from, to, remove)| *remove && i >= *from && i <= *to);
+        if !dropped {
+            out.push_str(line.raw());
+        }
+    }
+    Some(out)
+}
+
 /// Removes the VEVENT whose `RECURRENCE-ID` matches `rid` from a document.
 ///
 /// Returns `None` when no component matches, or when the match is the only

@@ -370,7 +370,7 @@ impl Store {
             .clone();
 
         if let Some(event) = self.index.event(calendar_id, uid)? {
-            vdir::delete_event(&meta, &event.file_name)?;
+            vdir::remove_record(&meta, &event.file_name, "VEVENT", uid)?;
         }
         self.index.sync_calendar(&meta)?;
         Ok(())
@@ -723,7 +723,7 @@ impl Store {
             .clone();
 
         if let Some(todo) = vdir::read_todos(&meta).into_iter().find(|t| t.uid == uid) {
-            vdir::delete_event(&meta, &todo.file_name)?;
+            vdir::remove_record(&meta, &todo.file_name, "VTODO", uid)?;
         }
         Ok(())
     }
@@ -912,6 +912,137 @@ mod tests {
         assert_eq!(
             instants(&store),
             vec![day(2026, 8, 4), day(2026, 8, 18), day(2026, 8, 25)]
+        );
+    }
+
+    #[test]
+    fn deleting_one_task_leaves_the_other_tasks_in_its_file() {
+        // The delete twin of the write bug: `write_todo` no longer serialises
+        // one task over its file's siblings, but deleting one still unlinked
+        // the whole file, so the siblings went with it. Same records, same
+        // file, opposite operation.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VTODO\r\nUID:task-1@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+SUMMARY:Buy milk\r\nEND:VTODO\r\n\
+BEGIN:VTODO\r\nUID:task-2@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+SUMMARY:File taxes\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("tasks.ics"), ics).unwrap();
+        store.refresh().unwrap();
+        assert_eq!(store.todos(&HashSet::new()).len(), 2);
+
+        store.delete_todo(&cal.id, "task-1@example.com").unwrap();
+
+        let left = store.todos(&HashSet::new());
+        assert_eq!(
+            left.len(),
+            1,
+            "deleting one task removed {} of 2",
+            2 - left.len()
+        );
+        assert_eq!(left[0].uid, "task-2@example.com");
+        assert!(
+            cal.path.join("tasks.ics").exists(),
+            "the file was unlinked while it still held a task"
+        );
+    }
+
+    #[test]
+    fn deleting_one_event_leaves_the_other_events_in_its_file() {
+        // Two events with DIFFERENT uids in one file. Non-conforming for vdir,
+        // but `import_ics` produces it and so does any hand-dropped export —
+        // and "our own layout never does this" is exactly the reasoning that
+        // hid the same bug in tasks and in contacts.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VEVENT\r\nUID:alpha@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:Alpha\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:beta@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260805T090000Z\r\nDTEND:20260805T100000Z\r\nSUMMARY:Beta\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("both.ics"), ics).unwrap();
+        store.refresh().unwrap();
+        assert!(store.event(&cal.id, "alpha@example.com").unwrap().is_some());
+        assert!(store.event(&cal.id, "beta@example.com").unwrap().is_some());
+
+        store.delete(&cal.id, "alpha@example.com").unwrap();
+
+        assert!(
+            store.event(&cal.id, "alpha@example.com").unwrap().is_none(),
+            "the deleted event survived"
+        );
+        assert!(
+            store.event(&cal.id, "beta@example.com").unwrap().is_some(),
+            "deleting one event took an unrelated event with it"
+        );
+        assert!(cal.path.join("both.ics").exists());
+    }
+
+    #[test]
+    fn deleting_a_series_takes_its_overrides_but_nothing_else() {
+        // A master and its override share a UID and must go together; an
+        // unrelated event in the same file must not.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VEVENT\r\nUID:series@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:Weekly\r\n\
+RRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:series@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+RECURRENCE-ID:20260811T090000Z\r\nDTSTART:20260811T140000Z\r\n\
+DTEND:20260811T150000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:other@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260806T090000Z\r\nDTEND:20260806T100000Z\r\nSUMMARY:Unrelated\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("mixed.ics"), ics).unwrap();
+        store.refresh().unwrap();
+
+        store.delete(&cal.id, "series@example.com").unwrap();
+
+        assert!(
+            store
+                .event(&cal.id, "series@example.com")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.event(&cal.id, "other@example.com").unwrap().is_some(),
+            "the unrelated event was deleted with the series"
+        );
+        let on_disk = std::fs::read_to_string(cal.path.join("mixed.ics")).unwrap();
+        assert!(
+            !on_disk.contains("SUMMARY:Moved"),
+            "the override survived its master"
+        );
+        assert_eq!(on_disk.matches("BEGIN:VEVENT").count(), 1);
+    }
+
+    #[test]
+    fn deleting_the_last_record_removes_the_file() {
+        // The other half of the rule: rewrite when something remains, unlink
+        // when nothing does. An empty VCALENDAR is not worth keeping.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VEVENT\r\nUID:only@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:Only\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("only.ics"), ics).unwrap();
+        store.refresh().unwrap();
+
+        store.delete(&cal.id, "only@example.com").unwrap();
+
+        assert!(store.event(&cal.id, "only@example.com").unwrap().is_none());
+        assert!(
+            !cal.path.join("only.ics").exists(),
+            "an emptied file was left behind"
         );
     }
 
