@@ -907,6 +907,111 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_series_with_an_override_survives_an_exclusion_and_an_edit() {
+        // The whole path at once, in the shape a user actually hits: a series
+        // another client wrote and someone else has already modified, from
+        // which a *different* occurrence is deleted and the rest then
+        // renamed. It exists because the parts passing individually was not
+        // enough — the patcher's END-line bug only appeared when a master and
+        // its override shared a file, and it made `exclude_occurrence`
+        // silently do nothing while every narrower test still passed.
+        //
+        // The excluded instance is deliberately NOT the overridden one, so
+        // both components stay in the file and the edit has something to
+        // preserve. Excluding the overridden instance is its own case, and
+        // removes the override by design — see the test below.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example Corp//EN\r\n\
+BEGIN:VEVENT\r\nUID:series@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\n\
+SUMMARY;LANGUAGE=en-gb:Weekly sync\r\nRRULE:FREQ=WEEKLY;INTERVAL=1\r\n\
+ORGANIZER;CN=Ada:mailto:ada@example.com\r\n\
+ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:bob@example.com\r\n\
+ATTENDEE;CN=Cleo;DELEGATED-FROM=\"mailto:dan@example.com\":mailto:cleo@example.com\r\n\
+STATUS:CONFIRMED\r\nX-WHICH:master\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:series@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+RECURRENCE-ID:20260811T090000Z\r\n\
+DTSTART:20260811T140000Z\r\nDTEND:20260811T150000Z\r\n\
+SUMMARY:Weekly sync (moved)\r\nX-WHICH:override\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("series.ics"), ics).unwrap();
+        store.refresh().unwrap();
+
+        assert_eq!(
+            instants(&store),
+            vec![
+                day(2026, 8, 4),
+                day(2026, 8, 11),
+                day(2026, 8, 18),
+                day(2026, 8, 25)
+            ]
+        );
+
+        // Delete an ordinary occurrence while the override sits in the same
+        // file. This is where the EXDATE used to land in the override.
+        let cut = instance_on(&store, day(2026, 8, 18));
+        store
+            .exclude_occurrence(&cal.id, "series@example.com", cut)
+            .unwrap();
+        assert_eq!(
+            instants(&store),
+            vec![day(2026, 8, 4), day(2026, 8, 11), day(2026, 8, 25)],
+            "the excluded occurrence came back — the EXDATE did not reach the master"
+        );
+
+        // Then an ordinary rename of the series.
+        let mut master = store
+            .event(&cal.id, "series@example.com")
+            .unwrap()
+            .expect("the master is indexed");
+        master.summary = "Weekly sync (renamed)".into();
+        store.save(&master).unwrap();
+
+        // Unfolded, because a 75-octet fold is correct output and asserting on
+        // wrapped bytes would test the folder rather than what survived.
+        let on_disk = std::fs::read_to_string(cal.path.join("series.ics")).unwrap();
+        let unfolded: String = crate::patch::logical_lines(&on_disk)
+            .iter()
+            .map(|line| format!("{}\n", line.unfolded()))
+            .collect();
+
+        for survivor in [
+            // The guest list, with the parameters the model has no field for.
+            "ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:bob@example.com",
+            "DELEGATED-FROM=\"mailto:dan@example.com\"",
+            "ORGANIZER;CN=Ada:mailto:ada@example.com",
+            // Properties the model does not interpret, on both components.
+            "STATUS:CONFIRMED",
+            "X-WHICH:master",
+            "X-WHICH:override",
+            // A parameter on a property the model DOES own — the residual a
+            // re-serialising writer could never have kept.
+            "SUMMARY;LANGUAGE=en-gb:Weekly sync (renamed)",
+            // The override is still its own component, with its own summary.
+            "SUMMARY:Weekly sync (moved)",
+            // And the exclusion is on the master, where it belongs.
+            "EXDATE:20260818T090000Z",
+        ] {
+            assert!(
+                unfolded.contains(survivor),
+                "an edit destroyed {survivor:?}:\n{unfolded}"
+            );
+        }
+        assert_eq!(
+            unfolded.matches("BEGIN:VEVENT").count(),
+            2,
+            "the components were merged or duplicated:\n{unfolded}"
+        );
+        assert_eq!(
+            unfolded.matches("EXDATE").count(),
+            1,
+            "the exclusion was written twice:\n{unfolded}"
+        );
+    }
+
+    #[test]
     fn excluding_an_overridden_occurrence_removes_the_override_too() {
         let (_dir, mut store) = store();
         let (_cal, master) = weekly_series(&mut store);
