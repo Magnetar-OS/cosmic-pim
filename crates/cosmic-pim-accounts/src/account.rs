@@ -378,6 +378,9 @@ pub struct AccountStore {
     path: PathBuf,
     secrets: SecretStore,
     accounts: Vec<Account>,
+    /// The ids this handle has seen on disk, so [`Self::save`] can tell an
+    /// account it never knew about from one it deliberately removed.
+    known: std::collections::HashSet<String>,
 }
 
 impl AccountStore {
@@ -388,21 +391,24 @@ impl AccountStore {
     }
 
     pub fn open(path: &Path, secrets: SecretStore) -> Result<Self> {
-        let accounts = match std::fs::read_to_string(path) {
-            Ok(text) => {
-                toml::from_str::<AccountsFile>(&text)
-                    .map_err(|why| Error::config(format!("{}: {why}", path.display())))?
-                    .accounts
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-
+        let accounts = Self::read(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             secrets,
+            known: accounts.iter().map(|a| a.id.clone()).collect(),
             accounts,
         })
+    }
+
+    /// The accounts currently on disk, or none when the file is not there yet.
+    fn read(path: &Path) -> Result<Vec<Account>> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(toml::from_str::<AccountsFile>(&text)
+                .map_err(|why| Error::config(format!("{}: {why}", path.display())))?
+                .accounts),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     #[must_use]
@@ -563,11 +569,34 @@ impl AccountStore {
         self.save()
     }
 
-    fn save(&self) -> Result<()> {
-        let text = toml::to_string_pretty(&AccountsFile {
-            accounts: self.accounts.clone(),
-        })
-        .map_err(Error::config)?;
+    /// Writes the accounts, merged with whatever is on disk *now*.
+    ///
+    /// The suite runs sync in an app and in a daemon, and both need
+    /// credentials, so both hold a store over one `accounts.toml`. Writing
+    /// this handle's list wholesale made whichever process saved second
+    /// discard the other's work — and one of the writers is
+    /// `cosmic_pim_auth::resolve` persisting a refreshed OAuth token, which
+    /// is a credential the user must re-authenticate to replace.
+    ///
+    /// Merging is per account rather than per file, which is the granularity
+    /// the conflict actually has: two processes touching different accounts
+    /// both succeed, and only two touching the same one race — where last
+    /// writer wins, as it must without locking. A deletion is not undone by
+    /// the merge, because `known` distinguishes an account this handle
+    /// removed from one it simply never saw.
+    fn save(&mut self) -> Result<()> {
+        let mut merged = self.accounts.clone();
+        for account in Self::read(&self.path)? {
+            let held = self.accounts.iter().any(|a| a.id == account.id);
+            let deleted_here = self.known.contains(&account.id);
+            if !held && !deleted_here {
+                merged.push(account);
+            }
+        }
+        self.known = merged.iter().map(|a| a.id.clone()).collect();
+
+        let text =
+            toml::to_string_pretty(&AccountsFile { accounts: merged }).map_err(Error::config)?;
 
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -597,6 +626,89 @@ mod tests {
             "https://caldav.fastmail.com/",
             "me@fastmail.com",
         )
+    }
+
+    #[test]
+    fn a_second_handle_does_not_overwrite_the_first_ones_work() {
+        // The suite runs sync in an app *and* a daemon, and both need
+        // credentials, so both hold an AccountStore over one accounts.toml.
+        // `save` writes the whole file from its own in-memory list with no
+        // guard, so whichever writes second silently discards the other's
+        // work — and one of the writers is `auth::resolve` persisting a
+        // refreshed OAuth token, which is a credential the user has to
+        // re-authenticate to replace.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("accounts.toml");
+        let secrets = || SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+
+        let mut first = AccountStore::open(&path, secrets()).unwrap();
+        first.add(account(), "hunter2").unwrap();
+
+        // A second process opens the same file — it sees the account above.
+        let mut second = AccountStore::open(&path, secrets()).unwrap();
+        assert_eq!(second.accounts().len(), 1);
+
+        // The first adds another account…
+        let mut extra = account();
+        extra.display_name = "Work".into();
+        extra.id = "work-account".into();
+        first.add(extra, "hunter3").unwrap();
+
+        // …and the second then saves its own (now stale) view.
+        let mut theirs = account();
+        theirs.display_name = "Personal".into();
+        theirs.id = "personal-account".into();
+        second.add(theirs, "hunter4").unwrap();
+
+        // Both writes must survive: neither process asked for the other's
+        // account to be deleted.
+        let reread = AccountStore::open(&path, secrets()).unwrap();
+        let names: Vec<&str> = reread
+            .accounts()
+            .iter()
+            .map(|a| a.display_name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Work"),
+            "the second handle's save discarded the first's account: {names:?}"
+        );
+        assert!(
+            names.contains(&"Personal"),
+            "the second handle's own account is missing: {names:?}"
+        );
+    }
+
+    #[test]
+    fn merging_on_save_does_not_resurrect_a_deleted_account() {
+        // The half of the merge that is easy to get wrong: an account absent
+        // from this handle's list is either one it never saw — keep it — or
+        // one it just deleted — do not bring it back. Without the
+        // distinction, "remove account" would appear to work and then undo
+        // itself on the next save.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("accounts.toml");
+        let secrets = || SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+
+        let mut store = AccountStore::open(&path, secrets()).unwrap();
+        store.add(account(), "hunter2").unwrap();
+        let id = store.accounts()[0].id.clone();
+
+        store.remove(&id).unwrap();
+        assert!(store.accounts().is_empty());
+
+        // A later save must not bring it back from the copy still on disk.
+        let mut another = account();
+        another.id = "second-account".into();
+        another.display_name = "Second".into();
+        store.add(another, "hunter3").unwrap();
+
+        let reread = AccountStore::open(&path, secrets()).unwrap();
+        let ids: Vec<&str> = reread.accounts().iter().map(|a| a.id.as_str()).collect();
+        assert!(
+            !ids.contains(&id.as_str()),
+            "the deleted account came back: {ids:?}"
+        );
+        assert_eq!(ids, ["second-account"]);
     }
 
     #[test]
