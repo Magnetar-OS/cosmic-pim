@@ -785,6 +785,227 @@ fn write_vtodo(todo: &Todo, out: &mut String) {
     fold_line("END:VTODO", out);
 }
 
+/// Rewrites one VTODO's modelled properties in place, or adds the component
+/// when the document does not hold it yet.
+///
+/// The task counterpart of [`upsert_vevent`], and it closes a worse hole than
+/// that one had. Saving a task used to write `todo_to_ics` over the whole
+/// file, so a `.ics` holding two VTODOs lost the one that was not being saved
+/// — an unrelated task, gone — along with any VTIMEZONE, and every property
+/// the model does not carry: ORGANIZER, ATTENDEE, CLASS, URL, `X-`, and the
+/// parameters on modelled properties.
+///
+/// Components are located by UID, since a VTODO has no RECURRENCE-ID in any
+/// shape this suite produces. `Todo` needs no `other` field to go with this,
+/// unlike `Event`: there is no task equivalent of `to_ics_collection`, so the
+/// only path that serialises a task from nothing is a file that does not
+/// exist yet, where there is nothing to preserve. An export path added later
+/// would need one.
+#[must_use]
+pub fn upsert_vtodo(text: &str, todo: &Todo) -> String {
+    use crate::patch::{Edit, logical_lines, patch_nth_component, terminator_of};
+
+    let target = todo_uids(text).iter().position(|uid| uid == &todo.uid);
+
+    if let Some(index) = target {
+        let source = component_params_of(text, "VTODO", index);
+        let keep = |property: &str, value: &str| -> String {
+            let params = source
+                .get(property)
+                .and_then(|all| all.first())
+                .map_or("", String::as_str);
+            format!("{property}{params}:{value}")
+        };
+        let datetime = |property: &str, time: EventTime| -> String {
+            let generated = datetime_line(property, time);
+            let foreign = source
+                .get(property)
+                .and_then(|all| all.first())
+                .map_or_else(String::new, |params| {
+                    params_except(params, &["VALUE", "TZID"])
+                });
+            if foreign.is_empty() {
+                return generated;
+            }
+            match crate::patch::find_unquoted_colon(&generated) {
+                Some(colon) => format!("{}{foreign}{}", &generated[..colon], &generated[colon..]),
+                None => generated,
+            }
+        };
+
+        let mut edits = BTreeMap::new();
+        let one = |edits: &mut BTreeMap<String, Edit>, property: &str, line: String| {
+            edits.insert(property.to_owned(), Edit::set(vec![line]));
+        };
+
+        // UID is the identity the component was found by, so it is never
+        // rewritten.
+        let dtstamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        one(&mut edits, "DTSTAMP", keep("DTSTAMP", &dtstamp));
+        one(
+            &mut edits,
+            "SUMMARY",
+            keep("SUMMARY", &escape_text(&todo.summary)),
+        );
+        one(&mut edits, "STATUS", keep("STATUS", todo.status.as_ical()));
+        let last_modified = todo
+            .last_modified
+            .unwrap_or_else(Utc::now)
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string();
+        one(
+            &mut edits,
+            "LAST-MODIFIED",
+            keep("LAST-MODIFIED", &last_modified),
+        );
+
+        for (property, time) in [("DUE", todo.due), ("DTSTART", todo.start)] {
+            match time {
+                Some(time) => one(&mut edits, property, datetime(property, time)),
+                None => {
+                    edits.insert(property.to_owned(), Edit::remove());
+                }
+            }
+        }
+
+        match &todo.description {
+            Some(description) => one(
+                &mut edits,
+                "DESCRIPTION",
+                keep("DESCRIPTION", &escape_text(description)),
+            ),
+            None => {
+                edits.insert("DESCRIPTION".to_owned(), Edit::remove());
+            }
+        }
+
+        for (property, value) in [
+            ("PRIORITY", u32::from(todo.priority)),
+            ("PERCENT-COMPLETE", u32::from(todo.percent_complete)),
+            ("SEQUENCE", u32::try_from(todo.sequence.max(0)).unwrap_or(0)),
+        ] {
+            if value > 0 {
+                one(&mut edits, property, keep(property, &value.to_string()));
+            } else {
+                edits.insert(property.to_owned(), Edit::remove());
+            }
+        }
+
+        match todo.completed {
+            Some(completed) => one(
+                &mut edits,
+                "COMPLETED",
+                keep("COMPLETED", &completed.format("%Y%m%dT%H%M%SZ").to_string()),
+            ),
+            None => {
+                edits.insert("COMPLETED".to_owned(), Edit::remove());
+            }
+        }
+
+        match &todo.rrule {
+            // Structured, not TEXT: escaping would corrupt its semicolons.
+            Some(rrule) => one(&mut edits, "RRULE", keep("RRULE", rrule.trim())),
+            None => {
+                edits.insert("RRULE".to_owned(), Edit::remove());
+            }
+        }
+
+        match &todo.related_to {
+            Some(parent) => one(
+                &mut edits,
+                "RELATED-TO",
+                keep("RELATED-TO", &escape_text(parent)),
+            ),
+            None => {
+                edits.insert("RELATED-TO".to_owned(), Edit::remove());
+            }
+        }
+
+        if todo.categories.is_empty() {
+            edits.insert("CATEGORIES".to_owned(), Edit::remove());
+        } else {
+            let list = todo
+                .categories
+                .iter()
+                .map(|c| escape_text(c))
+                .collect::<Vec<_>>()
+                .join(",");
+            one(&mut edits, "CATEGORIES", keep("CATEGORIES", &list));
+        }
+
+        if let Some(created) = todo.created {
+            one(
+                &mut edits,
+                "CREATED",
+                keep("CREATED", &created.format("%Y%m%dT%H%M%SZ").to_string()),
+            );
+        }
+
+        if let Some(patched) = patch_nth_component(text, "VTODO", index, &edits) {
+            return patched;
+        }
+    }
+
+    // Not in the document yet: serialise the component and add it before the
+    // calendar closes, leaving every existing component alone.
+    let terminator = terminator_of(text);
+    let mut component = String::new();
+    write_vtodo(todo, &mut component);
+    let component = if terminator == "\n" {
+        component.replace("\r\n", "\n")
+    } else {
+        component
+    };
+
+    let lines = logical_lines(text);
+    let mut out = String::with_capacity(text.len() + component.len());
+    let mut inserted = false;
+    for line in &lines {
+        if !inserted && line.ends().as_deref() == Some("VCALENDAR") {
+            out.push_str(&component);
+            inserted = true;
+        }
+        out.push_str(line.raw());
+    }
+    if !inserted {
+        out.push_str(&component);
+    }
+    out
+}
+
+/// The UID of every VTODO in a document, in document order.
+fn todo_uids(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    let mut nested = 0usize;
+    let mut uid: Option<String> = None;
+
+    for line in crate::patch::logical_lines(text) {
+        if let Some(component) = line.begins() {
+            if inside {
+                nested += 1;
+            } else if component.eq_ignore_ascii_case("VTODO") {
+                inside = true;
+                uid = None;
+            }
+            continue;
+        }
+        if line.ends().is_some() {
+            if nested > 0 {
+                nested -= 1;
+            } else if inside {
+                out.push(uid.take().unwrap_or_default());
+                inside = false;
+            }
+            continue;
+        }
+        if inside && nested == 0 && line.name() == "UID" {
+            uid = Some(line.value().trim().to_owned());
+        }
+    }
+    out
+}
+
 /* ------------------------------------------------------------------ */
 /* Recurrence identity                                                */
 
@@ -1007,7 +1228,7 @@ pub fn upsert_vevent(text: &str, event: &Event) -> String {
 fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
     use crate::patch::{Edit, patch_nth_component};
 
-    let source = component_params(text, index);
+    let source = component_params_of(text, "VEVENT", index);
     let keep = |property: &str, occurrence: usize, value: &str| -> String {
         let params = source
             .get(property)
@@ -1137,22 +1358,26 @@ fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
     patch_nth_component(text, "VEVENT", index, &edits)
 }
 
-/// The parameter section of every property occurrence inside one VEVENT, in
-/// document order — `";LANGUAGE=en-us"`, or `""` where there were none.
+/// The parameter section of every property occurrence inside the `index`-th
+/// component named `component`, in document order — `";LANGUAGE=en-us"`, or
+/// `""` where there were none.
+///
+/// What lets a rewritten property keep the parameters the source gave it,
+/// which is the whole difference between patching and re-serialising.
 ///
 /// Nested components are skipped for the same reason [`vevent_extras`] skips
 /// them: a VALARM's DESCRIPTION is not the event's.
-fn component_params(text: &str, index: usize) -> BTreeMap<String, Vec<String>> {
+fn component_params_of(text: &str, component: &str, index: usize) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut seen = 0usize;
     let mut inside = false;
     let mut nested = 0usize;
 
     for line in crate::patch::logical_lines(text) {
-        if let Some(component) = line.begins() {
+        if let Some(name) = line.begins() {
             if inside {
                 nested += 1;
-            } else if component.eq_ignore_ascii_case("VEVENT") {
+            } else if name.eq_ignore_ascii_case(component) {
                 if seen == index {
                     inside = true;
                 }
@@ -1969,6 +2194,95 @@ mod tests {
 mod preservation_tests {
     use super::*;
 
+    /// A task file another client wrote: two tasks in one document, a
+    /// VTIMEZONE, an alarm, and properties this model has no field for.
+    const FOREIGN_TASKS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Athens\r\nBEGIN:STANDARD\r\nDTSTART:19701025T040000\r\n\
+TZOFFSETFROM:+0300\r\nTZOFFSETTO:+0200\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VTODO\r\nUID:task-1@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+SUMMARY;LANGUAGE=en-gb:Buy milk\r\nDUE;TZID=Europe/Athens:20260805T170000\r\n\
+ORGANIZER;CN=Ada:mailto:ada@example.com\r\n\
+ATTENDEE;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n\
+CLASS:PRIVATE\r\nURL:https://example.com/task/1\r\nX-VENDOR:keep me\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Nudge\r\nTRIGGER:-PT30M\r\nEND:VALARM\r\n\
+END:VTODO\r\n\
+BEGIN:VTODO\r\nUID:task-2@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+SUMMARY:Second task\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn saving_one_task_does_not_delete_the_other_one_in_the_file() {
+        // The hole this closes was worse than the event one: saving a task
+        // wrote a freshly serialised document over the whole file, so an
+        // unrelated task sharing that file was simply gone — not a lost
+        // property, a lost record.
+        let mut first = parse_todos(FOREIGN_TASKS, "cal", "tasks.ics")
+            .into_iter()
+            .find(|t| t.uid == "task-1@example.com")
+            .expect("the first task");
+        first.summary = "Buy oat milk".into();
+
+        let after = upsert_vtodo(FOREIGN_TASKS, &first);
+        let unfolded = unfolded(&after);
+
+        assert!(
+            unfolded.contains("UID:task-2@example.com"),
+            "saving one task deleted the other:\n{unfolded}"
+        );
+        assert!(unfolded.contains("SUMMARY:Second task"));
+        assert_eq!(unfolded.matches("BEGIN:VTODO").count(), 2);
+        assert!(
+            unfolded.contains("SUMMARY;LANGUAGE=en-gb:Buy oat milk"),
+            "{unfolded}"
+        );
+    }
+
+    #[test]
+    fn a_task_edit_keeps_everything_the_model_does_not_carry() {
+        let mut first = parse_todos(FOREIGN_TASKS, "cal", "tasks.ics")
+            .into_iter()
+            .find(|t| t.uid == "task-1@example.com")
+            .expect("the first task");
+        first.summary = "Buy oat milk".into();
+
+        let unfolded = unfolded(&upsert_vtodo(FOREIGN_TASKS, &first));
+        for survivor in [
+            "BEGIN:VTIMEZONE",
+            "TZID:Europe/Athens",
+            "ORGANIZER;CN=Ada:mailto:ada@example.com",
+            "ATTENDEE;PARTSTAT=ACCEPTED:mailto:bob@example.com",
+            "CLASS:PRIVATE",
+            "URL:https://example.com/task/1",
+            "X-VENDOR:keep me",
+            // The alarm, exactly once — re-emitting it would double it.
+            "TRIGGER:-PT30M",
+            // A parameter on a property the model DOES own.
+            "DUE;TZID=Europe/Athens:20260805T170000",
+        ] {
+            assert!(
+                unfolded.contains(survivor),
+                "saving a task destroyed {survivor:?}:\n{unfolded}"
+            );
+        }
+        assert_eq!(unfolded.matches("BEGIN:VALARM").count(), 1);
+    }
+
+    #[test]
+    fn a_task_not_in_the_document_is_added_beside_the_others() {
+        let mut fresh = parse_todos(FOREIGN_TASKS, "cal", "tasks.ics")
+            .into_iter()
+            .next()
+            .expect("a task to clone from");
+        fresh.uid = "task-3@example.com".into();
+        fresh.summary = "A third task".into();
+
+        let unfolded = unfolded(&upsert_vtodo(FOREIGN_TASKS, &fresh));
+        assert_eq!(unfolded.matches("BEGIN:VTODO").count(), 3);
+        assert!(unfolded.contains("UID:task-3@example.com"));
+        // And the two that were already there are untouched.
+        assert!(unfolded.contains("UID:task-1@example.com"));
+        assert!(unfolded.contains("SUMMARY:Second task"));
+    }
+
     /// A foreign invitation: attendees, an organizer, and a spread of
     /// properties this model does not interpret.
     const INVITATION: &str = "BEGIN:VCALENDAR\r\n\
@@ -2010,6 +2324,16 @@ END:VCALENDAR\r\n";
     /// long `ATTENDEE` line has a CRLF and a space through the middle of its
     /// address. Every reader unfolds before interpreting; these assertions
     /// are about what survives, not where the folds fall.
+    /// A document with its folds removed, so assertions match on content
+    /// rather than on where the 75-octet wrap happened to fall.
+    fn unfolded(text: &str) -> String {
+        crate::patch::logical_lines(text)
+            .iter()
+            .map(|line| line.unfolded().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn written(event: &Event) -> String {
         let out = to_ics(event);
         crate::patch::logical_lines(&out)

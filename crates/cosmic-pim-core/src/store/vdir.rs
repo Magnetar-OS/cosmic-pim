@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 // callers.
 pub use crate::ical::{
     format_iso_duration, parse_ics, parse_iso_duration, parse_todos, remove_vevent, to_ics,
-    todo_to_ics, upsert_vevent,
+    todo_to_ics, upsert_vevent, upsert_vtodo,
 };
 
 /// Where calendars live by default: `$XDG_DATA_HOME/calendars`.
@@ -181,12 +181,22 @@ pub fn read_todos(meta: &CalendarMeta) -> Vec<Todo> {
 }
 
 /// Writes a task to its collection, atomically.
+///
+/// An existing document is patched, never replaced. A `.ics` may hold more
+/// than one VTODO, so serialising this task over the whole file would delete
+/// the others outright — along with any VTIMEZONE and everything the model
+/// does not carry. Only a file that does not exist yet is written from the
+/// model, where there is nothing to lose.
 pub fn write_todo(meta: &CalendarMeta, todo: &Todo) -> Result<(), StoreError> {
     if meta.read_only {
         return Err(StoreError::ReadOnly(meta.name.clone()));
     }
     let target = meta.path.join(&todo.file_name);
-    atomic::write(&target, &todo_to_ics(todo), None)
+    let text = match std::fs::read_to_string(&target) {
+        Ok(existing) if !existing.trim().is_empty() => upsert_vtodo(&existing, todo),
+        _ => todo_to_ics(todo),
+    };
+    atomic::write(&target, &text, None)
         .map(|_| ())
         .map_err(Into::into)
 }
