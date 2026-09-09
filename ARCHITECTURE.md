@@ -204,12 +204,36 @@ any value mid-word, and a `contains` that cannot see across the continuation
 reads correct folding as data loss, which is how a correct folder gets
 "fixed".
 
-There is a matching obligation on the application, which the substrate cannot
-enforce. Parameters and components travel *in* the model entry, so an editor
-that rebuilds an entry from its own field state — an ordinary way to write
-one — hands the writer an empty entry and drops everything just as
-thoroughly, with every test here still passing. An app must mutate its
-entries in place, and should pin that with a test of its own.
+**Every rung has two failure modes**, and they are not the same bug seen
+twice. One is that *the model is narrower than the format* — the fixes above.
+The other is that *the interface is narrower than the model*, and fixing the
+first only makes the second visible. Both lose the same data, and an
+application can be perfectly correct about one while losing everything to the
+other.
+
+Two forms of the second, both found in an editor within an hour of the
+matching substrate fix landing:
+
+- **Do not rebuild an entry from field state.** Parameters and components
+  travel *in* the model entry, so an editor that reconstructs each entry from
+  its own widgets hands the writer an empty one and drops everything, with
+  every test here still passing.
+- **Do not render a list to a flat string and parse the string back.** An
+  interface that shows categories as one comma-separated field and splits
+  that field on save turns `friends\, close` into two categories — no matter
+  what the parser does, because the interface flattened the value and then
+  parsed its own flattening. If a display must flatten, it has to escape in
+  the format's own spelling and honour the escape coming back.
+
+The substrate has projections of its own, and they were checked rather than
+assumed: the SQLite index joins attendee and unmodelled lines with `\n`,
+which is safe because an unfolded content line cannot contain one, and its
+two comma-joined columns carry integers only. Contacts do not pass through
+the index at all.
+
+An app must mutate its entries in place and must not round-trip a value
+through a display string. Both belong in the app's own tests: the substrate
+cannot see either mistake.
 
 This table is a record of what has been checked, not a claim that the list is
 complete — that claim was made twice during the sweep and was wrong both
