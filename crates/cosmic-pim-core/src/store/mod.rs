@@ -660,7 +660,11 @@ impl Store {
         moved.calendar_id = to.to_owned();
         self.save(&moved)?;
 
-        vdir::delete_event(&from_meta, &event.file_name)?;
+        // Remove just this event from its old file. Unlinking the file took
+        // any other record sharing it, which is the same bug the standalone
+        // delete paths had — a move is a write plus a delete, and it is the
+        // delete half that needs the care.
+        vdir::remove_record(&from_meta, &event.file_name, "VEVENT", &event.uid)?;
         self.index.sync_calendar(&from_meta)?;
         Ok(moved)
     }
@@ -1002,6 +1006,54 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         let long_a = format!("{}-one@example.com", "x".repeat(140));
         let long_b = format!("{}-two@example.com", "x".repeat(140));
         assert_ne!(sanitise_file_stem(&long_a), sanitise_file_stem(&long_b));
+    }
+
+    #[test]
+    fn moving_an_event_out_leaves_its_old_files_other_events_alone() {
+        // A move is a write plus a delete, and the delete half went on
+        // unlinking the whole source file after the standalone delete paths
+        // had been fixed — so moving one event out of a shared file deleted
+        // the others. The earlier fix said "both delete paths"; there were
+        // three.
+        let (_dir, mut store) = store();
+        let from = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        let to = store.create_calendar("Work", Rgb(4, 5, 6)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VEVENT\r\nUID:alpha@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:Alpha\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:beta@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260805T090000Z\r\nDTEND:20260805T100000Z\r\nSUMMARY:Beta\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(from.path.join("both.ics"), ics).unwrap();
+        store.refresh().unwrap();
+
+        let alpha = store
+            .event(&from.id, "alpha@example.com")
+            .unwrap()
+            .expect("alpha is indexed");
+        store.move_to_calendar(&alpha, &to.id).unwrap();
+
+        // The moved event is in its new home.
+        assert!(
+            store.event(&to.id, "alpha@example.com").unwrap().is_some(),
+            "the moved event did not arrive"
+        );
+        // And the one that stayed behind is still where it was.
+        let beta = store.event(&from.id, "beta@example.com").unwrap();
+        assert!(
+            beta.is_some(),
+            "moving one event out of a shared file deleted the other"
+        );
+        assert_eq!(beta.unwrap().summary, "Beta");
+        // Not left in both places.
+        assert!(
+            store
+                .event(&from.id, "alpha@example.com")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

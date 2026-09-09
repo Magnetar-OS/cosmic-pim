@@ -170,6 +170,25 @@ every `atomic::write` call site and deletion does not write. *The boundary of
 an audit is part of its result*: "I checked every write path" reads as "I
 checked every path" to everyone including the person who wrote it.
 
+**The verbs that touch a shared file, and which have been swept.** A `.ics`
+or `.vcf` may hold several records, and every operation that treats one as
+though it held one record corrupts the rest. The bugs came in four verbs, and
+each was found only after someone asked which verbs had *not* been looked at
+— re-sweeping an already-swept verb never found anything:
+
+| Verb | What went wrong | Where it is decided now |
+|---|---|---|
+| Write over an existing file | one record serialised over its neighbours | `upsert_vevent`, `upsert_vtodo`, `patch_vcard` |
+| Delete | unlinked the file, taking the neighbours | `vdir::remove_record`, `ContactStore::delete` |
+| Create at a derived name | two UIDs deriving one name, second written over first | `sanitise_file_stem`, `itip::unused_name`, and the collision loops in `caldav::vdir`/`feed` |
+| Move between collections | a write plus a delete, and the delete half unlinked | `move_to_calendar`, through `remove_record` |
+
+This table is a record of what has been checked, not a claim that the list is
+complete — that claim was made twice during the sweep and was wrong both
+times. *The boundary of an audit is part of its result*: "I checked every
+write path" reads as "I checked every path" to everyone including the person
+who wrote it, and the fix for that is to state the verb, not the conclusion.
+
 **A component is addressed by identity, never by position.** Every one of
 those paths locates its component before touching it — a VEVENT by
 RECURRENCE-ID or UID, a VTODO by UID, a VCARD by UID — because a file holding
