@@ -1638,7 +1638,11 @@ pub fn to_ics(event: &Event) -> String {
 
 /// Serialises several events into one document, for export.
 #[must_use]
-pub fn to_ics_collection(name: &str, events: &[Event]) -> String {
+pub fn to_ics_collection(
+    name: &str,
+    events: &[Event],
+    timezones: &BTreeMap<String, String>,
+) -> String {
     let mut out = String::new();
     fold_line("BEGIN:VCALENDAR", &mut out);
     fold_line("VERSION:2.0", &mut out);
@@ -1646,10 +1650,64 @@ pub fn to_ics_collection(name: &str, events: &[Event]) -> String {
     if !name.is_empty() {
         fold_line(&format!("X-WR-CALNAME:{}", escape_text(name)), &mut out);
     }
+    // Before the events, because a document that names a timezone it never
+    // defines is not one another application can place an event with — and
+    // handing the file to another application is the whole point of an
+    // export. Carrying our own bare TZIDs inside our own vdir is a different
+    // trade, made deliberately in `datetime_line`.
+    for block in timezones.values() {
+        out.push_str(block);
+    }
     for event in events {
         write_vevent(event, &mut out);
     }
     fold_line("END:VCALENDAR", &mut out);
+    out
+}
+
+/// Every VTIMEZONE in `text`, verbatim, keyed by its TZID.
+///
+/// Verbatim and not regenerated: the source's transition rules are the
+/// authority, and synthesising correct ones from an IANA name is a large
+/// amount of machinery for something the file already contains.
+#[must_use]
+pub fn timezones_of(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut current: Option<(String, String)> = None; // tzid, raw
+    let mut nested = 0usize;
+
+    for line in crate::patch::logical_lines(text) {
+        if let Some(component) = line.begins() {
+            if let Some((_, raw)) = current.as_mut() {
+                nested += 1;
+                raw.push_str(line.raw());
+            } else if component.eq_ignore_ascii_case("VTIMEZONE") {
+                current = Some((String::new(), line.raw().to_owned()));
+            }
+            continue;
+        }
+        if line.ends().is_some() {
+            if let Some((tzid, raw)) = current.as_mut() {
+                raw.push_str(line.raw());
+                if nested > 0 {
+                    nested -= 1;
+                } else {
+                    let (tzid, raw) = (std::mem::take(tzid), std::mem::take(raw));
+                    current = None;
+                    if !tzid.is_empty() {
+                        out.entry(tzid).or_insert(raw);
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some((tzid, raw)) = current.as_mut() {
+            raw.push_str(line.raw());
+            if nested == 0 && line.name() == "TZID" {
+                *tzid = line.value().trim().to_owned();
+            }
+        }
+    }
     out
 }
 

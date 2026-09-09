@@ -182,6 +182,7 @@ each was found only after someone asked which verbs had *not* been looked at
 | Delete | unlinked the file, taking the neighbours | `vdir::remove_record`, `ContactStore::delete` |
 | Create at a derived name | two UIDs deriving one name, second written over first | `sanitise_file_stem`, `itip::unused_name`, and the collision loops in `caldav::vdir`/`feed` |
 | Move between collections | a write plus a delete, and the delete half unlinked | `move_to_calendar`, through `remove_record` |
+| Export | contacts emitted a multi-card file once per card; calendars dropped the VTIMEZONE while keeping the `TZID=` references to it | `export_collection`, `ical::timezones_of` |
 
 This table is a record of what has been checked, not a claim that the list is
 complete — that claim was made twice during the sweep and was wrong both

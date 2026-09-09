@@ -236,7 +236,23 @@ pub fn write_todo(meta: &CalendarMeta, todo: &Todo) -> Result<(), StoreError> {
 /// Serialises every event in a collection into a single iCalendar document.
 #[must_use]
 pub fn export_collection(meta: &CalendarMeta) -> String {
-    crate::ical::to_ics_collection(&meta.name, &read_collection(meta))
+    // The zones come from the files themselves: the model has no field for a
+    // VTIMEZONE, so an export built from events alone referenced zones it
+    // never defined.
+    let mut timezones = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&meta.path)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "ics")
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            timezones.extend(crate::ical::timezones_of(&text));
+        }
+    }
+    crate::ical::to_ics_collection(&meta.name, &read_collection(meta), &timezones)
 }
 
 /// Writes an event to its collection, replacing any existing file.

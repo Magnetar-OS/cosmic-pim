@@ -1009,6 +1009,77 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     }
 
     #[test]
+    fn an_export_defines_every_timezone_it_refers_to() {
+        // Export re-serialises from the model, and the model has no field for
+        // a VTIMEZONE — so the component was dropped while the `TZID=`
+        // references to it survived. The result is a document that names a
+        // timezone it never defines, which RFC 5545 §3.6 does not permit and
+        // which a foreign client cannot place the event with. Carrying our
+        // own bare TZIDs inside our own vdir is defensible; handing one to
+        // another application, which is the entire point of export, is not.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Athens\r\nBEGIN:STANDARD\r\n\
+DTSTART:19701025T040000\r\nTZOFFSETFROM:+0300\r\nTZOFFSETTO:+0200\r\n\
+END:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:e@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART;TZID=Europe/Athens:20260804T090000\r\n\
+DTEND;TZID=Europe/Athens:20260804T100000\r\nSUMMARY:Planning\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("e.ics"), ics).unwrap();
+        store.refresh().unwrap();
+
+        let exported = store.export_calendar(&cal.id).unwrap();
+
+        assert!(
+            exported.contains("TZID=Europe/Athens"),
+            "the event lost its timezone reference:\n{exported}"
+        );
+        assert!(
+            exported.contains("BEGIN:VTIMEZONE"),
+            "the export names a timezone it does not define:\n{exported}"
+        );
+        assert!(exported.contains("TZID:Europe/Athens"));
+        // Carried through verbatim rather than regenerated: the transition
+        // rules are the source's, and inventing them is a different job.
+        assert!(exported.contains("TZOFFSETFROM:+0300"), "{exported}");
+    }
+
+    #[test]
+    fn an_export_defines_each_timezone_only_once() {
+        // Two events in different files sharing a zone must not produce two
+        // definitions of it: a duplicate TZID is as non-conforming as a
+        // missing one.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        let one = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Athens\r\nBEGIN:STANDARD\r\n\
+DTSTART:19701025T040000\r\nTZOFFSETFROM:+0300\r\nTZOFFSETTO:+0200\r\n\
+END:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:a@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART;TZID=Europe/Athens:20260804T090000\r\n\
+DTEND;TZID=Europe/Athens:20260804T100000\r\nSUMMARY:A\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("a.ics"), one).unwrap();
+        std::fs::write(
+            cal.path.join("b.ics"),
+            one.replace("a@example.com", "b@example.com"),
+        )
+        .unwrap();
+        store.refresh().unwrap();
+
+        let exported = store.export_calendar(&cal.id).unwrap();
+        assert_eq!(
+            exported.matches("BEGIN:VTIMEZONE").count(),
+            1,
+            "the zone was defined twice:\n{exported}"
+        );
+    }
+
+    #[test]
     fn moving_an_event_out_leaves_its_old_files_other_events_alone() {
         // A move is a write plus a delete, and the delete half went on
         // unlinking the whole source file after the standalone delete paths
