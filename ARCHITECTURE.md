@@ -141,6 +141,46 @@ writeback *patches* that text rather than re-serialising (`caldav::patch`).
 Verbatim storage plus lossy writeback is worse than lossy storage, because the
 loss only becomes visible once it is remote.
 
+**Every write path patches, not just the sync one.** The rule above has two
+enforcement points and only one of them used to be documented, which is how
+all three of the others were re-serialising for as long as they existed. A
+local edit goes through `store::vdir::write_event_if_unchanged`,
+`store::vdir::write_todo` or `store::contacts::write_contact` — none of which
+the sentence above covers — and each one now patches the file it is editing
+(`ical::upsert_vevent`, `ical::upsert_vtodo`, `vcard::patch_vcard`). Only a
+file that does not exist yet is serialised from the model, where there is
+nothing to lose.
+
+The failures this cost were not subtle, and they were found in an afternoon
+once someone looked for the shape rather than the symptom. Saving a task
+wrote one VTODO over a file that could hold several, deleting the other tasks
+in it. Editing an event lost every unmodelled property, and then — after that
+was mitigated — still lost the parameters on modelled ones. Saving a contact
+patched the *first* card in the file rather than the contact's own, so
+editing the second person in an imported address book wrote their name and
+email over the first person's card while leaving that card's UID in place.
+
+**A component is addressed by identity, never by position.** All three of
+those paths locate their component before touching it — a VEVENT by
+RECURRENCE-ID, a VTODO by UID, a VCARD by UID — because a file holding one
+record is the case our own fixtures generate and a file holding many is the
+case every real exporter produces. `patch::patch_nth_component` takes the
+index for the same reason. The related bug underneath them wrote an added
+property into whichever sibling component came last, because it located the
+insertion point by searching the output text for `END:` rather than by the
+index it already had.
+
+Two lessons worth keeping, because both were paid for. *Using the right
+mechanism is not the same claim as being correct*: contacts genuinely did
+edit through the patcher, which is why this document held them up as the
+example and why two people reading the code stopped at that fact — it patched,
+it just patched the wrong component, and a wrong implementation of the right
+pattern is harder to see than a wrong pattern because the reason to look has
+already been answered. And *a comment explaining why something surprising is
+safe does a test's job without a test's guarantees*: the `rfind` above had
+one, it was specific and confident and wrong, and it was read past by
+everyone who touched the file.
+
 **Writeback is queued and durable.** A push that fails and is forgotten diverges
 *permanently*: the server's etag never changed, so the next pull finds nothing
 to reconcile and the edit is lost with no trace. Failed pushes persist in the
