@@ -404,7 +404,35 @@ impl ContactStore {
             };
 
             taken.insert(file_name.clone());
-            write_contact_raw(&meta, &file_name, &segment)?;
+
+            // The card may live in a file holding several people — which is
+            // what the export being imported *is*, and what the book already
+            // holds if one was dropped into it. Writing this card's segment
+            // over that file would delete everybody who shares it, so the
+            // card is replaced inside the file instead.
+            //
+            // Read fresh rather than from `existing`: two cards in this same
+            // import may target the same file, and the second must see what
+            // the first wrote.
+            let path = meta.path.join(&file_name);
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            let text = if current.matches("BEGIN:VCARD").count() > 1 {
+                crate::vcard::replace_vcard(&current, &card.uid, &segment).unwrap_or_else(|| {
+                    // In the file but not locatable by uid — a card with no
+                    // UID of its own. Append rather than overwrite: a
+                    // duplicate is recoverable, a deleted stranger is not.
+                    let mut merged = current.clone();
+                    if !merged.ends_with('\n') {
+                        merged.push_str("\r\n");
+                    }
+                    merged.push_str(&segment);
+                    merged
+                })
+            } else {
+                segment.clone()
+            };
+
+            write_contact_raw(&meta, &file_name, &text)?;
             summary.files.push(file_name);
         }
         Ok(summary)

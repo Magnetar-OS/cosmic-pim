@@ -877,6 +877,31 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     }
 }
 
+/// Replaces the card carrying `uid` in `document` with `replacement`.
+///
+/// For updating one person inside a file that holds several — an import
+/// applying a newer copy of one card, where writing the card over the file
+/// would take everybody else in it with them.
+///
+/// Returns `None` if no card in `document` carries that uid, so a caller
+/// cannot mistake "not there" for "replaced".
+#[must_use]
+pub fn replace_vcard(document: &str, uid: &str, replacement: &str) -> Option<String> {
+    let index = vcard_index_of(document, uid)?;
+    let mut cards = split_vcards(document);
+    if index >= cards.len() {
+        return None;
+    }
+    // A replacement must end in a line break or the next card's BEGIN would
+    // land on the same line as this card's END.
+    let mut replacement = replacement.to_owned();
+    if !replacement.ends_with('\n') {
+        replacement.push_str("\r\n");
+    }
+    cards[index] = replacement;
+    Some(cards.concat())
+}
+
 /// The version declared by the card carrying `uid`, rather than by whichever
 /// card happens to come first in the document.
 ///
@@ -1800,6 +1825,60 @@ PHOTO;ENCODING=b;TYPE=JPEG:OLDOLD==\r\nEND:VCARD\r\n";
 
         assert!(set_photo(&two, "nobody", &[1], "image/png").is_none());
         assert!(remove_photo(&two, "nobody").is_none());
+    }
+
+    /// The import path's need: swap one person inside a file holding several
+    /// without touching the others.
+    #[test]
+    fn replacing_a_card_leaves_its_neighbours_alone() {
+        let two = format!("{V4}{V3}")
+            .replacen("UID:x", "UID:first", 1)
+            .replacen("UID:x", "UID:second", 1);
+        let fresh = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:second\r\nFN:Updated\r\nEND:VCARD\r\n";
+
+        let merged = replace_vcard(&two, "second", fresh).unwrap();
+        assert_eq!(merged.matches("BEGIN:VCARD").count(), 2, "{merged}");
+        assert!(merged.contains("FN:Updated"), "{merged}");
+        assert!(
+            merged.contains("UID:first"),
+            "the other card was lost: {merged}"
+        );
+        // The replaced card's own content is gone — `OLDOLD` is only in the
+        // 3.0 fixture, which is the card that was swapped out. The first
+        // card's `X-KEEP` is still there, and must be.
+        assert!(
+            !merged.contains("OLDOLD"),
+            "the replaced card survived: {merged}"
+        );
+        assert!(
+            merged.contains("X-KEEP:me"),
+            "the untouched card lost content: {merged}"
+        );
+    }
+
+    /// A replacement without a trailing break would put the next card's BEGIN
+    /// on the same line as this card's END.
+    #[test]
+    fn a_replacement_missing_its_line_break_still_joins_cleanly() {
+        let two = format!("{V4}{V3}")
+            .replacen("UID:x", "UID:first", 1)
+            .replacen("UID:x", "UID:second", 1);
+
+        let merged = replace_vcard(&two, "first", "BEGIN:VCARD\r\nUID:first\r\nEND:VCARD").unwrap();
+        assert!(
+            !merged.contains("END:VCARDBEGIN:VCARD"),
+            "two cards ran together: {merged}"
+        );
+        assert_eq!(merged.matches("BEGIN:VCARD").count(), 2);
+    }
+
+    /// "Not there" must not be mistakable for "replaced".
+    #[test]
+    fn replacing_a_card_that_is_absent_is_refused() {
+        let two = format!("{V4}{V3}")
+            .replacen("UID:x", "UID:first", 1)
+            .replacen("UID:x", "UID:second", 1);
+        assert!(replace_vcard(&two, "nobody", "BEGIN:VCARD\r\nEND:VCARD\r\n").is_none());
     }
 
     #[test]
