@@ -1042,6 +1042,16 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
             "the export names a timezone it does not define:\n{exported}"
         );
         assert!(exported.contains("TZID:Europe/Athens"));
+
+        // And it is a calendar, not merely text containing the right
+        // substrings: an export is handed to another application, so the
+        // property that matters is that it parses and reads back as the same
+        // events. `contains` on freshly written text re-asserts the format
+        // string and would not notice a stray fold or a missing END.
+        let back = crate::ical::parse_ics(&exported, &cal.id, "export.ics");
+        assert_eq!(back.len(), 1, "the export did not read back:\n{exported}");
+        assert_eq!(back[0].uid, "e@example.com");
+        assert_eq!(back[0].summary, "Planning");
         // Carried through verbatim rather than regenerated: the transition
         // rules are the source's, and inventing them is a different job.
         assert!(exported.contains("TZOFFSETFROM:+0300"), "{exported}");

@@ -1361,6 +1361,55 @@ FREEBUSY;FBTYPE=BUSY-TENTATIVE:20270104T140000Z/PT1H30M\r\n\
 END:VFREEBUSY\r\n\
 END:VCALENDAR\r\n";
 
+    /// Every payload this module hands to a server or a mail client must
+    /// survive the one parser this suite has.
+    ///
+    /// `contains` on text the builder just wrote cannot tell a valid calendar
+    /// from a plausible-looking one: it re-asserts the format string. These
+    /// builders are hand-rolled — they do not go through `to_ics` — so
+    /// nothing else would catch a stray fold, a missing END, or a component
+    /// nested wrong, and the failure would surface as a server rejecting an
+    /// invitation rather than as a test.
+    fn parses_as_a_calendar(ics: &str) -> usize {
+        let mut parser = calcard::Parser::new(ics);
+        match parser.entry() {
+            calcard::Entry::ICalendar(calendar) => calendar.components.len(),
+            other => panic!("not a calendar: {other:?}\n{ics}"),
+        }
+    }
+
+    #[test]
+    fn every_built_payload_parses_back() {
+        // A free/busy request, as posted to a scheduling outbox.
+        let freebusy = build_freebusy_request(
+            "me@example.com",
+            &["ada@example.com".into()],
+            1_767_484_800_000,
+            1_767_571_200_000,
+        );
+        assert!(parses_as_a_calendar(&freebusy) >= 2, "{freebusy}");
+
+        // A reply, as mailed to an organizer — and it must read back as the
+        // REPLY it claims to be, not merely as valid text.
+        let reply = build_reply(
+            &Reply {
+                uid: "meet-1@org.example",
+                recurrence_id: None,
+                sequence: 2,
+                organizer_email: "boss@org.example",
+                summary: Some("Planning"),
+                partstat: "ACCEPTED",
+            },
+            "me@example.com",
+            "Ada Lovelace",
+        );
+        assert!(parses_as_a_calendar(&reply) >= 2, "{reply}");
+        let parsed = parse(&reply).expect("a reply must parse as iTIP");
+        assert_eq!(parsed.method, Method::Reply);
+        assert_eq!(parsed.uid, "meet-1@org.example");
+        assert_eq!(parsed.sequence, 2);
+    }
+
     #[test]
     fn a_request_names_every_attendee_and_bounds_the_window() {
         let ics = build_freebusy_request(
