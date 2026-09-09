@@ -314,6 +314,17 @@ impl ContactStore {
             .ok_or_else(|| StoreError::UnknownCalendar(book_id.to_owned()))?
             .clone();
 
+        // Refused here, at the top, because the two exits below do not both
+        // reach a check. Removing a card from a *shared* file goes through
+        // `write_contact_raw`, which refuses; removing a card that owns its
+        // file ends in `remove_file_if_present`, which takes a path and no
+        // book and so cannot refuse anything even in principle. The guard was
+        // present exactly where the damage was smallest, and the write
+        // functions' checks made the whole type look covered.
+        if meta.read_only {
+            return Err(StoreError::ReadOnly(meta.name.clone()));
+        }
+
         let Some(contact) = read_book(&meta).into_iter().find(|c| c.uid == uid) else {
             return Ok(());
         };
@@ -746,6 +757,44 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob@x\r\nFN:Bob\r\nEND:VCARD\r\n";
         let summary = store.import_vcf(TWO_CARDS, &meta.id).unwrap();
         assert_eq!((summary.added, summary.updated), (0, 2));
         assert_eq!(store.contacts().len(), 2);
+    }
+
+    #[test]
+    fn deleting_from_a_read_only_book_is_refused() {
+        // Through the store, not through a write function with a doctored
+        // meta. That shortcut is how this gap survived: it asserts the
+        // *function's* guard, and `delete` reaches the filesystem by a path
+        // that has no function to guard it.
+        //
+        // The directory is left writable on purpose, so a delete that
+        // succeeds proves a missing check rather than a missing OS
+        // permission.
+        let (dir, mut store, meta) = store();
+        store.import_vcf(TWO_CARDS, &meta.id).unwrap();
+        let uid = store.contacts()[0].uid.clone();
+
+        // Mark it the way the loader recognises, then reopen so the store's
+        // own book list carries the flag.
+        std::fs::write(meta.path.join(".ics-feed.json"), "{}").unwrap();
+        let mut store = ContactStore::open(&dir.path().join("contacts")).unwrap();
+        let book = store.books().first().expect("a book").clone();
+        assert!(book.read_only, "the book was not marked read-only");
+
+        // Saving is refused — the contrast is one run rather than an argument.
+        let mut contact = store.contacts()[0].clone();
+        contact.display_name = "Edited".into();
+        assert!(
+            store.save(&contact).is_err(),
+            "a read-only book accepted a save"
+        );
+
+        // And so is deleting, which is the half that was not checked.
+        assert!(
+            store.delete(&book.id, &uid).is_err(),
+            "a read-only book accepted a delete"
+        );
+        // The card is still there.
+        assert!(store.contacts().iter().any(|c| c.uid == uid));
     }
 
     #[test]

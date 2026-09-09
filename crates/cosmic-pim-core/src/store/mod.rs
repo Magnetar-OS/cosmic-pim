@@ -627,6 +627,15 @@ impl Store {
             .ok_or_else(|| StoreError::UnknownCalendar(event.calendar_id.clone()))?
             .clone();
 
+        // Checked here because only one of the two exits below reaches a
+        // guard: emptying the file routes through `vdir::delete_event`, which
+        // refuses, while rewriting it writes to a path directly and cannot.
+        // The same split that left `ContactStore::delete` unguarded — the
+        // damaging branch is the one typed as a filesystem operation.
+        if meta.read_only {
+            return Err(StoreError::ReadOnly(meta.name.clone()));
+        }
+
         let path = meta.path.join(&event.file_name);
         let text = std::fs::read_to_string(&path)?;
         match vdir::remove_vevent(
@@ -1243,6 +1252,72 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
             "the override survived its master"
         );
         assert_eq!(on_disk.matches("BEGIN:VEVENT").count(), 1);
+    }
+
+    #[test]
+    fn a_read_only_calendar_refuses_every_way_of_deleting() {
+        // Deletion had been typed as a filesystem operation in places where
+        // writing was typed as a collection operation, so the guard sat on
+        // some exits and not others. This asserts the *store's* behaviour on
+        // each route rather than each function's own check, because a
+        // function that takes a path has no check to assert.
+        //
+        // The directory stays writable on purpose: a delete that succeeds
+        // then proves a missing guard rather than a missing OS permission.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Feed", Rgb(1, 2, 3)).unwrap();
+
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+BEGIN:VEVENT\r\nUID:s@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:Weekly\r\n\
+RRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:s@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+RECURRENCE-ID:20260811T090000Z\r\nDTSTART:20260811T140000Z\r\n\
+DTEND:20260811T150000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("s.ics"), ics).unwrap();
+        // The marker the loader recognises, then a refresh so the store's own
+        // calendar list carries the flag.
+        std::fs::write(cal.path.join(".ics-feed.json"), "{}").unwrap();
+        store.refresh().unwrap();
+        let cal = store
+            .calendars()
+            .iter()
+            .find(|c| c.id == cal.id)
+            .expect("the calendar")
+            .clone();
+        assert!(cal.read_only, "the calendar was not marked read-only");
+
+        let master = store
+            .event(&cal.id, "s@example.com")
+            .unwrap()
+            .expect("the master is indexed");
+        let override_event = vdir::read_collection(&cal)
+            .into_iter()
+            .find(|e| e.recurrence_id.is_some())
+            .expect("the override");
+
+        // Whole event, one occurrence, and the override: three routes to the
+        // filesystem, all refused.
+        assert!(
+            store.delete(&cal.id, "s@example.com").is_err(),
+            "a read-only calendar accepted a delete"
+        );
+        assert!(
+            store.delete_override(&override_event).is_err(),
+            "a read-only calendar accepted an override delete"
+        );
+        let cut = instance_on(&store, day(2026, 8, 18));
+        assert!(
+            store
+                .exclude_occurrence(&cal.id, "s@example.com", cut)
+                .is_err(),
+            "a read-only calendar accepted an exclusion"
+        );
+
+        // Nothing moved on disk.
+        let on_disk = std::fs::read_to_string(cal.path.join("s.ics")).unwrap();
+        assert_eq!(on_disk, ics, "a refused delete still changed the file");
+        let _ = master;
     }
 
     #[test]
