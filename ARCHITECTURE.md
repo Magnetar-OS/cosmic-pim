@@ -141,9 +141,9 @@ writeback *patches* that text rather than re-serialising (`caldav::patch`).
 Verbatim storage plus lossy writeback is worse than lossy storage, because the
 loss only becomes visible once it is remote.
 
-**Every write path patches, not just the sync one.** The rule above has two
-enforcement points and only one of them used to be documented, which is how
-all three of the others were re-serialising for as long as they existed. A
+**Every write path patches, not just the sync one.** The rule above has
+several enforcement points and only one of them used to be documented, which
+is how all the others were re-serialising for as long as they existed. A
 local edit goes through `store::vdir::write_event_if_unchanged`,
 `store::vdir::write_todo` or `store::contacts::write_contact` — none of which
 the sentence above covers — and each one now patches the file it is editing
@@ -160,11 +160,21 @@ patched the *first* card in the file rather than the contact's own, so
 editing the second person in an imported address book wrote their name and
 email over the first person's card while leaving that card's UID in place.
 
-**A component is addressed by identity, never by position.** All three of
-those paths locate their component before touching it — a VEVENT by
-RECURRENCE-ID, a VTODO by UID, a VCARD by UID — because a file holding one
-record is the case our own fixtures generate and a file holding many is the
-case every real exporter produces. `patch::patch_nth_component` takes the
+**Deleting a record rewrites its file; only an emptied file is unlinked.**
+`store::vdir::remove_record` is the single place that decides between the
+two, for both events and tasks. Deleting used to unlink the file outright,
+which took every other record in it — so a `.ics` holding two tasks lost both
+when the user deleted one. This is the same bug as the write ones and it
+outlived them by an afternoon, because the audit that found those enumerated
+every `atomic::write` call site and deletion does not write. *The boundary of
+an audit is part of its result*: "I checked every write path" reads as "I
+checked every path" to everyone including the person who wrote it.
+
+**A component is addressed by identity, never by position.** Every one of
+those paths locates its component before touching it — a VEVENT by
+RECURRENCE-ID or UID, a VTODO by UID, a VCARD by UID — because a file holding
+one record is the case our own fixtures generate and a file holding many is
+the case every real exporter produces. `patch::patch_nth_component` takes the
 index for the same reason. The related bug underneath them wrote an added
 property into whichever sibling component came last, because it located the
 insertion point by searching the output text for `END:` rather than by the
