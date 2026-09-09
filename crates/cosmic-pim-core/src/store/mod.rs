@@ -151,10 +151,39 @@ pub(crate) fn sanitise_file_stem(uid: &str) -> String {
 
     let trimmed = collapsed.trim_matches('.').trim_matches('-');
     if trimmed.is_empty() {
-        uuid::Uuid::new_v4().to_string()
-    } else {
-        trimmed.chars().take(120).collect()
+        return uuid::Uuid::new_v4().to_string();
     }
+
+    let stem: String = trimmed.chars().take(120).collect();
+    if stem == uid {
+        // Nothing was changed, so nothing can collide: the name still *is*
+        // the uid.
+        return stem;
+    }
+
+    // Cleaning is lossy, and a lossy map is not injective: `a@x.com` and
+    // `a-x.com` both clean to `a-x.com`, and any two uids sharing a
+    // 120-character prefix collide on the truncation. Two events landing on
+    // one file is not merely untidy — the second is upserted into the first's
+    // file, and before this was fixed the result was one event's UID carrying
+    // the other's content. So a lossy stem carries a digest of what it came
+    // from, which restores uniqueness without making clean uids ugly.
+    format!("{stem}-{:08x}", stable_hash(uid))
+}
+
+/// FNV-1a, inlined because this value ends up in file names.
+///
+/// Written out rather than taken from `DefaultHasher`, whose output is
+/// explicitly not stable across releases: a uid must derive the same file
+/// name next year as it did today, or a re-import writes a second copy beside
+/// the first instead of updating it.
+fn stable_hash(text: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 /// Everything the UI needs from disk.
@@ -913,6 +942,66 @@ mod tests {
             instants(&store),
             vec![day(2026, 8, 4), day(2026, 8, 18), day(2026, 8, 25)]
         );
+    }
+
+    #[test]
+    fn importing_two_events_whose_uids_sanitise_alike_keeps_both() {
+        // A third verb, after write and delete: create at a *derived* name.
+        // Neither earlier sweep could have found this, because nothing is
+        // overwritten wholesale and nothing is unlinked — two events simply
+        // derive the same file name, and the second is upserted into the
+        // first's file. The record that came out carried the first event's
+        // UID and the second's summary: a record wearing another's identity,
+        // reached through a documented menu item.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        // '@' sanitises to '-', so these two UIDs collide on disk.
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VEVENT\r\nUID:a@x.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:First event\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:a-x.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260805T090000Z\r\nDTEND:20260805T100000Z\r\nSUMMARY:Second event\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let summary = store.import_ics(ics, &cal.id).unwrap();
+        assert_eq!(summary.added, 2);
+
+        let first = store.event(&cal.id, "a@x.com").unwrap();
+        let second = store.event(&cal.id, "a-x.com").unwrap();
+        assert!(
+            first.is_some(),
+            "the first event was lost to a name collision"
+        );
+        assert!(
+            second.is_some(),
+            "the second event was lost to a name collision"
+        );
+
+        // And neither is wearing the other's content.
+        assert_eq!(first.unwrap().summary, "First event");
+        assert_eq!(second.unwrap().summary, "Second event");
+    }
+
+    #[test]
+    fn a_derived_file_name_distinguishes_uids_that_clean_to_the_same_text() {
+        // The names need not be pretty, only distinct. A UID that survives
+        // cleaning unchanged keeps its readable name.
+        assert_eq!(sanitise_file_stem("abc-123"), "abc-123");
+        assert_ne!(
+            sanitise_file_stem("a@x.com"),
+            sanitise_file_stem("a-x.com"),
+            "two different uids derived the same file name"
+        );
+        // Stable across calls: a re-import must land on the same file rather
+        // than accumulating copies.
+        assert_eq!(sanitise_file_stem("a@x.com"), sanitise_file_stem("a@x.com"));
+        // And the truncation case, which is the realistic collision: two long
+        // uids sharing a 120-character prefix.
+        let long_a = format!("{}-one@example.com", "x".repeat(140));
+        let long_b = format!("{}-two@example.com", "x".repeat(140));
+        assert_ne!(sanitise_file_stem(&long_a), sanitise_file_stem(&long_b));
     }
 
     #[test]
@@ -1757,10 +1846,14 @@ X-VENDOR-THING:keep me\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn sanitised_stems_stay_usable() {
         assert_eq!(sanitise_file_stem("abc-123"), "abc-123");
-        assert_eq!(sanitise_file_stem("a@b.com"), "a-b.com");
-        assert_eq!(
-            sanitise_file_stem("a..b"),
-            "a.b",
+        // A uid that survives cleaning keeps its readable name; one that does
+        // not carries a digest, because the cleaning is lossy and two uids
+        // must never derive one file. This assertion used to read
+        // `== "a-b.com"`, which pinned the collision as though it were the
+        // contract.
+        assert!(sanitise_file_stem("a@b.com").starts_with("a-b.com-"));
+        assert!(
+            !sanitise_file_stem("a..b").contains(".."),
             "consecutive dots survived"
         );
         assert!(!sanitise_file_stem("../../etc/passwd").contains(".."));

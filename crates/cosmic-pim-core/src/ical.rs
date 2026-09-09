@@ -1161,13 +1161,26 @@ pub(crate) fn fold_line(line: &str, out: &mut String) {
 pub fn upsert_vevent(text: &str, event: &Event) -> String {
     use crate::patch::{logical_lines, terminator_of};
 
-    // Which component to replace: match on the parsed RECURRENCE-ID, in
-    // document order — the same order the component walk below sees.
-    let rids: Vec<Option<EventTime>> = parse_ics(text, &event.calendar_id, &event.file_name)
+    // Which component to replace: the one with this event's UID *and* this
+    // recurrence-id, in document order — the same order the component walk
+    // below sees.
+    //
+    // Both halves are load-bearing. Matching on the recurrence-id alone made
+    // any component with the same rid a target, and two ordinary
+    // non-recurring events both have `None`, so upserting an event into a
+    // file belonging to a different one patched that stranger's component:
+    // the modelled properties were rewritten while its UID stayed put, and
+    // the result was one event's identity carrying another's content. Two
+    // events derive the same file name more easily than it looks — see
+    // `store::sanitise_file_stem` — so this is reachable from Import.
+    let existing: Vec<(String, Option<EventTime>)> =
+        parse_ics(text, &event.calendar_id, &event.file_name)
+            .iter()
+            .map(|e| (e.uid.clone(), e.recurrence_id))
+            .collect();
+    let target = existing
         .iter()
-        .map(|e| e.recurrence_id)
-        .collect();
-    let target = rids.iter().position(|rid| *rid == event.recurrence_id);
+        .position(|(uid, rid)| uid == &event.uid && *rid == event.recurrence_id);
 
     // The component already exists: patch it where it lies, so every byte the
     // model does not own survives untouched. Only the insert path below
@@ -1260,8 +1273,13 @@ fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
         edits.insert(property.to_owned(), Edit::set(vec![line]));
     };
 
-    // UID is deliberately absent: it is the identity this component was
-    // located by, so rewriting it could only ever be wrong.
+    // UID is deliberately absent: it is half of the identity this component
+    // was located by, so rewriting it could only ever be wrong. That claim
+    // was untrue when it was first written — the lookup keyed on the
+    // recurrence-id alone, so a component could be located while carrying a
+    // different UID, and this comment asserted a safety property the code did
+    // not have. It holds now because the lookup was fixed, not because the
+    // comment was right.
     let dtstamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     set(&mut edits, "DTSTAMP", keep("DTSTAMP", 0, &dtstamp));
     set(&mut edits, "DTSTART", datetime("DTSTART", event.start));

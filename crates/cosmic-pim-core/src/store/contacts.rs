@@ -719,7 +719,11 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob@x\r\nFN:Bob\r\nEND:VCARD\r\n";
         let summary = store.import_vcf(TWO_CARDS, &meta.id).unwrap();
         assert_eq!((summary.added, summary.updated), (2, 0));
 
-        let ada = std::fs::read_to_string(meta.path.join("ada-x.vcf")).unwrap();
+        // The derived name is not spelled out here: `sanitise_file_stem` owns
+        // that mapping and has its own tests. What this test is about is one
+        // file per card, each holding only its own bytes.
+        let ada_file = format!("{}.vcf", crate::store::sanitise_file_stem("ada@x"));
+        let ada = std::fs::read_to_string(meta.path.join(&ada_file)).unwrap();
         assert!(ada.contains("PHOTO;ENCODING=b:AAAABBBB"), "{ada}");
         assert!(
             !ada.contains("Bob"),
