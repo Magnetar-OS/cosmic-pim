@@ -248,6 +248,24 @@ source amplifies any leak downstream in proportion — which is the argument
 for the round-trip test below, since that test is the only check standing at
 the crossing.
 
+**Stage hunks, not files, and verify gates against HEAD.** Several sessions
+write this checkout at once, so a file you edited may also carry someone
+else's uncommitted work, and `git add <file>` commits both. That is how the
+toolchain pin and the manifest came to disagree: a commit meant to change a
+comment also swept up an uncommitted channel bump sitting in the same file,
+and the drift it created was against a manifest that was consistent until
+then.
+
+The same shape makes local verification lie. Every tool reaches for the
+working tree — `cat`, `grep`, `cargo` — while CI sees HEAD, and in a shared
+checkout those differ by whatever other sessions have open. A gate checked
+against the tree can report green on a fix that is not committed. Read HEAD
+deliberately (`git show <rev>:<path>`, or a throwaway `git worktree`), and
+have the check print the values it compared rather than a verdict: an audit
+across several commits caught a broken extractor precisely because the
+printed values were empty, where a bare PASS/FAIL would have read as a
+finding about the history.
+
 **A payload built by hand needs a test that reads it back.** Anything
 assembled outside the normal writer — an iTIP reply, a VFREEBUSY request, a
 calendar export, a DAV request body, a JSON message to an external process —
