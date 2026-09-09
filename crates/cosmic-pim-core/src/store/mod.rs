@@ -1189,15 +1189,13 @@ mod tests {
         let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
 
         // Written the way a server would send an invitation.
-        let ics = format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
 BEGIN:VEVENT\r\nUID:invite@example.com\r\nDTSTAMP:20260901T000000Z\r\n\
 DTSTART:20260903T090000Z\r\nDTEND:20260903T100000Z\r\nSUMMARY:Planning\r\n\
 ORGANIZER;CN=Ada:mailto:ada@example.com\r\n\
 ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n\
-X-VENDOR-THING:keep me\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-        );
-        std::fs::write(cal.path.join("invite.ics"), &ics).unwrap();
+X-VENDOR-THING:keep me\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        std::fs::write(cal.path.join("invite.ics"), ics).unwrap();
         store.refresh().unwrap();
 
         // Read back through the index, edited, and saved — the ordinary path.

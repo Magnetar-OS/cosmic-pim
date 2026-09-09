@@ -321,15 +321,17 @@ pub struct Event {
     /// order — `STATUS`, `TRANSP`, `CLASS`, `URL`, `CATEGORIES`, `X-` and
     /// anything else this model does not interpret.
     ///
-    /// It exists because writing an event re-serialises it from these fields
-    /// rather than editing the file in place, so a property with nowhere to
-    /// live here would simply vanish on the next save. Contacts do not have
-    /// this problem: `vcard.rs` edits through [`crate::patch`], naming only
-    /// the fields that changed, and everything else passes through untouched.
-    /// Moving the calendar write path onto the patcher the same way would
-    /// make this field unnecessary — and would also fix what it cannot reach,
-    /// namely parameters on properties that *are* modelled here
-    /// (`SUMMARY;LANGUAGE=en-us` comes back as plain `SUMMARY`).
+    /// This is no longer what stands between a foreign invitation and data
+    /// loss. Editing an event that already exists in a file patches that file
+    /// in place (`ical::upsert_vevent` → [`crate::patch::patch_nth_component`]),
+    /// so unmodelled properties are never rewritten and never consulted here —
+    /// and parameters on properties that *are* modelled survive too, which
+    /// this field could never have achieved.
+    ///
+    /// What it still carries is the serialise-from-nothing paths, where there
+    /// are no original bytes to patch: `to_ics` writing an event to a file
+    /// that does not exist yet, and `to_ics_collection` rendering a whole
+    /// collection for export. Losing it would silently strip those outputs.
     ///
     /// Nested components are not collected: `VALARM` blocks are handled
     /// separately, and capturing them here would emit each alarm twice.

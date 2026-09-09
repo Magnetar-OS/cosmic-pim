@@ -31,6 +31,8 @@
 //! and an all-day event normalised through UTC lands on the wrong calendar day
 //! for every user west of Greenwich.
 
+use std::collections::BTreeMap;
+
 use crate::model::{Attendee, Event, EventTime, Todo, TodoStatus};
 use calcard::Parser;
 use calcard::icalendar::{
@@ -946,6 +948,15 @@ pub fn upsert_vevent(text: &str, event: &Event) -> String {
         .collect();
     let target = rids.iter().position(|rid| *rid == event.recurrence_id);
 
+    // The component already exists: patch it where it lies, so every byte the
+    // model does not own survives untouched. Only the insert path below
+    // serialises, because only it has nothing to preserve.
+    if let Some(index) = target
+        && let Some(patched) = patch_vevent(text, index, event)
+    {
+        return patched;
+    }
+
     let terminator = terminator_of(text);
     let mut component = String::new();
     write_vevent(event, &mut component);
@@ -955,67 +966,274 @@ pub fn upsert_vevent(text: &str, event: &Event) -> String {
         component
     };
 
+    // A component that is not in the document yet goes in before it closes.
     let lines = logical_lines(text);
     let mut out = String::with_capacity(text.len() + component.len());
-    let mut vevent_index = 0usize;
-    // Depth of BEGIN/END nesting *inside* a VEVENT, so a VALARM's END does not
-    // close the component early.
-    let mut inside: Option<usize> = None;
-    let mut replaced = false;
-
+    let mut inserted = false;
     for line in &lines {
-        let begins = line.begins();
-        let ends = line.ends();
+        if !inserted && line.ends().as_deref() == Some("VCALENDAR") {
+            out.push_str(&component);
+            inserted = true;
+        }
+        out.push_str(line.raw());
+    }
+    if !inserted {
+        out.push_str(&component);
+    }
+    out
+}
 
-        match inside {
+/// Rewrites one VEVENT's modelled properties in place, leaving every other
+/// byte of the document exactly as it was.
+///
+/// This is the difference between "the model can describe this event" and
+/// "the model owns this event". [`write_vevent`] emits the properties the
+/// model knows and, since `Event::other` was added, the content lines it does
+/// not — but it still re-serialises, so it loses what lives *on* a modelled
+/// property: `SUMMARY;LANGUAGE=en-us:Planning` came back as
+/// `SUMMARY:Planning`, and the order and folding the source chose were
+/// replaced by ours. Patching names only the properties the model actually
+/// owns; the patcher passes everything else through byte-for-byte, which is
+/// what the contacts side has always done (see `vcard::patch_*`).
+///
+/// Parameters on a rewritten property are carried across from the source
+/// line, because the model owns those properties' *values* and nothing else.
+/// The exception is the date-time properties, where `VALUE` and `TZID` encode
+/// the value itself and are therefore regenerated — any other parameter on
+/// them still survives.
+///
+/// `None` when the document has no such component, which sends the caller to
+/// the insert path.
+fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
+    use crate::patch::{Edit, patch_nth_component};
+
+    let source = component_params(text, index);
+    let keep = |property: &str, occurrence: usize, value: &str| -> String {
+        let params = source
+            .get(property)
+            .and_then(|all| all.get(occurrence))
+            .map_or("", String::as_str);
+        format!("{property}{params}:{value}")
+    };
+    // A date-time's own parameters are the value's encoding, so they are
+    // regenerated; anything else the source put there is not ours to drop.
+    let datetime = |property: &str, time: EventTime| -> String {
+        let generated = datetime_line(property, time);
+        let foreign = source
+            .get(property)
+            .and_then(|all| all.first())
+            .map_or_else(String::new, |params| {
+                params_except(params, &["VALUE", "TZID"])
+            });
+        if foreign.is_empty() {
+            return generated;
+        }
+        match crate::patch::find_unquoted_colon(&generated) {
+            Some(colon) => format!("{}{foreign}{}", &generated[..colon], &generated[colon..]),
+            None => generated,
+        }
+    };
+
+    let mut edits = BTreeMap::new();
+    let set = |edits: &mut BTreeMap<String, Edit>, property: &str, line: String| {
+        edits.insert(property.to_owned(), Edit::set(vec![line]));
+    };
+
+    // UID is deliberately absent: it is the identity this component was
+    // located by, so rewriting it could only ever be wrong.
+    let dtstamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    set(&mut edits, "DTSTAMP", keep("DTSTAMP", 0, &dtstamp));
+    set(&mut edits, "DTSTART", datetime("DTSTART", event.start));
+    set(&mut edits, "DTEND", datetime("DTEND", event.end));
+    set(
+        &mut edits,
+        "SUMMARY",
+        keep("SUMMARY", 0, &escape_text(&event.summary)),
+    );
+    let last_modified = event
+        .last_modified
+        .unwrap_or_else(Utc::now)
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
+    set(
+        &mut edits,
+        "LAST-MODIFIED",
+        keep("LAST-MODIFIED", 0, &last_modified),
+    );
+
+    // DURATION is read as DTEND on the way in, so a document carrying one
+    // would otherwise end up with two conflicting ends.
+    edits.insert("DURATION".to_owned(), Edit::remove());
+
+    for (property, value) in [
+        ("DESCRIPTION", event.description.as_deref()),
+        ("LOCATION", event.location.as_deref()),
+    ] {
+        match value {
+            Some(value) => set(&mut edits, property, keep(property, 0, &escape_text(value))),
             None => {
-                if begins.as_deref() == Some("VEVENT") {
-                    if target == Some(vevent_index) {
-                        // Swap the whole component for the regenerated one.
-                        out.push_str(&component);
-                        replaced = true;
-                        inside = Some(usize::MAX); // skip until the matching END
-                    } else {
-                        inside = Some(0);
-                        out.push_str(line.raw());
-                    }
-                    vevent_index += 1;
-                    continue;
-                }
-                // A new component goes in before the document closes.
-                if !replaced && ends.as_deref() == Some("VCALENDAR") {
-                    out.push_str(&component);
-                    replaced = true;
-                }
-                out.push_str(line.raw());
-            }
-            Some(depth) => {
-                let skipping = depth == usize::MAX;
-                let mut depth = if skipping { 0 } else { depth };
-                if begins.is_some() {
-                    depth += 1;
-                } else if ends.is_some() {
-                    if depth == 0 {
-                        inside = None;
-                        if skipping {
-                            continue; // the replaced component's own END
-                        }
-                        out.push_str(line.raw());
-                        continue;
-                    }
-                    depth -= 1;
-                }
-                if !skipping {
-                    out.push_str(line.raw());
-                    inside = Some(depth);
-                } else {
-                    inside = Some(usize::MAX);
-                }
+                edits.insert(property.to_owned(), Edit::remove());
             }
         }
     }
 
+    match &event.rrule {
+        // Structured, not TEXT — escaping would corrupt the semicolons that
+        // separate its parts.
+        Some(rrule) => set(&mut edits, "RRULE", keep("RRULE", 0, rrule.trim())),
+        None => {
+            edits.insert("RRULE".to_owned(), Edit::remove());
+        }
+    }
+
+    if event.sequence > 0 {
+        let sequence = event.sequence.to_string();
+        set(&mut edits, "SEQUENCE", keep("SEQUENCE", 0, &sequence));
+    } else {
+        edits.insert("SEQUENCE".to_owned(), Edit::remove());
+    }
+
+    if let Some(created) = event.created {
+        let created = created.format("%Y%m%dT%H%M%SZ").to_string();
+        set(&mut edits, "CREATED", keep("CREATED", 0, &created));
+    }
+
+    if let Some(rid) = event.recurrence_id {
+        set(&mut edits, "RECURRENCE-ID", datetime("RECURRENCE-ID", rid));
+    }
+
+    edits.insert(
+        "EXDATE".to_owned(),
+        Edit::set(
+            event
+                .exdates
+                .iter()
+                .map(|exdate| exdate_line(event, *exdate))
+                .collect(),
+        ),
+    );
+
+    // An attendee read from the document re-emits its own source line, so
+    // DELEGATED-FROM, ROLE and every other parameter survive; only one this
+    // app added is synthesised.
+    edits.insert(
+        "ATTENDEE".to_owned(),
+        Edit::set(
+            event
+                .attendees
+                .iter()
+                .map(|attendee| attendee_line(attendee, "ATTENDEE"))
+                .collect(),
+        ),
+    );
+    edits.insert(
+        "ORGANIZER".to_owned(),
+        match &event.organizer {
+            Some(organizer) => Edit::set(vec![attendee_line(organizer, "ORGANIZER")]),
+            None => Edit::remove(),
+        },
+    );
+
+    patch_nth_component(text, "VEVENT", index, &edits)
+}
+
+/// The parameter section of every property occurrence inside one VEVENT, in
+/// document order — `";LANGUAGE=en-us"`, or `""` where there were none.
+///
+/// Nested components are skipped for the same reason [`vevent_extras`] skips
+/// them: a VALARM's DESCRIPTION is not the event's.
+fn component_params(text: &str, index: usize) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut seen = 0usize;
+    let mut inside = false;
+    let mut nested = 0usize;
+
+    for line in crate::patch::logical_lines(text) {
+        if let Some(component) = line.begins() {
+            if inside {
+                nested += 1;
+            } else if component.eq_ignore_ascii_case("VEVENT") {
+                if seen == index {
+                    inside = true;
+                }
+                seen += 1;
+            }
+            continue;
+        }
+        if line.ends().is_some() {
+            if nested > 0 {
+                nested -= 1;
+            } else if inside {
+                break;
+            }
+            continue;
+        }
+        if inside && nested == 0 {
+            out.entry(line.name())
+                .or_default()
+                .push(line.params().to_owned());
+        }
+    }
     out
+}
+
+/// A parameter section with the named parameters removed, keeping the rest
+/// exactly as they were written.
+fn params_except(params: &str, generated: &[&str]) -> String {
+    let mut out = String::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    let flush = |current: &mut String, out: &mut String| {
+        if current.is_empty() {
+            return;
+        }
+        let name = current
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase();
+        if !generated.iter().any(|g| g.eq_ignore_ascii_case(&name)) {
+            out.push(';');
+            out.push_str(current);
+        }
+        current.clear();
+    };
+
+    for ch in params.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                current.push(ch);
+            }
+            ';' if !quoted => flush(&mut current, &mut out),
+            _ => current.push(ch),
+        }
+    }
+    flush(&mut current, &mut out);
+    out
+}
+
+/// One EXDATE line, in the value type DTSTART uses.
+///
+/// EXDATE must match DTSTART's value type, or clients will not match it
+/// against the expansion and the excluded instance reappears.
+fn exdate_line(event: &Event, exdate: NaiveDateTime) -> String {
+    if event.start.is_all_day() {
+        return format!("EXDATE;VALUE=DATE:{}", exdate.format("%Y%m%d"));
+    }
+    match event.start {
+        EventTime::Zoned(_, tz) if tz == chrono_tz::UTC => {
+            format!("EXDATE:{}Z", exdate.format("%Y%m%dT%H%M%S"))
+        }
+        EventTime::Zoned(_, tz) => format!(
+            "EXDATE;TZID={}:{}",
+            tz.name(),
+            exdate.format("%Y%m%dT%H%M%S")
+        ),
+        _ => format!("EXDATE:{}", exdate.format("%Y%m%dT%H%M%S")),
+    }
 }
 
 /// Removes the VEVENT whose `RECURRENCE-ID` matches `rid` from a document.
@@ -1959,6 +2177,7 @@ END:VCALENDAR\r\n";
     }
 }
 
+#[cfg(test)]
 mod recurrence_id_tests {
     use super::*;
 
