@@ -866,15 +866,7 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         contact.addresses.iter().map(address_line).collect(),
     );
 
-    set(
-        &mut edits,
-        "ORG",
-        contact
-            .organisation
-            .iter()
-            .map(|o| org_line(o, &contact.organisation_units))
-            .collect(),
-    );
+    set(&mut edits, "ORG", org_lines(contact));
     set(
         &mut edits,
         "TITLE",
@@ -893,18 +885,7 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
             .map(|n| format!("NOTE:{}", escape_text(n)))
             .collect(),
     );
-    set(
-        &mut edits,
-        "BDAY",
-        contact
-            .birthday
-            .iter()
-            .map(|b| match version {
-                WriteVersion::V3 => format!("BDAY:{}", b.format("%Y-%m-%d")),
-                WriteVersion::V4 => format!("BDAY:{}", b.format("%Y%m%d")),
-            })
-            .collect(),
-    );
+    set(&mut edits, "BDAY", bday_lines(contact, version));
 
     set(
         &mut edits,
@@ -1046,6 +1027,55 @@ pub fn vcard_index_of(text: &str, uid: &str) -> Option<usize> {
 /// Escaping the joined string instead would write `Company\;Division\;Team`
 /// — one organisation name that happens to contain semicolons, which is a
 /// different fact about the contact.
+/// The `BDAY` line, from whichever of the two fields carries the date.
+///
+/// One property, two model fields: a full date lands in `birthday`, and a
+/// year-less one — `BDAY:--0415`, which is what a card says when the person
+/// gave a day and not a year — lands in `birthday_month_day`, because a
+/// `NaiveDate` cannot hold a date without a year. The writer consulted only
+/// the first, so an empty list reached the patcher and an empty list means
+/// *remove the property*. Editing an unrelated field deleted the birthday
+/// outright: not reformatted, gone.
+///
+/// "Empty means delete" is right for a property the model fully represents
+/// and wrong for one it represents in two places. Anything else split the
+/// same way has to consult every field before concluding the property is
+/// absent — see [`org_lines`].
+fn bday_lines(contact: &Contact, version: WriteVersion) -> Vec<String> {
+    if let Some(date) = contact.birthday {
+        return vec![match version {
+            WriteVersion::V3 => format!("BDAY:{}", date.format("%Y-%m-%d")),
+            WriteVersion::V4 => format!("BDAY:{}", date.format("%Y%m%d")),
+        }];
+    }
+    // `--MMDD` in both dialects, which is not the symmetry it looks like.
+    // Measured against the parser: `--0229` reads back on 3.0 and 4.0 cards
+    // alike, and the hyphenated `--02-29` reads back on neither. Writing the
+    // 3.0-looking spelling would produce a value our own next load drops —
+    // the same deletion this function exists to prevent, one save later.
+    let _ = version;
+    contact
+        .birthday_month_day
+        .map(|(month, day)| format!("BDAY:--{month:02}{day:02}"))
+        .into_iter()
+        .collect()
+}
+
+/// The `ORG` line, from whichever of the two fields carries anything.
+///
+/// Split the same way as `BDAY` and for the same reason: a card may name a
+/// division with no company (`ORG:;Research`), and gating on the
+/// organisation name alone deleted the units with the line.
+fn org_lines(contact: &Contact) -> Vec<String> {
+    if contact.organisation.is_none() && contact.organisation_units.is_empty() {
+        return Vec::new();
+    }
+    vec![org_line(
+        contact.organisation.as_deref().unwrap_or_default(),
+        &contact.organisation_units,
+    )]
+}
+
 fn org_line(organisation: &str, units: &[String]) -> String {
     let mut line = format!("ORG:{}", escape_text(organisation));
     for unit in units {
@@ -1178,8 +1208,8 @@ pub fn to_vcard_versioned(contact: &Contact, version: WriteVersion) -> String {
         fold_line(&address_line(address), &mut out);
     }
 
-    if let Some(org) = &contact.organisation {
-        fold_line(&org_line(org, &contact.organisation_units), &mut out);
+    for line in org_lines(contact) {
+        fold_line(&line, &mut out);
     }
     if let Some(title) = &contact.title {
         fold_line(&format!("TITLE:{}", escape_text(title)), &mut out);
@@ -1187,12 +1217,8 @@ pub fn to_vcard_versioned(contact: &Contact, version: WriteVersion) -> String {
     if let Some(note) = &contact.note {
         fold_line(&format!("NOTE:{}", escape_text(note)), &mut out);
     }
-    if let Some(birthday) = contact.birthday {
-        let formatted = match version {
-            WriteVersion::V3 => birthday.format("%Y-%m-%d"),
-            WriteVersion::V4 => birthday.format("%Y%m%d"),
-        };
-        fold_line(&format!("BDAY:{formatted}"), &mut out);
+    for line in bday_lines(contact, version) {
+        fold_line(&line, &mut out);
     }
     if !contact.categories.is_empty() {
         let list = contact
@@ -1243,6 +1269,95 @@ pub fn default_version() -> VCardVersion {
 
 #[cfg(test)]
 mod tests {
+
+    /* ------------- one property, more than one model field ------------- */
+
+    #[test]
+    fn a_year_less_birthday_survives_editing_something_else() {
+        // `birthday` is None by construction for a year-less date — a
+        // NaiveDate cannot hold one — so the writer's empty list reached the
+        // patcher, and an empty list means *remove the property*. Editing the
+        // display name deleted the birthday outright: not reformatted, gone.
+        let mut contact = parse_vcards(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:x\r\nFN:Ada Lovelace\r\n\
+BDAY:--0415\r\nEND:VCARD\r\n",
+            "book",
+            "c.vcf",
+        )
+        .into_iter()
+        .next()
+        .expect("a card");
+        assert_eq!(contact.birthday, None);
+        assert_eq!(contact.birthday_month_day, Some((4, 15)));
+
+        contact.display_name = "Ada L".into();
+        let out = patch_vcard(&contact.raw, &contact).expect("patched");
+
+        assert!(
+            out.contains("BDAY:--0415"),
+            "editing the name deleted the birthday:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_year_less_birthday_round_trips_in_both_dialects() {
+        // The spellings have to be the ones the parser reads back, or the
+        // next load drops what this save just wrote.
+        let mut contact = Contact::draft("book");
+        contact.display_name = "Ada".into();
+        // Through a leap year, so 29 February stays expressible.
+        contact.birthday_month_day = Some((2, 29));
+
+        // `--MMDD` in both dialects: measured, the hyphenated 3.0-looking
+        // form reads back on neither, so writing it would be write-only.
+        for (version, expected) in [
+            (WriteVersion::V4, "BDAY:--0229"),
+            (WriteVersion::V3, "BDAY:--0229"),
+        ] {
+            let text = to_vcard_versioned(&contact, version);
+            assert!(text.contains(expected), "{version:?}: {text}");
+            let back = parse_vcards(&text, "book", "c.vcf")
+                .into_iter()
+                .next()
+                .expect("a card");
+            assert_eq!(
+                back.birthday_month_day,
+                Some((2, 29)),
+                "{version:?} did not round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn an_org_with_units_but_no_company_keeps_its_units() {
+        // The same shape, introduced by the ORG fix itself: gating the line
+        // on `organisation` alone deleted the units along with it when a card
+        // named a division and no company. Every property split across more
+        // than one field has to consult all of them before concluding it is
+        // absent.
+        let mut contact = parse_vcards(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:z\r\nFN:Ada\r\n\
+ORG:;Research;Difference Engines\r\nEND:VCARD\r\n",
+            "book",
+            "c.vcf",
+        )
+        .into_iter()
+        .next()
+        .expect("a card");
+        assert_eq!(contact.organisation, None);
+        assert_eq!(
+            contact.organisation_units,
+            ["Research", "Difference Engines"]
+        );
+
+        contact.display_name = "Ada L".into();
+        let out = patch_vcard(&contact.raw, &contact).expect("patched");
+
+        assert!(
+            out.contains("ORG:;Research;Difference Engines"),
+            "the units went with the line:\n{out}"
+        );
+    }
 
     /* ------------- components inside a single value ------------- */
 
