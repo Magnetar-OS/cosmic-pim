@@ -363,6 +363,9 @@ mod tests {
             last_modified: None,
             file_name: "test-uid.ics".into(),
             recurrence_id: None,
+            attendees: Vec::new(),
+            organizer: None,
+            other: Vec::new(),
         }
     }
 

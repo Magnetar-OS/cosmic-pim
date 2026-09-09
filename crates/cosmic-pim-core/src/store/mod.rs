@@ -1179,6 +1179,60 @@ mod tests {
         assert_eq!(unchanged.rrule.as_deref(), Some("FREQ=WEEKLY;INTERVAL=1"));
     }
 
+    /// The whole point of the index carrying attendees: `Store::event` reads
+    /// from the cache, and whatever it hands back is what a later save writes.
+    /// If the index dropped them, the file would lose them on the next edit
+    /// even though the parser had read them correctly.
+    #[test]
+    fn attendees_survive_a_trip_through_the_index() {
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+
+        // Written the way a server would send an invitation.
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Example//EN\r\n\
+BEGIN:VEVENT\r\nUID:invite@example.com\r\nDTSTAMP:20260901T000000Z\r\n\
+DTSTART:20260903T090000Z\r\nDTEND:20260903T100000Z\r\nSUMMARY:Planning\r\n\
+ORGANIZER;CN=Ada:mailto:ada@example.com\r\n\
+ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n\
+X-VENDOR-THING:keep me\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        std::fs::write(cal.path.join("invite.ics"), &ics).unwrap();
+        store.refresh().unwrap();
+
+        // Read back through the index, edited, and saved — the ordinary path.
+        let mut event = store
+            .event(&cal.id, "invite@example.com")
+            .unwrap()
+            .expect("the invitation is indexed");
+        assert_eq!(event.attendees.len(), 1, "the index dropped the attendee");
+        assert_eq!(event.attendees[0].email, "bob@example.com");
+        assert_eq!(
+            event.organizer.as_ref().map(|o| o.email.as_str()),
+            Some("ada@example.com")
+        );
+
+        event.summary = "Planning (renamed)".into();
+        store.save(&event).unwrap();
+
+        let on_disk = std::fs::read_to_string(cal.path.join("invite.ics")).unwrap();
+        let unfolded: String = crate::patch::logical_lines(&on_disk)
+            .iter()
+            .map(|line| line.unfolded().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(unfolded.contains("Planning (renamed)"), "{unfolded}");
+        assert!(
+            unfolded.contains("bob@example.com"),
+            "attendee lost: {unfolded}"
+        );
+        assert!(
+            unfolded.contains("ada@example.com"),
+            "organizer lost: {unfolded}"
+        );
+        assert!(unfolded.contains("X-VENDOR-THING:keep me"), "{unfolded}");
+    }
+
     #[test]
     fn opens_empty_and_reports_no_calendars() {
         let (_dir, store) = store();

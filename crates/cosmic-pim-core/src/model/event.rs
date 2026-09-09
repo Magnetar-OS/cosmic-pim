@@ -217,6 +217,72 @@ impl Recurrence {
     }
 }
 
+/// One `ATTENDEE` or `ORGANIZER` on an event.
+///
+/// The address is what scheduling needs — free/busy asks a server about
+/// addresses — but the line it arrived on is kept too, because these carry
+/// parameters this model does not interpret (`DELEGATED-TO`, `MEMBER`,
+/// `SENT-BY`, `CUTYPE`, …) and rewriting one from the fields below would
+/// quietly drop them. A person added here rather than parsed has no `raw`,
+/// and is written from the fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attendee {
+    /// Lowercased, `mailto:` stripped — the form `query_availability` wants.
+    pub email: String,
+    /// `CN=`, when the source gave one.
+    pub name: Option<String>,
+    /// `PARTSTAT=`, verbatim: who has accepted.
+    pub partstat: Option<String>,
+    /// The content line exactly as it was read, if it was read rather than
+    /// built here.
+    pub raw: Option<String>,
+}
+
+impl Attendee {
+    /// A new attendee this app is adding, with no source line behind it.
+    #[must_use]
+    pub fn new(email: &str, name: Option<String>) -> Self {
+        Self {
+            email: normalise_address(email),
+            name,
+            partstat: None,
+            raw: None,
+        }
+    }
+
+    /// How to show them: their name if the source gave one, else the address.
+    #[must_use]
+    pub fn display(&self) -> &str {
+        match self.name.as_deref().filter(|n| !n.trim().is_empty()) {
+            Some(name) => name,
+            None => &self.email,
+        }
+    }
+
+    /// Whether they have accepted. `None` — no `PARTSTAT` — is
+    /// "needs action" per RFC 5545, not "accepted".
+    #[must_use]
+    pub fn accepted(&self) -> bool {
+        self.partstat
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case("ACCEPTED"))
+    }
+}
+
+/// `MAILTO:Bob@Example.com` → `bob@example.com`.
+///
+/// Addresses are compared against what a server echoes back in a free/busy
+/// reply, which need not match the case or the prefix that was sent.
+#[must_use]
+pub fn normalise_address(value: &str) -> String {
+    let trimmed = value.trim();
+    let without = trimmed
+        .strip_prefix("mailto:")
+        .or_else(|| trimmed.strip_prefix("MAILTO:"))
+        .unwrap_or(trimmed);
+    without.trim().to_lowercase()
+}
+
 /// A single `VEVENT`, as stored in one `.ics` file.
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -247,6 +313,27 @@ pub struct Event {
     /// value space. `None` for a one-off event or a series master. An override
     /// lives in the same file as its master, under the same UID.
     pub recurrence_id: Option<EventTime>,
+    /// Who is invited. Order is the source's.
+    pub attendees: Vec<Attendee>,
+    /// Who called the meeting.
+    pub organizer: Option<Attendee>,
+    /// Every other content line of this VEVENT, verbatim and in document
+    /// order — `STATUS`, `TRANSP`, `CLASS`, `URL`, `CATEGORIES`, `X-` and
+    /// anything else this model does not interpret.
+    ///
+    /// It exists because writing an event re-serialises it from these fields
+    /// rather than editing the file in place, so a property with nowhere to
+    /// live here would simply vanish on the next save. Contacts do not have
+    /// this problem: `vcard.rs` edits through [`crate::patch`], naming only
+    /// the fields that changed, and everything else passes through untouched.
+    /// Moving the calendar write path onto the patcher the same way would
+    /// make this field unnecessary — and would also fix what it cannot reach,
+    /// namely parameters on properties that *are* modelled here
+    /// (`SUMMARY;LANGUAGE=en-us` comes back as plain `SUMMARY`).
+    ///
+    /// Nested components are not collected: `VALARM` blocks are handled
+    /// separately, and capturing them here would emit each alarm twice.
+    pub other: Vec<String>,
 }
 
 impl Event {
@@ -270,6 +357,9 @@ impl Event {
             created: Some(Utc::now()),
             last_modified: Some(Utc::now()),
             recurrence_id: None,
+            attendees: Vec::new(),
+            organizer: None,
+            other: Vec::new(),
         }
     }
 

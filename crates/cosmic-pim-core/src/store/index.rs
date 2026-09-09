@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Bumped whenever the schema changes; a mismatch wipes and rebuilds the cache.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS events (
@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS events (
     rid_kind    INTEGER NOT NULL DEFAULT -1,
     rid_naive   INTEGER NOT NULL DEFAULT 0,
     rid_tz      TEXT,
+    -- Attendees, the organizer, and every content line the model does not
+    -- interpret, each stored as the iCalendar line itself. The index feeds
+    -- saves as well as reads, so anything missing here is destroyed on the
+    -- next write just as surely as if it had never been parsed.
+    attendees   TEXT    NOT NULL DEFAULT '',
+    organizer   TEXT,
+    other       TEXT    NOT NULL DEFAULT '',
     -- The RID columns are part of the key: a series master and its overrides
     -- share (calendar_id, file_name, uid) and differ only in RECURRENCE-ID.
     -- Without them the last component read would silently overwrite the rest.
@@ -459,7 +466,7 @@ impl Index {
 const COLUMNS: &str = "calendar_id, file_name, uid, summary, description, location, \
      start_kind, start_naive, start_tz, end_kind, end_naive, end_tz, \
      rrule, exdates, sequence, created, modified, alarms, \
-     rid_kind, rid_naive, rid_tz";
+     rid_kind, rid_naive, rid_tz, attendees, organizer, other";
 
 /// `rid_kind` for a component that is not an override. Distinct from every
 /// [`split_time`] kind, and NOT NULL so it can participate in the primary key.
@@ -491,6 +498,21 @@ fn insert_event(
         .collect::<Vec<_>>()
         .join(",");
 
+    // Stored as the iCalendar lines themselves: an attendee added in the app
+    // has no source line yet, so this is where it gets one. Unfolded lines
+    // never contain a newline, which is what makes joining safe.
+    let attendees = event
+        .attendees
+        .iter()
+        .map(|a| crate::ical::attendee_line(a, "ATTENDEE"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let organizer = event
+        .organizer
+        .as_ref()
+        .map(|o| crate::ical::attendee_line(o, "ORGANIZER"));
+    let other = event.other.join("\n");
+
     let (rid_kind, rid_naive, rid_tz) = split_rid(event.recurrence_id);
 
     tx.execute(
@@ -499,11 +521,12 @@ fn insert_event(
             start_kind, start_naive, start_tz, end_kind, end_naive, end_tz,
             rrule, exdates, sequence, created, modified,
             start_utc, end_utc, until_utc, alarms,
-            rid_kind, rid_naive, rid_tz
+            rid_kind, rid_naive, rid_tz,
+            attendees, organizer, other
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-            ?22, ?23, ?24
+            ?22, ?23, ?24, ?25, ?26, ?27
          )
          ON CONFLICT(calendar_id, file_name, uid, rid_kind, rid_naive) DO UPDATE SET
             summary = excluded.summary, description = excluded.description,
@@ -518,7 +541,9 @@ fn insert_event(
             modified = excluded.modified,
             start_utc = excluded.start_utc, end_utc = excluded.end_utc,
             until_utc = excluded.until_utc,
-            rid_tz = excluded.rid_tz",
+            rid_tz = excluded.rid_tz,
+            attendees = excluded.attendees, organizer = excluded.organizer,
+            other = excluded.other",
         params![
             event.calendar_id,
             event.file_name,
@@ -544,6 +569,9 @@ fn insert_event(
             rid_kind,
             rid_naive,
             rid_tz,
+            attendees,
+            organizer,
+            other,
         ],
     )?;
     Ok(())
@@ -645,6 +673,20 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             let kind: i64 = row.get(18)?;
             (kind != RID_NONE).then(|| join_time(kind, row.get(19).unwrap_or(0), row.get(20).ok()))
         },
+        attendees: row
+            .get::<_, String>(21)?
+            .lines()
+            .filter_map(crate::ical::parse_attendee_line)
+            .collect(),
+        organizer: row
+            .get::<_, Option<String>>(22)?
+            .as_deref()
+            .and_then(crate::ical::parse_attendee_line),
+        other: row
+            .get::<_, String>(23)?
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect(),
     })
 }
 

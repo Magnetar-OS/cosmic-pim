@@ -31,7 +31,7 @@
 //! and an all-day event normalised through UTC lands on the wrong calendar day
 //! for every user west of Greenwich.
 
-use crate::model::{Event, EventTime, Todo, TodoStatus};
+use crate::model::{Attendee, Event, EventTime, Todo, TodoStatus};
 use calcard::Parser;
 use calcard::icalendar::{
     ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarParameterName,
@@ -52,16 +52,29 @@ use chrono_tz::Tz;
 pub fn parse_ics(text: &str, calendar_id: &str, file_name: &str) -> Vec<Event> {
     let mut parser = Parser::new(text);
     let mut out = Vec::new();
+    // Read straight off the source, because what these keep is the exact
+    // spelling — which calcard's parsed component no longer has.
+    let mut extras = vevent_extras(text).into_iter();
 
     loop {
         match parser.entry() {
             calcard::Entry::ICalendar(ical) => {
                 let resolver = ical.build_tz_resolver();
                 for component in &ical.components {
-                    if component.component_type == ICalendarComponentType::VEvent
-                        && let Some(event) =
-                            convert_event(component, &ical, &resolver, calendar_id, file_name)
+                    if component.component_type != ICalendarComponentType::VEvent {
+                        continue;
+                    }
+                    // Taken for every VEVENT, converted or not, so the two
+                    // walks cannot drift out of step.
+                    let extra = extras.next();
+                    if let Some(mut event) =
+                        convert_event(component, &ical, &resolver, calendar_id, file_name)
                     {
+                        if let Some((attendees, organizer, other)) = extra {
+                            event.attendees = attendees;
+                            event.organizer = organizer;
+                            event.other = other;
+                        }
                         out.push(event);
                     }
                 }
@@ -125,7 +138,157 @@ fn convert_event(
         last_modified: utc_property(component, &ICalendarProperty::LastModified),
         file_name: file_name.to_owned(),
         recurrence_id,
+        // Filled by `parse_ics`, which has the source text these are read
+        // from verbatim; calcard's parsed component has already lost the
+        // spelling they need to keep.
+        attendees: Vec::new(),
+        organizer: None,
+        other: Vec::new(),
     })
+}
+
+/// Splits one `ATTENDEE`/`ORGANIZER` content line into the fields scheduling
+/// needs, keeping the line itself so nothing unmodelled is lost.
+///
+/// `line` is unfolded and carries no terminator, e.g.
+/// `ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com`.
+#[must_use]
+pub fn parse_attendee_line(line: &str) -> Option<Attendee> {
+    let colon = crate::patch::find_unquoted_colon(line)?;
+    let (head, value) = line.split_at(colon);
+    let email = crate::model::normalise_address(&value[1..]);
+    if email.is_empty() {
+        return None;
+    }
+
+    let mut name = None;
+    let mut partstat = None;
+    for param in head.split(';').skip(1) {
+        let Some((key, raw)) = param.split_once('=') else {
+            continue;
+        };
+        // A quoted CN may contain anything, including a semicolon — but
+        // splitting on ';' has already cut it. Quotes are stripped; a name
+        // that was split is still better than none, and the raw line below
+        // is what gets written back regardless.
+        let raw = raw.trim().trim_matches('"');
+        match key.trim().to_ascii_uppercase().as_str() {
+            "CN" => name = (!raw.is_empty()).then(|| raw.to_owned()),
+            "PARTSTAT" => partstat = (!raw.is_empty()).then(|| raw.to_owned()),
+            _ => {}
+        }
+    }
+
+    Some(Attendee {
+        email,
+        name,
+        partstat,
+        raw: Some(line.to_owned()),
+    })
+}
+
+/// One `ATTENDEE`/`ORGANIZER` line: the original if there was one, otherwise
+/// built from the fields.
+#[must_use]
+pub fn attendee_line(attendee: &Attendee, property: &str) -> String {
+    if let Some(raw) = &attendee.raw {
+        return raw.clone();
+    }
+    let mut line = String::from(property);
+    if let Some(name) = attendee.name.as_deref().filter(|n| !n.trim().is_empty()) {
+        // Quoted, because a display name routinely contains a comma or a
+        // colon and either would end the parameter early.
+        line.push_str(&format!(";CN=\"{}\"", name.replace('"', "")));
+    }
+    if let Some(partstat) = &attendee.partstat {
+        line.push_str(&format!(";PARTSTAT={partstat}"));
+    }
+    line.push_str(&format!(":mailto:{}", attendee.email));
+    line
+}
+
+/// Property names `write_vevent` emits itself. Everything else in a VEVENT is
+/// captured verbatim into [`Event::other`] so it survives a round trip.
+const MODELLED: &[&str] = &[
+    "UID",
+    "DTSTAMP",
+    "DTSTART",
+    "DTEND",
+    // Converted into DTEND on the way in; re-emitting it too would give the
+    // component two conflicting ends.
+    "DURATION",
+    "RECURRENCE-ID",
+    "SUMMARY",
+    "DESCRIPTION",
+    "LOCATION",
+    "RRULE",
+    "EXDATE",
+    "SEQUENCE",
+    "CREATED",
+    "LAST-MODIFIED",
+    "ATTENDEE",
+    "ORGANIZER",
+];
+
+/// What each VEVENT in `text` carries that the model does not interpret:
+/// its attendees, its organizer, and every other content line, in document
+/// order, one entry per VEVENT.
+///
+/// Nested components are skipped entirely — `VALARM` is modelled separately
+/// and written back from [`Event::alarms`], so collecting its lines here
+/// would emit every alarm twice.
+fn vevent_extras(text: &str) -> Vec<(Vec<Attendee>, Option<Attendee>, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut current: Option<(Vec<Attendee>, Option<Attendee>, Vec<String>)> = None;
+    let mut nested = 0usize;
+
+    for line in crate::patch::logical_lines(text) {
+        if let Some(component) = line.begins() {
+            if current.is_some() {
+                nested += 1;
+            } else if component.eq_ignore_ascii_case("VEVENT") {
+                current = Some((Vec::new(), None, Vec::new()));
+            }
+            continue;
+        }
+        if let Some(component) = line.ends() {
+            if nested > 0 {
+                nested -= 1;
+            } else if component.eq_ignore_ascii_case("VEVENT")
+                && let Some(done) = current.take()
+            {
+                out.push(done);
+            }
+            continue;
+        }
+
+        // Inside a VALARM, not the event itself.
+        if nested > 0 {
+            continue;
+        }
+        let Some((attendees, organizer, other)) = current.as_mut() else {
+            continue;
+        };
+
+        let unfolded = line.unfolded().to_owned();
+        let name = line.name().to_ascii_uppercase();
+        match name.as_str() {
+            "ATTENDEE" => {
+                if let Some(attendee) = parse_attendee_line(&unfolded) {
+                    attendees.push(attendee);
+                }
+            }
+            "ORGANIZER" => {
+                if organizer.is_none() {
+                    *organizer = parse_attendee_line(&unfolded);
+                }
+            }
+            _ if !MODELLED.contains(&name.as_str()) => other.push(unfolded),
+            _ => {}
+        }
+    }
+
+    out
 }
 
 /// RFC 5545: a `DATE`-valued event with no `DTEND` lasts one day; a `DATE-TIME`
@@ -1018,6 +1181,18 @@ fn write_vevent(event: &Event, out: &mut String) {
         fold_line(&line, out);
     }
 
+    if let Some(organizer) = &event.organizer {
+        fold_line(&attendee_line(organizer, "ORGANIZER"), out);
+    }
+    for attendee in &event.attendees {
+        fold_line(&attendee_line(attendee, "ATTENDEE"), out);
+    }
+
+    // Everything this model does not interpret, back exactly as it arrived.
+    for line in &event.other {
+        fold_line(line, out);
+    }
+
     for alarm in &event.alarms {
         fold_line("BEGIN:VALARM", out);
         fold_line("ACTION:DISPLAY", out);
@@ -1573,6 +1748,217 @@ mod tests {
 }
 
 #[cfg(test)]
+mod preservation_tests {
+    use super::*;
+
+    /// A foreign invitation: attendees, an organizer, and a spread of
+    /// properties this model does not interpret.
+    const INVITATION: &str = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Example Corp//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:invite@example.com\r\n\
+DTSTAMP:20260901T000000Z\r\n\
+DTSTART;TZID=Europe/Athens:20260903T090000\r\n\
+DTEND;TZID=Europe/Athens:20260903T100000\r\n\
+SUMMARY:Planning\r\n\
+ORGANIZER;CN=Ada:mailto:ada@example.com\r\n\
+ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED;ROLE=REQ-PARTICIPANT:mailto:bob@example.com\r\n\
+ATTENDEE;CN=Cleo;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\"mailto:dan@example.com\":mailto:cleo@example.com\r\n\
+STATUS:CONFIRMED\r\n\
+TRANSP:OPAQUE\r\n\
+CLASS:PRIVATE\r\n\
+PRIORITY:5\r\n\
+URL:https://example.com/meeting\r\n\
+CATEGORIES:Work,Planning\r\n\
+X-VENDOR-THING:keep me\r\n\
+BEGIN:VALARM\r\n\
+ACTION:DISPLAY\r\n\
+DESCRIPTION:Planning\r\n\
+TRIGGER:-PT10M\r\n\
+END:VALARM\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    fn parsed() -> Event {
+        let events = parse_ics(INVITATION, "personal", "invite.ics");
+        assert_eq!(events.len(), 1);
+        events.into_iter().next().unwrap()
+    }
+
+    /// The document with its content lines unfolded.
+    ///
+    /// Written output is folded at 73 octets, as RFC 5545 §3.1 requires, so a
+    /// long `ATTENDEE` line has a CRLF and a space through the middle of its
+    /// address. Every reader unfolds before interpreting; these assertions
+    /// are about what survives, not where the folds fall.
+    fn written(event: &Event) -> String {
+        let out = to_ics(event);
+        crate::patch::logical_lines(&out)
+            .iter()
+            .map(|line| line.unfolded().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn attendees_and_the_organizer_are_read() {
+        let event = parsed();
+        assert_eq!(
+            event.organizer.as_ref().map(|o| o.email.as_str()),
+            Some("ada@example.com")
+        );
+        let emails: Vec<&str> = event.attendees.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(emails, vec!["bob@example.com", "cleo@example.com"]);
+        assert_eq!(event.attendees[0].name.as_deref(), Some("Bob"));
+        assert!(event.attendees[0].accepted());
+        assert!(!event.attendees[1].accepted());
+    }
+
+    #[test]
+    fn an_address_is_normalised_for_comparison() {
+        // Free/busy answers come back spelled however the server likes.
+        assert_eq!(
+            crate::model::normalise_address("MAILTO:Bob@Example.COM"),
+            "bob@example.com"
+        );
+    }
+
+    /// The bug this all exists for: editing an invitation used to drop every
+    /// property the model does not carry.
+    #[test]
+    fn a_round_trip_keeps_what_the_model_does_not_understand() {
+        let mut event = parsed();
+        event.summary = "Planning (moved)".into();
+        let out = written(&event);
+
+        for expected in [
+            "ORGANIZER",
+            "ada@example.com",
+            "bob@example.com",
+            "cleo@example.com",
+            "STATUS:CONFIRMED",
+            "TRANSP:OPAQUE",
+            "CLASS:PRIVATE",
+            "PRIORITY:5",
+            "URL:https://example.com/meeting",
+            "CATEGORIES:Work,Planning",
+            "X-VENDOR-THING:keep me",
+        ] {
+            assert!(out.contains(expected), "{expected} was lost:\n{out}");
+        }
+        assert!(out.contains("Planning (moved)"), "the edit was not applied");
+    }
+
+    #[test]
+    fn an_unmodelled_attendee_parameter_survives() {
+        // Only CN and PARTSTAT are modelled; the rest of the line has to ride
+        // along verbatim or a delegation is silently forgotten.
+        let out = written(&parsed());
+        assert!(
+            out.contains("DELEGATED-FROM=\"mailto:dan@example.com\""),
+            "an unmodelled parameter was dropped:\n{out}"
+        );
+        assert!(out.contains("ROLE=REQ-PARTICIPANT"));
+    }
+
+    #[test]
+    fn the_alarm_is_written_exactly_once() {
+        // VALARM is modelled and re-emitted from `alarms`; if the verbatim
+        // capture also collected its lines, every save would double the alarm.
+        let out = written(&parsed());
+        assert_eq!(out.matches("BEGIN:VALARM").count(), 1, "{out}");
+        assert_eq!(out.matches("TRIGGER:").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn a_new_attendee_is_written_from_its_fields() {
+        let mut event = parsed();
+        event.attendees.push(crate::model::Attendee::new(
+            "MAILTO:New@Example.com",
+            Some("New Person".into()),
+        ));
+
+        let out = written(&event);
+        assert!(out.contains("mailto:new@example.com"), "{out}");
+        assert!(out.contains("CN=\"New Person\""), "{out}");
+
+        // …and reading it back gives the same person.
+        let again = parse_ics(&to_ics(&event), "personal", "invite.ics")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(again.attendees.len(), 3);
+        assert_eq!(again.attendees[2].email, "new@example.com");
+        assert_eq!(again.attendees[2].name.as_deref(), Some("New Person"));
+    }
+
+    #[test]
+    fn removing_an_attendee_removes_only_that_line() {
+        let mut event = parsed();
+        event.attendees.retain(|a| a.email != "cleo@example.com");
+        let out = written(&event);
+        assert!(out.contains("bob@example.com"));
+        assert!(!out.contains("cleo@example.com"), "{out}");
+    }
+
+    #[test]
+    fn a_master_and_its_override_keep_their_own_extras() {
+        // Two VEVENTs in one file: the verbatim capture walks the source text
+        // separately from the parser, so a drift between the two walks would
+        // hand one component's properties to the other.
+        let doc = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Example//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:series@example.com\r\n\
+DTSTAMP:20260901T000000Z\r\n\
+DTSTART:20260804T090000Z\r\n\
+DTEND:20260804T100000Z\r\n\
+RRULE:FREQ=WEEKLY\r\n\
+SUMMARY:Standup\r\n\
+X-WHICH:master\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+UID:series@example.com\r\n\
+DTSTAMP:20260901T000000Z\r\n\
+RECURRENCE-ID:20260811T090000Z\r\n\
+DTSTART:20260811T140000Z\r\n\
+DTEND:20260811T150000Z\r\n\
+SUMMARY:Standup (moved)\r\n\
+X-WHICH:override\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+        let events = parse_ics(doc, "personal", "series.ics");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].other, vec!["X-WHICH:master".to_owned()]);
+        assert_eq!(events[1].other, vec!["X-WHICH:override".to_owned()]);
+    }
+
+    #[test]
+    fn an_event_with_nothing_extra_carries_nothing_extra() {
+        let doc = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Example//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:plain@example.com\r\n\
+DTSTAMP:20260901T000000Z\r\n\
+DTSTART:20260804T090000Z\r\n\
+DTEND:20260804T100000Z\r\n\
+SUMMARY:Plain\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let event = parse_ics(doc, "personal", "plain.ics")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(event.other.is_empty());
+        assert!(event.attendees.is_empty());
+        assert!(event.organizer.is_none());
+    }
+}
+
 mod recurrence_id_tests {
     use super::*;
 
