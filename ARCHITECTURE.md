@@ -256,6 +256,19 @@ comment also swept up an uncommitted channel bump sitting in the same file,
 and the drift it created was against a manifest that was consistent until
 then.
 
+The reverse costs more and hides better: HEAD *lacking* something a commit
+meant to include. A build that reads a **path** — `include_bytes!`, an asset
+list, a packaging manifest, a container file a CI job mounts — is satisfied by
+the working tree, and the tree holds every session's untracked files. So a
+reference to a file nobody committed resolves for everyone on the machine and
+for nobody else. No test covers it, because tests run where the file is; and
+`git status` files it under the one heading everybody has trained themselves
+to skim. The precondition is an untracked file that something committed
+names, so `git status --porcelain -uall` bounds the whole class in one line —
+this workspace currently has none, and its four `include_str!` provider
+manifests plus the Dovecot config a CI job mounts are all tracked at HEAD,
+checked with `git ls-tree` rather than by looking for them on disk.
+
 The same shape makes local verification lie. Every tool reaches for the
 working tree — `cat`, `grep`, `cargo` — while CI sees HEAD, and in a shared
 checkout those differ by whatever other sessions have open. A gate checked
