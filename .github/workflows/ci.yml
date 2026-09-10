@@ -27,19 +27,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `rust-version` is a minimum, so a manifest asking for *less* than the
-      # pinned channel builds silently — which is what raising the toolchain
-      # and forgetting the manifest produces. Cargo catches the other
-      # direction on its own; this catches the likely one.
-      - name: The toolchain pin and the manifest agree
-        run: |
-          pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
-          declared=$(grep -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
-          echo "rust-toolchain.toml: $pinned / Cargo.toml: $declared"
-          test "$pinned" = "$declared" || {
-            echo "::error::rust-toolchain.toml pins $pinned but Cargo.toml declares $declared; raise both together"
-            exit 1
-          }
+      # Both file-level checks, from the same script the justfile runs, so
+      # there is one copy of each rule. They read files rather than building,
+      # so they run first and fail fast — and "your lock names a crate CI
+      # cannot fetch" is more actionable than the build error it prevents.
+      - name: Preflight — toolchain pin and lockfile
+        run: ./scripts/preflight.sh
 
       - name: Formatting
         run: cargo fmt --all -- --check
