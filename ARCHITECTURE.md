@@ -772,7 +772,7 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 | Convention | Here | Why |
 |---|---|---|
-| `rust-toolchain.toml` agreeing with `rust-version` | follows | 1.98.0 in both; raise together. |
+| `rust-toolchain.toml` agreeing with `rust-version` | follows | 1.98.1 in both; raise together. |
 | `rustfmt.toml`, `imports_granularity = "Module"` | follows | |
 | `Cargo.lock` committed, libraries included | follows | |
 | justfile with the conventional recipe set | follows | Trimmed of install/uninstall — a library ships nothing installable. `vendor` stays for offline distro builds. |
