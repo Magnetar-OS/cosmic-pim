@@ -287,6 +287,23 @@ provider manifests and the Dovecot config a CI job mounts were confirmed with
 on disk, which asks whether the tree has them and is the question that
 created the problem.
 
+**A lockfile can carry a dependency no manifest in this repository names.**
+Path dependencies read the filesystem, so a sibling repo's *uncommitted*
+manifest change enters this workspace's graph immediately, and the next
+routine `cargo test` rewrites `Cargo.lock` to match. Committing that lock
+encodes a crate nothing here asks for and CI may be unable to fetch — and it
+does so through a file people stage without reading, because a lockfile diff
+always looks like noise. The rule: never commit a `Cargo.lock` carrying an
+entry you cannot trace to a change in this repository. This is live right
+now — the working tree's lock names `cosmic-ext-nib-text`, from another
+crate's uncommitted manifest edit, while HEAD's lock is clean.
+
+The reverse direction is the same fact seen from the other repository: an
+uncommitted edit here changes a *consumer's* dependency graph with no commit
+in either repository, so their `--locked` check fails on a crate they never
+named. A substrate manifest change is therefore a cross-repository release —
+every consumer moves in the same change, or none does.
+
 The same shape makes local verification lie. Every tool reaches for the
 working tree — `cat`, `grep`, `cargo` — while CI sees HEAD, and in a shared
 checkout those differ by whatever other sessions have open. A gate checked
