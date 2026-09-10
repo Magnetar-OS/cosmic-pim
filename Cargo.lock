@@ -669,6 +669,8 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "cosmic-ext-nib-model"
 version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30849bfa899c590885e04bc8c9d24f46128d2f33cf768a2f380a8a04e37c7b53"
 dependencies = [
  "regex",
  "thiserror",
@@ -678,6 +680,8 @@ dependencies = [
 [[package]]
 name = "cosmic-ext-nib-text"
 version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5167b25f60a233d893d376b41c8ac8025aa11319ef4c3a7fcfc7c98d609af313"
 dependencies = [
  "cosmic-ext-nib-model",
  "unicode-segmentation",
