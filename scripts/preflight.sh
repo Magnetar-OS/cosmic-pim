@@ -40,27 +40,43 @@ if [ -n "$unexpected" ]; then
     fail=1
 fi
 
-# A file a build or a workflow names by *path* is satisfied by the working
-# tree, and the tree holds every session's uncommitted work — so a reference
-# to a file nobody committed resolves for everyone on this machine and for
-# nobody who clones. That shape broke a sibling repository's HEAD for twenty
-# commits. Only paths that exist are checked: one that does not is either
-# generated (the vendor recipe writes .cargo/config.toml) or already a loud
-# failure.
+# A file a build or a workflow names by *path* has two ways to be wrong, and
+# they need opposite checks.
+#
+# Present but not committed: the tree satisfies the reference for everyone on
+# this machine and for nobody who clones. That shape kept a sibling
+# repository's HEAD from compiling for twenty commits.
+#
+# Named but absent: a rename or a deletion nothing else reaches. The first
+# draft of this check skipped absent paths, on the reasoning that one is
+# "either generated or already a loud failure" — which was a comment asserting
+# a property rather than a check establishing one, in a script written to stop
+# exactly that. It is false for the interesting case: `dovecot.conf` is named
+# by one CI job, opened by no build and no test, so its deletion is silent
+# until that job runs on a push.
 referenced=$(grep -ohE '(\./)?(scripts|crates|\.github)/[A-Za-z0-9_./-]+' \
     .github/workflows/ci.yml justfile scripts/preflight.sh 2>/dev/null \
     | sed 's|^\./||' | sort -u)
-missing=""
+untracked=""
+absent=""
 for path in $referenced; do
-    if [ -e "$path" ] && ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
-        missing="$missing $path"
+    if [ ! -e "$path" ]; then
+        absent="$absent $path"
+    elif ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+        untracked="$untracked $path"
     fi
 done
 echo "referenced paths checked: $(echo "$referenced" | wc -l)"
-if [ -n "$missing" ]; then
+if [ -n "$untracked" ]; then
     echo "  named by committed configuration but not committed:" >&2
-    for path in $missing; do echo "    $path" >&2; done
+    for path in $untracked; do echo "    $path" >&2; done
     echo "  they resolve here and nowhere else." >&2
+    fail=1
+fi
+if [ -n "$absent" ]; then
+    echo "  named by committed configuration and not present:" >&2
+    for path in $absent; do echo "    $path" >&2; done
+    echo "  nothing else reaches them, so nothing else would notice." >&2
     fail=1
 fi
 
