@@ -263,11 +263,23 @@ the working tree, and the tree holds every session's untracked files. So a
 reference to a file nobody committed resolves for everyone on the machine and
 for nobody else. No test covers it, because tests run where the file is; and
 `git status` files it under the one heading everybody has trained themselves
-to skim. The precondition is an untracked file that something committed
-names, so `git status --porcelain -uall` bounds the whole class in one line —
-this workspace currently has none, and its four `include_str!` provider
-manifests plus the Dovecot config a CI job mounts are all tracked at HEAD,
-checked with `git ls-tree` rather than by looking for them on disk.
+to skim. The precondition is a file present but not committed that something
+committed names, and bounding that takes two questions rather than one.
+`git status --porcelain -uall` finds untracked files; it does **not** list
+ignored ones, and a gitignored file a build reads is exactly as absent from a
+clone as an untracked one, so `--ignored=matching` belongs in the same
+command. Worse, the ignored set is machine-dependent: this checkout ignores
+`.vscode/` through the developer's *global* config rather than the repo's, so
+the same check run elsewhere bounds a different set. A rule that lives in
+`.gitignore` is shared; one that lives in `~/.config/git/ignore` is not, and
+only the first is auditable by anyone else.
+
+Both questions asked here: no untracked entries, two ignored ones — `target/`
+and `.vscode/` — and nothing committed names either. The four `include_str!`
+provider manifests and the Dovecot config a CI job mounts were confirmed with
+`git ls-tree`, which asks what is committed, rather than by looking for them
+on disk, which asks whether the tree has them and is the question that
+created the problem.
 
 The same shape makes local verification lie. Every tool reaches for the
 working tree — `cat`, `grep`, `cargo` — while CI sees HEAD, and in a shared
