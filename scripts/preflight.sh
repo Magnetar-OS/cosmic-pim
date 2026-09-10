@@ -63,14 +63,41 @@ for path in $referenced; do
         untracked="$untracked $path"
     fi
 done
+# The membership rule above — ours if git knows it, HEAD has it, or the tree
+# does — is what lets this run without an exception list for generated files
+# like .cargo/config.toml. Its price is that a path *never created* satisfies
+# none of the three and is therefore skipped, so a typo in a `run:` line
+# passes silently. Demonstrated by misspelling this script's own name in the
+# CI step and watching the run succeed.
+#
+# The example is described rather than written out, because this file is one
+# of the files scanned: spelling the typo here made it a referenced path and
+# the check failed on a clean checkout, reporting a file that existed only in
+# a comment about it not existing.
+#
+# Closed for the directories that are ours by construction. Nothing generates
+# anything under scripts/ or .github/, so a name there that does not exist is
+# a mistake rather than an artefact, and requiring existence needs no list.
+# Elsewhere the membership rule still applies, and the hole with it.
+for path in $referenced; do
+    case "$path" in
+        scripts/*|.github/*)
+            [ -e "$path" ] || absent="$absent $path" ;;
+    esac
+done
+# `echo` on an empty string still emits a newline, so a naive dedup turns
+# "nothing absent" into a single space, which every `-n` test then calls
+# non-empty. That reported a failure with an empty list under it.
+absent=$(printf '%s' "$absent" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' || true)
+
 echo "referenced paths checked: $(echo "$referenced" | wc -w)"
-if [ -n "$untracked" ]; then
+if [ -n "$(printf %s "$untracked" | tr -d "[:space:]")" ]; then
     echo "  named by committed configuration but not committed:" >&2
     for path in $untracked; do echo "    $path" >&2; done
     echo "  they resolve here and nowhere else." >&2
     fail=1
 fi
-if [ -n "$absent" ]; then
+if [ -n "$(printf %s "$absent" | tr -d "[:space:]")" ]; then
     echo "  named by committed configuration and no longer present:" >&2
     for path in $absent; do echo "    $path" >&2; done
     echo "  nothing else reaches them, so nothing else would notice." >&2
