@@ -33,9 +33,15 @@ build-vendored *args: vendor-extract (build-release '--frozen --offline' args)
 preflight:
     ./scripts/preflight.sh
 
+# Proves preflight's checks can fail. Without it their evidence is a set of
+# experiments run once by hand, which is a practice, and a practice is
+# deletable exactly when nothing fails without it.
+preflight-selftest:
+    ./scripts/preflight-selftest.sh
+
 # Pedantic as warnings, not denials — the ecosystem standard. The workspace's
 # own clippy::all=warn lint table is what the build actually gates on.
-check *args: preflight
+check *args: preflight preflight-selftest
     cargo clippy --workspace --all-targets --locked {{args}} -- -W clippy::pedantic
 
 test *args:

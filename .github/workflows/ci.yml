@@ -34,6 +34,11 @@ jobs:
       - name: Preflight — toolchain pin and lockfile
         run: ./scripts/preflight.sh
 
+      # And proof those checks can fail, since otherwise their evidence is a
+      # handful of experiments someone ran once.
+      - name: Preflight self-test
+        run: ./scripts/preflight-selftest.sh
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
