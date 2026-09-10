@@ -335,13 +335,30 @@ impl Message {
         let html = msg.body_html(0).map(std::borrow::Cow::into_owned);
         let plain = msg.body_text(0).map(std::borrow::Cow::into_owned);
 
-        // HTML wins when present: it is what the sender laid out, and the
-        // `text/plain` alternative of a marketing mail is routinely a stub
-        // reading "view this in your browser". Extraction gives us the visible
-        // text either way, so preferring HTML costs nothing.
+        // `body_html` *synthesises* HTML from a text part when the message has
+        // none — a `text/plain` message comes back as
+        // `<html><body>…<br/></body></html>` — so its presence says nothing
+        // about what the sender sent. The part's own Content-Type is what
+        // says, and asking it is what keeps a plain-text body out of the HTML
+        // walker: `extract_plain` exists precisely because html5ever would
+        // read a line like `use <div> for layout` as markup.
+        let sent_html = msg
+            .html_body
+            .first()
+            .and_then(|index| msg.part(*index))
+            .and_then(mail_parser::MessagePart::content_type)
+            .is_some_and(|ct| {
+                ct.ctype().eq_ignore_ascii_case("text")
+                    && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("html"))
+            });
+
+        // HTML wins when the sender actually sent it: it is what they laid
+        // out, and the `text/plain` alternative of a marketing mail is
+        // routinely a stub reading "view this in your browser".
         let body = match (&html, &plain) {
-            (Some(html), _) => text::extract(html),
-            (None, Some(plain)) => text::extract_plain(plain),
+            (Some(html), _) if sent_html => text::extract(html),
+            (_, Some(plain)) => text::extract_plain(plain),
+            (Some(html), None) => text::extract(html),
             (None, None) => ExtractedText::default(),
         };
 

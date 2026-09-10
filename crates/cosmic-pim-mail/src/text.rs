@@ -63,6 +63,19 @@ pub struct ExtractedText {
     /// plus HTML comments carrying prose (≥ 4 words once markup is removed;
     /// tag-only MSO conditional comments don't count).
     pub hidden_elided: usize,
+    /// The HTML the text was extracted from, when the message had an HTML
+    /// part.
+    ///
+    /// Kept so a client can show the message's *structure* — headings, lists,
+    /// tables, links, the blockquotes a thread is actually made of — which is
+    /// information [`Self::text`] has already thrown away by the time anyone
+    /// sees it. It is not kept so that a client can hand it to a web engine,
+    /// and nothing in this crate ever renders it.
+    ///
+    /// Treat it as hostile. It is the sender's bytes, unmodified: whatever
+    /// reads it must be a parser that cannot fetch, cannot script and cannot
+    /// style, or the guarantees the extractor exists to provide are gone.
+    pub html: Option<String>,
 }
 
 /// Elements whose inner text is never content (dropped silently, not counted:
@@ -118,6 +131,12 @@ pub fn extract(html: &str) -> ExtractedText {
     ExtractedText {
         text: finalize(&w.out),
         hidden_elided: w.hidden_elided,
+        // Verbatim, because the point of keeping it is to show what the sender
+        // laid out. Anything trimmed here would be a second, quieter
+        // sanitiser, and two sanitisers disagreeing is the shape of every
+        // bypass there has ever been — the one parser that reads this is where
+        // the safety lives.
+        html: Some(html.to_owned()),
     }
 }
 
@@ -132,13 +151,15 @@ pub fn extract_plain(text: &str) -> ExtractedText {
     ExtractedText {
         text: finalize(text),
         hidden_elided: 0,
+        html: None,
     }
 }
 
 /// Does this HTML reference anything that would be fetched from another host?
 ///
-/// Envelope never renders HTML, so nothing here can load. The point is to tell
-/// the user *that the message tried* — a newsletter with twelve remote images
+/// Nothing here can load: the reader shows the message through a parser that
+/// resolves no URL — an image is a placeholder, not a request. The point is to
+/// tell the user *that the message tried* — a newsletter with twelve remote images
 /// is ordinary, and a four-line personal note with one 1×1 remote image is a
 /// read receipt the sender did not ask permission for.
 ///
@@ -558,6 +579,50 @@ mod tests {
 
         let html = extract("<p>One</p><p>Two</p>");
         assert_eq!(html.text, "One\n\nTwo", "block elements are paragraphs");
+    }
+
+    #[test]
+    fn the_html_is_kept_beside_the_text_it_was_extracted_from() {
+        // Kept verbatim: a client showing the message's structure needs the
+        // sender's bytes, and anything trimmed on the way past would be a
+        // second sanitiser disagreeing with the first.
+        let source = "<p>One</p><p><b>Two</b></p>";
+        let e = extract(source);
+        assert_eq!(e.html.as_deref(), Some(source));
+        assert_eq!(e.text, "One\n\nTwo", "the extracted text is unaffected");
+    }
+
+    #[test]
+    fn a_plain_text_body_carries_no_html() {
+        // There is none, and inventing one — wrapping the text in tags so the
+        // field is always populated — would hand a renderer markup the sender
+        // never wrote.
+        let e = extract_plain("just words");
+        assert!(e.html.is_none());
+    }
+
+    #[test]
+    fn a_plain_text_message_is_not_treated_as_having_sent_html() {
+        // `body_html` synthesises HTML from a text part, so a message that
+        // never contained any comes back with some. Trusting that would run
+        // every plain-text body through html5ever and hand a reader markup the
+        // sender never wrote.
+        let m = crate::model::Message::parse(
+            b"From: a@b\r\nSubject: T\r\n\r\nuse <div> for layout\r\n",
+        )
+        .expect("parse");
+        assert!(m.body.html.is_none());
+        assert_eq!(m.body.text, "use <div> for layout");
+    }
+
+    #[test]
+    fn a_message_that_did_send_html_keeps_it() {
+        let m = crate::model::Message::parse(
+            b"From: a@b\r\nSubject: T\r\nContent-Type: text/html\r\n\r\n<p>hi</p>\r\n",
+        )
+        .expect("parse");
+        assert!(m.body.html.is_some());
+        assert_eq!(m.body.text, "hi");
     }
 
     #[test]

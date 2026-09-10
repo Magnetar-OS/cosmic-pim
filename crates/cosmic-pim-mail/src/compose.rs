@@ -573,23 +573,27 @@ fn quote(message: &Message) -> String {
     out
 }
 
+/// The body, quoted, and cut off after [`QUOTE_LIMIT_LINES`].
+///
+/// The prefixing itself is `nib_text`'s, not this crate's. What a quote is —
+/// `>` with a space, a bare `>` on an empty line so no transport strips a
+/// trailing one — is the same question the composer asks when it reads the
+/// reply back, and a second implementation here is two answers that agree
+/// only until one of them is edited.
+///
+/// The line limit stays, because it is a *mail* decision rather than a
+/// quoting one: a reply must not carry a thread's entire history down every
+/// hop, and no general quoter has an opinion about that.
 fn quoted_lines(body: &str) -> String {
-    let mut out = String::new();
-    for (index, line) in body.lines().enumerate() {
-        if index == QUOTE_LIMIT_LINES {
-            out.push_str("> [...]\n");
-            break;
-        }
-        // No trailing space on an empty quoted line: `"> "` is trailing
-        // whitespace, which some transports strip and every diff complains
-        // about.
-        if line.is_empty() {
-            out.push_str(">\n");
-        } else {
-            out.push_str("> ");
-            out.push_str(line);
-            out.push('\n');
-        }
+    let mut lines = body.lines();
+    let kept: Vec<&str> = lines.by_ref().take(QUOTE_LIMIT_LINES).collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    let mut out = nib_text::quote::quote(&kept.join("\n"));
+    out.push('\n');
+    if lines.next().is_some() {
+        out.push_str("> [...]\n");
     }
     out
 }
