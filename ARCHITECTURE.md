@@ -328,6 +328,34 @@ the sentence that would have prevented that icon shipping was written, was
 correct, and was removed by someone tidying. The remedy is never a better
 sentence; it is making something run that fails without it.
 
+**A check needs three controls, and each needs a way to fire.** A positive
+control proves the harness can pass — without it, every later row is
+meaningless, because a matrix whose baseline is already failing reports
+"caught" for reasons that have nothing to do with the case under test. A
+negative control proves it can fail: disable the check on purpose and require
+the row to notice. A provenance control proves it is running the code you
+mean — a harness that extracts both the tree *and* the script from `HEAD`
+reports every row green while the working copy is broken, and the negative
+control does not catch that, because neutering happens after a copy is placed
+and disables whichever copy that was.
+
+And each control needs a condition under which it would fire, or it only
+asserts that it does not crash. The provenance control here passed
+immediately against a working copy byte-identical to `HEAD` — the one
+situation where the confound is harmless. It proved nothing until the two
+were made to differ.
+
+The provenance one is a failure mode of its own, distinct from a check being
+absent or narrow: *a control coupled to the thing it checks*. Compare against
+the literal path, not the variable holding it, because the variable is what a
+rewiring changes — a control reading it follows the rewiring and goes on
+agreeing. It looks correct at every level: the assertion is true, the operand
+is printed, and it is blind.
+
+Three is where this stops. The provenance control has no control of its own,
+and the honest end of the regress is that it was verified by an experiment
+rather than by a fourth check.
+
 **A payload built by hand needs a test that reads it back.** Anything
 assembled outside the normal writer — an iTIP reply, a VFREEBUSY request, a
 calendar export, a DAV request body, a JSON message to an external process —
