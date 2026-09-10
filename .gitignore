@@ -1,1 +1,10 @@
 /target
+
+# Ignored in the repository rather than in a developer's global config, so
+# the rule is the same for everyone who clones. An ignore that lives in
+# ~/.config/git/ignore is invisible from here: this directory read as
+# "ignored, nothing to see" on the machine it was written on and as an
+# untracked file to anyone else, which makes any "nothing is untracked"
+# audit true only locally. `git check-ignore -v <path>` prints the rule that
+# decided, and `-c core.excludesFile=/dev/null` shows what a stranger sees.
+.vscode/

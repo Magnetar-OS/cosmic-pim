@@ -268,11 +268,17 @@ committed names, and bounding that takes two questions rather than one.
 `git status --porcelain -uall` finds untracked files; it does **not** list
 ignored ones, and a gitignored file a build reads is exactly as absent from a
 clone as an untracked one, so `--ignored=matching` belongs in the same
-command. Worse, the ignored set is machine-dependent: this checkout ignores
-`.vscode/` through the developer's *global* config rather than the repo's, so
-the same check run elsewhere bounds a different set. A rule that lives in
-`.gitignore` is shared; one that lives in `~/.config/git/ignore` is not, and
-only the first is auditable by anyone else.
+command. Worse, the ignored set is machine-dependent unless the rules are kept in the
+repository. This checkout ignored `.vscode/` through the developer's *global*
+config, so the audit read "nothing untracked" here and would have found an
+untracked file on anyone else's machine — the bound was true locally and
+nowhere else. The rules are repo-local now, which is what makes the check
+mean the same thing for everyone.
+
+Two commands make that answerable rather than assumed, and both print their
+operand rather than a verdict: `git check-ignore -v <path>` names the rule
+that decided, and `-c core.excludesFile=/dev/null` shows what a contributor
+with no global ignores sees.
 
 Both questions asked here: no untracked entries, two ignored ones — `target/`
 and `.vscode/` — and nothing committed names either. The four `include_str!`
@@ -290,6 +296,20 @@ have the check print the values it compared rather than a verdict: an audit
 across several commits caught a broken extractor precisely because the
 printed values were empty, where a bare PASS/FAIL would have read as a
 finding about the history.
+
+**The artefact that was wrong had every checkable property right.** That is
+the single line this section is made of, and it is why reading never found
+any of these and running something always did. A comment that quantified
+correctly over call sites the code did not honour. An `If-Match` defence
+documented in three registers and implemented in none. A read-only guard
+present on every path except the one that removed the file. A toolchain pin
+agreeing with a file six lines away. An icon committed under the right name,
+at the right size, in the right format, of the wrong application. In each
+case every property a reader could check was satisfied, and the thing itself
+was wrong. A comment is also deletable exactly when nothing depends on it —
+the sentence that would have prevented that icon shipping was written, was
+correct, and was removed by someone tidying. The remedy is never a better
+sentence; it is making something run that fails without it.
 
 **A payload built by hand needs a test that reads it back.** Anything
 assembled outside the normal writer — an iTIP reply, a VFREEBUSY request, a
