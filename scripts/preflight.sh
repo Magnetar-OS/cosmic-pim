@@ -30,9 +30,14 @@ fail=0
 # exactly that. It is false for the interesting case: `dovecot.conf` is named
 # by one CI job, opened by no build and no test, so its deletion is silent
 # until that job runs on a push.
-referenced=$(grep -ohE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.(toml|sh|conf|yml|yaml|json|lock|md|rs)' \
+# Leading dot allowed, and a shell-variable prefix stripped: without the
+# first, `.github/workflows/ci.yml` arrives as `github/...`; without the
+# second, ci.yml's `$PWD/crates/...` arrives as `PWD/crates/...`. Both then
+# match nothing in the repository and are silently skipped — which is how
+# widening this pattern quietly dropped the coverage the narrow version had.
+referenced=$(grep -ohE '\$?[A-Za-z0-9_.][A-Za-z0-9_./-]*\.(toml|sh|conf|yml|yaml|json|lock|md|rs)' \
     .github/workflows/ci.yml justfile scripts/preflight.sh 2>/dev/null \
-    | sed 's|^\./||' | sort -u)
+    | sed -e 's|^\$||' -e 's|^PWD/||' -e 's|^\./||' | sort -u)
 
 # Which of those are repository paths at all. A name is one if git knows it or
 # the working tree has it; anything else — /etc/dovecot/dovecot.conf inside a
@@ -44,7 +49,12 @@ untracked=""
 absent=""
 for path in $referenced; do
     tracked=no
+    # Index, or HEAD. A `git rm`'d file is in neither the index nor the tree,
+    # and without asking HEAD it stops looking like a repository path at all
+    # — so the check would skip the very case it exists for: a file removed
+    # while configuration still names it.
     git ls-files --error-unmatch "$path" >/dev/null 2>&1 && tracked=yes
+    git cat-file -e "HEAD:$path" 2>/dev/null && tracked=yes
     if [ "$tracked" = yes ] && [ ! -e "$path" ]; then
         absent="$absent $path"
     elif [ "$tracked" = no ] && [ -e "$path" ] && git check-ignore -q "$path"; then
