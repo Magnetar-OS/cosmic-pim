@@ -11,35 +11,11 @@ cd "$(dirname "$0")/.."
 
 fail=0
 
-# `rust-version` is a *minimum*, so a manifest asking for less than the pinned
-# channel builds silently, and that is exactly what raising the channel and
-# forgetting the manifest produces. Cargo refuses only the opposite, rarer
-# direction.
-pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
-declared=$(grep -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
-echo "toolchain pin: rust-toolchain.toml=$pinned Cargo.toml=$declared"
-if [ "$pinned" != "$declared" ]; then
-    echo "  raise both together" >&2
-    fail=1
-fi
-
-# `--locked` catches a stale lockfile and cannot catch an over-full one. An
-# entry with no `source` is resolved from a local path; a path reaching
-# outside this repository resolves on the machine that committed it and fails
-# in CI, which checks out this repository alone. The allowed set is derived
-# from the workspace rather than written down, so it stays true when a crate
-# is added and fails when a *repository* is.
-allowed=$(grep -h '^name = ' crates/*/Cargo.toml | tr -d '"' | awk '{print $3}' | sort)
-sourceless=$(awk '/^\[\[package\]\]/{n="";s=0} /^name = /{n=$3} /^source = /{s=1} /^$/{if(n!=""&&!s) print n; n=""}' Cargo.lock | tr -d '"' | sort)
-echo "lockfile path crates: $(echo "$sourceless" | tr '\n' ' ')"
-unexpected=$(comm -13 <(echo "$allowed") <(echo "$sourceless") || true)
-if [ -n "$unexpected" ]; then
-    echo "  Cargo.lock names path crates this repository does not contain:" >&2
-    echo "$unexpected" | sed 's/^/    /' >&2
-    echo "  CI checks out only this repository, so it cannot fetch them." >&2
-    fail=1
-fi
-
+# The path sweep runs first. It is the only check that can explain a missing
+# input, and the others read files — so with it last, deleting
+# rust-toolchain.toml produced `grep: No such file or directory` and exit 2
+# instead of naming the file. An early check crashing hides the later one
+# that had the answer.
 # A file a build or a workflow names by *path* has two ways to be wrong, and
 # they need opposite checks.
 #
@@ -54,19 +30,30 @@ fi
 # exactly that. It is false for the interesting case: `dovecot.conf` is named
 # by one CI job, opened by no build and no test, so its deletion is silent
 # until that job runs on a push.
-referenced=$(grep -ohE '(\./)?(scripts|crates|\.github)/[A-Za-z0-9_./-]+' \
+referenced=$(grep -ohE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.(toml|sh|conf|yml|yaml|json|lock|md|rs)' \
     .github/workflows/ci.yml justfile scripts/preflight.sh 2>/dev/null \
     | sed 's|^\./||' | sort -u)
+
+# Which of those are repository paths at all. A name is one if git knows it or
+# the working tree has it; anything else — /etc/dovecot/dovecot.conf inside a
+# container, /tmp/radicale.conf a CI step writes — is neither, and skipping it
+# needs no exception list. That union is also what makes deletion visible: a
+# path git knows and the tree lacks has been removed, which the earlier
+# version could not distinguish from a path that was never ours.
 untracked=""
 absent=""
 for path in $referenced; do
-    if [ ! -e "$path" ]; then
+    tracked=no
+    git ls-files --error-unmatch "$path" >/dev/null 2>&1 && tracked=yes
+    if [ "$tracked" = yes ] && [ ! -e "$path" ]; then
         absent="$absent $path"
-    elif ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+    elif [ "$tracked" = no ] && [ -e "$path" ] && git check-ignore -q "$path"; then
+        : # ignored build output that happens to match, not a reference
+    elif [ "$tracked" = no ] && [ -e "$path" ]; then
         untracked="$untracked $path"
     fi
 done
-echo "referenced paths checked: $(echo "$referenced" | wc -l)"
+echo "referenced paths checked: $(echo "$referenced" | wc -w)"
 if [ -n "$untracked" ]; then
     echo "  named by committed configuration but not committed:" >&2
     for path in $untracked; do echo "    $path" >&2; done
@@ -74,10 +61,47 @@ if [ -n "$untracked" ]; then
     fail=1
 fi
 if [ -n "$absent" ]; then
-    echo "  named by committed configuration and not present:" >&2
+    echo "  named by committed configuration and no longer present:" >&2
     for path in $absent; do echo "    $path" >&2; done
     echo "  nothing else reaches them, so nothing else would notice." >&2
     fail=1
+fi
+
+# `rust-version` is a *minimum*, so a manifest asking for less than the pinned
+# channel builds silently, and that is exactly what raising the channel and
+# forgetting the manifest produces. Cargo refuses only the opposite, rarer
+# direction.
+if [ ! -e rust-toolchain.toml ] || [ ! -e Cargo.toml ]; then
+    echo "toolchain pin: skipped, an input is missing (named above)"
+else
+pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+declared=$(grep -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
+echo "toolchain pin: rust-toolchain.toml=$pinned Cargo.toml=$declared"
+if [ "$pinned" != "$declared" ]; then
+    echo "  raise both together" >&2
+    fail=1
+fi
+fi
+
+# `--locked` catches a stale lockfile and cannot catch an over-full one. An
+# entry with no `source` is resolved from a local path; a path reaching
+# outside this repository resolves on the machine that committed it and fails
+# in CI, which checks out this repository alone. The allowed set is derived
+# from the workspace rather than written down, so it stays true when a crate
+# is added and fails when a *repository* is.
+if [ ! -e Cargo.lock ]; then
+    echo "lockfile: skipped, Cargo.lock is missing (named above)"
+else
+allowed=$(grep -h '^name = ' crates/*/Cargo.toml | tr -d '"' | awk '{print $3}' | sort)
+sourceless=$(awk '/^\[\[package\]\]/{n="";s=0} /^name = /{n=$3} /^source = /{s=1} /^$/{if(n!=""&&!s) print n; n=""}' Cargo.lock | tr -d '"' | sort)
+echo "lockfile path crates: $(echo "$sourceless" | tr '\n' ' ')"
+unexpected=$(comm -13 <(echo "$allowed") <(echo "$sourceless") || true)
+if [ -n "$unexpected" ]; then
+    echo "  Cargo.lock names path crates this repository does not contain:" >&2
+    echo "$unexpected" | sed 's/^/    /' >&2
+    echo "  CI checks out only this repository, so it cannot fetch them." >&2
+    fail=1
+fi
 fi
 
 exit "$fail"
