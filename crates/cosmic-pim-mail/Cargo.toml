@@ -18,7 +18,7 @@ readme = "../../README.md"
 # Atomic writes and the Contact model a sender resolves against. The mail crate
 # stands *beside* cosmic-pim-caldav rather than on it: IMAP is not a WebDAV
 # flavour and shares none of its plumbing.
-cosmic-pim-core = { path = "../cosmic-pim-core", version = "0.1.0" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "1.0.0" }
 
 # The parser boundary. `mail-parser` reads; nothing here ever writes a message
 # back through it — the maildir file holds the server's RFC 5322 bytes verbatim,

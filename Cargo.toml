@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 # MPL-2.0 throughout. The applications built on these crates are GPL-3.0-only
 # and link them without absorbing them — see LICENSING.md for why the split

@@ -11,11 +11,11 @@ categories = ["network-programming", "email"]
 readme = "../../README.md"
 
 [dependencies]
-cosmic-pim-core = { path = "../cosmic-pim-core", version = "0.1.0" }
-cosmic-pim-caldav = { path = "../cosmic-pim-caldav", version = "0.1.0" }
-cosmic-pim-accounts = { path = "../cosmic-pim-accounts", version = "0.1.0" }
-cosmic-pim-auth = { path = "../cosmic-pim-auth", version = "0.1.0" }
-cosmic-pim-mail = { path = "../cosmic-pim-mail", version = "0.1.0" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "1.0.0" }
+cosmic-pim-caldav = { path = "../cosmic-pim-caldav", version = "1.0.0" }
+cosmic-pim-accounts = { path = "../cosmic-pim-accounts", version = "1.0.0" }
+cosmic-pim-auth = { path = "../cosmic-pim-auth", version = "1.0.0" }
+cosmic-pim-mail = { path = "../cosmic-pim-mail", version = "1.0.0" }
 
 thiserror = "2"
 tracing = "0.1"

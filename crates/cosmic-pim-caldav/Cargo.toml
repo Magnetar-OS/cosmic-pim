@@ -16,7 +16,7 @@ categories = ["network-programming", "date-and-time"]
 readme = "../../README.md"
 
 [dependencies]
-cosmic-pim-core = { path = "../cosmic-pim-core", version = "0.1.0" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "1.0.0" }
 
 # Synchronous HTTP. The whole protocol layer is blocking by design: a sync
 # cycle is a sequence of dependent round trips with nothing to interleave, so

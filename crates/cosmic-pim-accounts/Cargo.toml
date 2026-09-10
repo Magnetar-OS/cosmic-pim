@@ -12,7 +12,7 @@ categories = ["authentication", "os::linux-apis"]
 readme = "../../README.md"
 
 [dependencies]
-cosmic-pim-core = { path = "../cosmic-pim-core", version = "0.1.0" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "1.0.0" }
 
 # The OS keychain. On Linux this is secret-service (GNOME Keyring / KWallet).
 keyring = "4.2.0"
