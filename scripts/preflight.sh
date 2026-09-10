@@ -40,4 +40,28 @@ if [ -n "$unexpected" ]; then
     fail=1
 fi
 
+# A file a build or a workflow names by *path* is satisfied by the working
+# tree, and the tree holds every session's uncommitted work — so a reference
+# to a file nobody committed resolves for everyone on this machine and for
+# nobody who clones. That shape broke a sibling repository's HEAD for twenty
+# commits. Only paths that exist are checked: one that does not is either
+# generated (the vendor recipe writes .cargo/config.toml) or already a loud
+# failure.
+referenced=$(grep -ohE '(\./)?(scripts|crates|\.github)/[A-Za-z0-9_./-]+' \
+    .github/workflows/ci.yml justfile scripts/preflight.sh 2>/dev/null \
+    | sed 's|^\./||' | sort -u)
+missing=""
+for path in $referenced; do
+    if [ -e "$path" ] && ! git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+        missing="$missing $path"
+    fi
+done
+echo "referenced paths checked: $(echo "$referenced" | wc -l)"
+if [ -n "$missing" ]; then
+    echo "  named by committed configuration but not committed:" >&2
+    for path in $missing; do echo "    $path" >&2; done
+    echo "  they resolve here and nowhere else." >&2
+    fail=1
+fi
+
 exit "$fail"
