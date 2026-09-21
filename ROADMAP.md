@@ -17,7 +17,7 @@ file wins on *when relative to what*.
 ## Status ledger
 
 Updated as milestones move; the one place a session checks before claiming
-work. Last touched 2026-09-07.
+work. Last touched 2026-09-21.
 
 - **Milestone 0 — done.** Docs agree with the code; the Meltemi MPL-2.0 grant
   exists (per-file, extended as ports continue); all four repos green.
@@ -69,15 +69,12 @@ work. Last touched 2026-09-07.
   action; Envelope's snooze UI shipped and has since been migrated onto the
   substrate engine, deleting its app-local scheduler.
 
-  One correction to an earlier claim: Circle's photos are **not** done, only
-  half. The write path is; nothing validated photo bytes on the read side,
-  so a card carrying a truncated or non-image `PHOTO` renders as an
-  invisible contact row — iced accepts any byte string and only fails at
-  draw time, producing nothing rather than falling back to initials. Real
-  address books contain such cards, because exporters truncate and
-  `X-ABCROP-RECTANGLE` puts parameters where an image is expected. Magic-
-  number sniffing is written and tested in a session's tree but not yet
-  committed, and the app-side fallback to initials is unbuilt.
+  Circle's photos are done on both sides. The read path sniffs the bytes
+  (`Photo::is_renderable` in `core::vcard`) before handing them to iced,
+  which accepts any byte string and only fails at draw time; a truncated or
+  non-image `PHOTO` — real address books carry them, because exporters
+  truncate and `X-ABCROP-RECTANGLE` puts parameters where an image is
+  expected — now falls back to initials instead of an invisible row.
 - **Milestone 4 — iMIP proven on the wire; two GUI clicks from exit.** Both
   halves implemented and the joint end-to-end ran green on a real session
   bus against a stock Dovecot: DeliverInvitation rendered Slate's dialog,
@@ -100,9 +97,14 @@ work. Last touched 2026-09-07.
   silent miss). Known CI note: the stock Dovecot container's submission
   proxy lacks `submission_relay_host` — live send legs need a sink beside
   it.
-- **Milestones 3, 5, 6 — not started**, except items the fleet pulled
-  forward (folder management in Envelope exceeds the Geary baseline
-  already).
+- **Milestone 6 — partly done.** The substrate is on crates.io at 1.0.0 and
+  the apps consume it by version; the `[patch]`+path arrangement is retired.
+  All three apps are tagged and installable from the signed `[magnetar]`
+  pacman repository, and `ci.yml` (fmt gate included) is green. Not yet
+  checked against the exit criteria: the conventions checklist at 15/15 per
+  app, the `debian/` packaging tier, and listing in the COSMIC store.
+- **Milestones 3, 5 — not started**, except items the fleet pulled forward
+  (folder management in Envelope exceeds the Geary baseline already).
 
 ---
 
