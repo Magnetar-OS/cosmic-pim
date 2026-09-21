@@ -186,6 +186,24 @@ fn sync_one(
         contacts_unavailable,
     };
 
+    // Where the server is. A typed-in account carries its own URL; an account
+    // created from a provider has the manifest's, because nobody types
+    // `https://apidata.googleusercontent.com/caldav/v2/` from memory.
+    let calendar_url = service_url(account, registry, Service::Calendar);
+    let contacts_url = service_url(account, registry, Service::Contacts);
+
+    // A mail-only account (IMAP/SMTP, no DAV address, no provider to supply
+    // one) has nothing to sync here. Settled before the secret is resolved:
+    // resolving can mean asking the keyring to unlock, and that prompt must
+    // not appear for an account this pass was never going to contact.
+    if calendar_url.trim().is_empty() && contacts_url.trim().is_empty() {
+        tracing::debug!(
+            account = account.display_name,
+            "no DAV address; not a calendar or contacts account"
+        );
+        return report(Ok(Vec::new()), None);
+    }
+
     // One resolution for the whole pass, whichever way this account signs in.
     // For OAuth that includes renewing an expired token and storing the result
     // back, which is why the store is taken by value here and not by reference:
@@ -197,12 +215,6 @@ fn sync_one(
         Err(why) => return report(Err(Error::Auth(why)), None),
     };
     let auth = dav_auth(account, &secret);
-
-    // Where the server is. A typed-in account carries its own URL; an account
-    // created from a provider has the manifest's, because nobody types
-    // `https://apidata.googleusercontent.com/caldav/v2/` from memory.
-    let calendar_url = service_url(account, registry, Service::Calendar);
-    let contacts_url = service_url(account, registry, Service::Contacts);
 
     let mut client = CaldavClient::with_auth(&calendar_url, Flavor::CalDav, &auth);
 
@@ -435,6 +447,35 @@ mod tests {
             !matches!(report.collections, Err(Error::Auth(_))),
             "a password account was stopped by the credential resolver"
         );
+    }
+
+    #[test]
+    fn a_mail_only_account_is_not_synced_as_dav() {
+        // An IMAP/SMTP account has no DAV address and no provider to supply
+        // one. It used to go through discovery against the empty string and
+        // log "PROPFIND : builder error" on every pass — after resolving its
+        // secret first, which can prompt to unlock the keyring for nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = accounts_at(dir.path());
+        let mut account = Account::new("Mail", "", "ada@example.com");
+        account.auth = AuthMethod::OAuth; // no grant stored: resolving would fail
+        let id = account.id.clone();
+        store.add(account, "unused").unwrap();
+
+        let report = sync_account(
+            &mut store,
+            &Registry::load_from(dir.path()),
+            &id,
+            dir.path(),
+            dir.path(),
+        )
+        .unwrap();
+
+        let Ok(collections) = report.collections else {
+            panic!("a mail-only account was treated as a failed DAV sync");
+        };
+        assert!(collections.is_empty());
+        assert_eq!(report.contacts_unavailable, None);
     }
 
     #[test]
