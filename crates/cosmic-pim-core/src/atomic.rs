@@ -287,6 +287,58 @@ pub fn write_bytes(
     })
 }
 
+/// An exclusive, cross-process advisory lock over one file's
+/// read-modify-write cycle. Released when dropped.
+///
+/// [`write`] makes each write whole; it cannot make a *read, change, write*
+/// sequence safe, and several of this suite's files are exactly that, shared
+/// between processes: a collection's sync sidecar (the app queues pushes while
+/// the daemon syncs), a maildir's sidecar, `accounts.toml` and the secret
+/// store (three apps). Two such cycles interleaving lose whichever wrote
+/// first. Holding this lock across the cycle — and re-reading the file after
+/// taking it — is what turns that into two changes, both kept.
+///
+/// The lock is `flock(2)` on a sibling `.<name>.lock` file, which is created
+/// on first use and never removed: removing a lock file is itself a race.
+/// Advisory, so it binds only writers that take it; every writer of these
+/// files in the suite does. It also excludes other handles in the *same*
+/// process, which is what makes it safe for an app's UI and its sync worker
+/// to share.
+///
+/// Hold it for the cycle and no longer — never across network I/O. Taking it
+/// twice from one thread for the same file deadlocks.
+#[derive(Debug)]
+pub struct Lock {
+    _file: fs::File,
+}
+
+/// Takes the lock guarding `target`, waiting for any other holder.
+pub fn lock(target: &Path) -> Result<Lock, Error> {
+    let path = lock_path_for(target)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.lock()?;
+    Ok(Lock { _file: file })
+}
+
+/// Sibling lock path for `target`: `<dir>/.<name>.lock`, without doubling
+/// the dot of a name that already starts with one.
+fn lock_path_for(target: &Path) -> Result<PathBuf, Error> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| Error::NoParent(target.to_path_buf()))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| Error::NoFileName(target.to_path_buf()))?
+        .to_string_lossy();
+    let name = name.strip_prefix('.').unwrap_or(&name);
+    Ok(parent.join(format!(".{name}.lock")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +499,46 @@ mod tests {
         let target = d.path().join("nested/deeper/event.ics");
         write(&target, "x", None).expect("should create parents");
         assert_eq!(fs::read_to_string(&target).unwrap(), "x");
+    }
+
+    #[test]
+    fn a_held_lock_excludes_every_other_handle_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".state.json");
+        let held = lock(&target).unwrap();
+
+        let path = dir.path().join(".state.json.lock");
+        let other = fs::File::open(&path).unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock)),
+            "a second holder got the lock while the first still held it"
+        );
+        drop(held);
+        other.try_lock().expect("the lock was not released on drop");
+    }
+
+    #[test]
+    fn two_writers_cycling_under_the_lock_keep_both_changes() {
+        // The lost update the lock exists for: each thread reads a counter,
+        // adds one, and writes it back, a hundred times.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("counter");
+        write(&target, "0", None).unwrap();
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        let _guard = lock(&target).unwrap();
+                        let n: u32 = fs::read_to_string(&target).unwrap().parse().unwrap();
+                        write(&target, &(n + 1).to_string(), None).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "200");
     }
 }

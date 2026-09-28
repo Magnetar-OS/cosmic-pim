@@ -63,6 +63,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `compose::Draft::message_id` and `Draft::ensure_message_id(local)`: the
   `Message-ID` a message goes out under. The outbox assigns one from the queue
   id.
+- `cosmic_pim_core::atomic::lock(target) -> Result<Lock, Error>`: an exclusive
+  cross-process advisory lock (`flock` on a sibling `.<name>.lock`) for a
+  file's read-modify-write cycle (audit O-01).
+
 
 
 ## [1.1.0] - 2026-09-22
