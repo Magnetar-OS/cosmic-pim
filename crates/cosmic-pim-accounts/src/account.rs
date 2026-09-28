@@ -593,7 +593,10 @@ impl AccountStore {
                 merged.push(account);
             }
         }
-        self.known = merged.iter().map(|a| a.id.clone()).collect();
+        // Only what this handle holds: an account merged in from disk was
+        // never held here, so on a later save it must still read as "never
+        // saw" rather than "deleted here".
+        self.known = self.accounts.iter().map(|a| a.id.clone()).collect();
 
         let text =
             toml::to_string_pretty(&AccountsFile { accounts: merged }).map_err(Error::config)?;
@@ -675,6 +678,37 @@ mod tests {
         assert!(
             names.contains(&"Personal"),
             "the second handle's own account is missing: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_account_survives_every_later_save_not_just_the_first() {
+        // The first merge keeps an account another process added. It must
+        // keep it on every save after that too: an account this handle has
+        // written through a merge, but never held, is not one it deleted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("accounts.toml");
+        let secrets = || SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+
+        let mut app = AccountStore::open(&path, secrets()).unwrap();
+        let mut daemon = AccountStore::open(&path, secrets()).unwrap();
+
+        let mut foreign = account();
+        foreign.id = "work-account".into();
+        foreign.display_name = "Work".into();
+        daemon.add(foreign, "hunter3").unwrap();
+
+        let mut own = account();
+        own.id = "personal-account".into();
+        own.display_name = "Personal".into();
+        app.add(own, "hunter4").unwrap();
+        // A second, unrelated save from the same long-lived handle.
+        app.set_enabled("personal-account", false).unwrap();
+
+        let reread = AccountStore::open(&path, secrets()).unwrap();
+        assert!(
+            reread.get("work-account").is_some(),
+            "the second save from a handle that never held the account deleted it"
         );
     }
 

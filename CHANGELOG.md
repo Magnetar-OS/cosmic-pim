@@ -9,6 +9,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `AccountStore::save` no longer drops an account another app added on the
+  second save from a long-lived handle (audit F-01).
+
 ### Changed
 
 ### Added
