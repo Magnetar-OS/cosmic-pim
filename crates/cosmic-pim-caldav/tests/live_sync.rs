@@ -25,6 +25,10 @@ const EVENT_A: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
 BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\n\
 SUMMARY:Event A\r\nATTENDEE;CN=Someone:mailto:s@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
+const EVENT_A_MOVED: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T110000Z\r\nDTEND:20260804T120000Z\r\n\
+SUMMARY:Event A\r\nATTENDEE;CN=Someone:mailto:s@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
 const TASK: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
 BEGIN:VTODO\r\nUID:t@test\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260804\r\n\
 STATUS:NEEDS-ACTION\r\nPRIORITY:2\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
@@ -32,6 +36,10 @@ STATUS:NEEDS-ACTION\r\nPRIORITY:2\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
 const EVENT_B: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
 BEGIN:VEVENT\r\nUID:b@test\r\nDTSTART:20260805T090000Z\r\nDTEND:20260805T100000Z\r\n\
 SUMMARY:Event B\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// An etag in [`Round::entries`] that makes the listing report the href as
+/// failed rather than list it.
+const FAILED: &str = "FAILED";
 
 /// One scripted round of the server's behaviour.
 #[derive(Clone)]
@@ -100,6 +108,15 @@ fn serve(rounds: Vec<Round>) -> Server {
 </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
                 );
                 for (href, etag) in &current.entries {
+                    // A per-resource failure, the shape SOGo produces: the
+                    // server lists the href and says it could not serve it.
+                    if *etag == FAILED {
+                        out.push_str(&format!(
+                            r#"<d:response><d:href>{href}</d:href>
+<d:status>HTTP/1.1 500 Internal Server Error</d:status></d:response>"#
+                        ));
+                        continue;
+                    }
                     out.push_str(&format!(
                         r#"<d:response><d:href>{href}</d:href><d:propstat><d:prop>
 <d:getetag>{etag}</d:getetag>
@@ -506,4 +523,48 @@ fn resolving_a_conflict_in_favour_of_the_server_leaves_a_clean_collection() {
         "the resolved collection re-listed itself"
     );
     assert_eq!(server.report_count.load(Ordering::SeqCst), reports_before);
+}
+
+#[test]
+fn a_listing_that_reported_a_failed_resource_does_not_commit_the_ctag() {
+    // The server changed /cal/a.ics but failed to list it. That change was
+    // neither fetched nor deleted, so the cycle did not apply in full, and
+    // committing the ctag would hide it until some unrelated edit moves the
+    // ctag again.
+    let server = serve(vec![
+        Round {
+            ctag: "ctag-1",
+            entries: vec![("/cal/a.ics", "\"1\""), ("/cal/b.ics", "\"1\"")],
+            bodies: vec![("/cal/a.ics", EVENT_A), ("/cal/b.ics", EVENT_B)],
+        },
+        Round {
+            ctag: "ctag-2",
+            entries: vec![("/cal/a.ics", FAILED), ("/cal/b.ics", "\"1\"")],
+            bodies: vec![("/cal/b.ics", EVENT_B)],
+        },
+        Round {
+            ctag: "ctag-2", // the server recovered; nothing else changed
+            entries: vec![("/cal/a.ics", "\"2\""), ("/cal/b.ics", "\"1\"")],
+            bodies: vec![("/cal/a.ics", EVENT_A_MOVED), ("/cal/b.ics", EVENT_B)],
+        },
+    ]);
+    let (_dir, mut store) = collection();
+    let client = CaldavClient::new(&server.url, "user", "pass");
+
+    sync_collection(&client, &server.url, &mut store).expect("first");
+    let second = sync_collection(&client, &server.url, &mut store).expect("second");
+    assert_eq!(
+        second.deleted, 0,
+        "a failed resource was treated as deleted"
+    );
+
+    let third = sync_collection(&client, &server.url, &mut store).expect("third");
+    assert!(
+        !third.unchanged,
+        "the ctag was committed over a listing that failed a resource"
+    );
+    assert_eq!(
+        third.fetched, 1,
+        "the change behind the failure never arrived"
+    );
 }

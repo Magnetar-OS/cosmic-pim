@@ -252,13 +252,16 @@ pub fn sync_collection(
     }
 
     // 6. commit — only over a cycle that applied everything it was asked to.
-    if outcome.fully_applied() {
+    // A resource the listing reported as failed was neither fetched nor
+    // deleted, so whatever changed it is still unapplied.
+    if outcome.fully_applied() && listing.failed_uris.is_empty() {
         store.commit_ctag(remote_ctag.as_deref())?;
     } else {
         tracing::info!(
             calendar_url,
             missing_bodies = outcome.missing_bodies,
             guard_tripped = outcome.guard_tripped,
+            failed_in_listing = listing.failed_uris.len(),
             "cycle did not apply in full; leaving the ctag uncommitted so it is retried"
         );
     }
@@ -372,7 +375,7 @@ mod tests {
             outcome.deleted += 1;
         }
 
-        if outcome.fully_applied() {
+        if outcome.fully_applied() && listing.failed_uris.is_empty() {
             store.commit_ctag(remote_ctag)?;
         }
         Ok(outcome)

@@ -19,6 +19,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - CalDAV/CardDAV responses keep their XML entity and character references:
   escaped calendar data such as `R&amp;D` is stored as `R&D`, not `RD` (audit
   F-04).
+- A DAV listing that reported a failed resource no longer commits the
+  collection's ctag, so that resource's change is not left waiting for an
+  unrelated edit (audit F-05).
 
 ### Changed
 
