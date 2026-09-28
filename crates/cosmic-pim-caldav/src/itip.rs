@@ -909,10 +909,23 @@ pub fn build_reply(reply: &Reply<'_>, me_email: &str, me_name: &str) -> String {
         terminator,
         &mut out,
     );
+    // A parameter value is never backslash-escaped (RFC 5545 §3.2): one
+    // holding `:`, `;` or `,` is quoted instead, the way `vcard` spells
+    // parameters, and a quoted one cannot carry a DQUOTE or a control
+    // character at all.
     let cn = if me_name.trim().is_empty() {
         String::new()
     } else {
-        format!(";CN={}", escape_text(me_name.trim()))
+        let name: String = me_name
+            .trim()
+            .chars()
+            .filter(|c| *c != '"' && !c.is_control())
+            .collect();
+        if name.contains([':', ';', ',']) {
+            format!(";CN=\"{name}\"")
+        } else {
+            format!(";CN={name}")
+        }
     };
     fold(
         &format!(
@@ -1408,6 +1421,32 @@ END:VCALENDAR\r\n";
         assert_eq!(parsed.method, Method::Reply);
         assert_eq!(parsed.uid, "meet-1@org.example");
         assert_eq!(parsed.sequence, 2);
+    }
+
+    #[test]
+    fn a_reply_from_a_name_with_punctuation_still_names_its_sender() {
+        // A parameter value has no backslash escaping (RFC 5545 §3.2): a CN
+        // holding `:`, `;` or `,` must be quoted, or the property value
+        // starts at the name's own colon and the attendee is lost.
+        for name in ["Team: Ada", "Lovelace, Ada", "Ada; Countess"] {
+            let reply = build_reply(
+                &Reply {
+                    uid: "meet-1@org.example",
+                    recurrence_id: None,
+                    sequence: 2,
+                    organizer_email: "boss@org.example",
+                    summary: None,
+                    partstat: "ACCEPTED",
+                },
+                "me@example.com",
+                name,
+            );
+            let parsed = parse(&reply).expect("a reply must parse as iTIP");
+            assert!(
+                parsed.is_addressed_to("me@example.com"),
+                "the sender was lost behind CN={name}: {reply}"
+            );
+        }
     }
 
     #[test]

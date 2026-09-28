@@ -24,6 +24,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   unrelated edit (audit F-05).
 - A JMAP full read no longer deletes every message beyond a server-clamped
   query limit (audit F-06).
+- `itip::build_reply` quotes a CN that holds `:`, `;` or `,` instead of
+  backslash-escaping it, so organizers can match the replying attendee (audit
+  F-07).
 
 ### Changed
 
