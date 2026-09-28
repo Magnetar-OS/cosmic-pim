@@ -404,11 +404,25 @@ impl SecretStore {
         Ok(cipher)
     }
 
-    fn read_envelope(&self) -> Envelope {
-        std::fs::read(self.dir.join(STORE_FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// The envelope on disk, or an empty one when there is no file yet.
+    ///
+    /// Anything else is an error, never an empty store: every write is a
+    /// read-modify-write of the whole file, so an unreadable store read as
+    /// empty would be replaced by one holding only the new entry.
+    fn read_envelope(&self) -> Result<Envelope> {
+        let path = self.dir.join(STORE_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Envelope::default()),
+            Err(e) => {
+                return Err(Error::keychain(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|e| Error::keychain(format!("{} is corrupt: {e}", path.display())))
     }
 
     fn write_envelope(&self, envelope: &Envelope) -> Result<()> {
@@ -424,7 +438,7 @@ impl SecretStore {
     fn envelope_load(&self, slot: &str) -> Result<Option<String>> {
         let _guard = self.envelope_lock.lock().map_err(|_| Error::poisoned())?;
 
-        let envelope = self.read_envelope();
+        let envelope = self.read_envelope()?;
         let Some(entry) = envelope.entries.get(slot) else {
             return Ok(None);
         };
@@ -457,7 +471,7 @@ impl SecretStore {
             .encrypt(&XNonce::from(nonce_bytes), value.as_bytes())
             .map_err(|_| Error::keychain("secret encryption failed"))?;
 
-        let mut envelope = self.read_envelope();
+        let mut envelope = self.read_envelope()?;
         envelope.entries.insert(
             slot.to_owned(),
             EnvelopeEntry {
@@ -471,7 +485,7 @@ impl SecretStore {
     fn envelope_forget(&self, slot: &str) -> Result<()> {
         let _guard = self.envelope_lock.lock().map_err(|_| Error::poisoned())?;
 
-        let mut envelope = self.read_envelope();
+        let mut envelope = self.read_envelope()?;
         if envelope.entries.remove(slot).is_some() {
             self.write_envelope(&envelope)?;
         }
@@ -615,10 +629,24 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_store_file_does_not_panic() {
+    fn a_corrupt_store_file_is_an_error_not_an_empty_store() {
+        // Reading it as empty is a silent miss for every secret in it — and
+        // the next write then replaced the file with that empty store plus
+        // one entry, destroying the rest for good.
         let (dir, store) = store();
-        std::fs::write(dir.path().join(STORE_FILE), "{ not json").unwrap();
-        assert_eq!(store.load("slot").unwrap(), None);
+        let path = dir.path().join(STORE_FILE);
+        std::fs::write(&path, "{ not json").unwrap();
+
+        assert!(store.load("slot").is_err(), "a corrupt store read as empty");
+        assert!(
+            store.store("other", "hunter2").is_err(),
+            "a write went ahead over a store it could not read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ not json",
+            "the unreadable store was overwritten"
+        );
     }
 
     /* ---------------- the per-slot backend record ---------------- */
