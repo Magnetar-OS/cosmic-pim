@@ -37,6 +37,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - A send the server refuses for good (a draft that cannot be built, 5xx at
   login or recipient, a 4xx other than 401/408/429 from Gmail or Graph) stops
   at once instead of retrying twelve times over five hours (audit F-33).
+- Outbox: the drain claims a message (renames and locks it) before sending, so
+  Undo during an SMTP conversation reports that the message is going instead
+  of handing back a draft that is delivered anyway, and a failed attempt no
+  longer recreates a cancelled message. A send interrupted by a crash is given
+  up, never retried (audit F-29, Envelope F-14).
 
 ### Changed
 
@@ -45,6 +50,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `smtp::Outcome` gains `Rejected(Error)`: not delivered, and retrying
   unchanged will be refused again. Callers that match on `Outcome` must handle
   it; the outbox marks such a message given up and keeps it.
+- `outbox::Queued` gains `sending: bool` (read from disk, never stored).
+  `Outbox::list` includes messages a drain is sending; `Outbox::cancel`
+  returns `None` for them; `Outbox::remove` refuses them with an error.
 
 ### Added
 

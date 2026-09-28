@@ -41,6 +41,12 @@ const DIRECTORY: &str = ".outbox";
 
 const EXTENSION: &str = ".outgoing.json";
 
+/// A message a drain has claimed and is sending. The claim is a rename, so a
+/// message is in exactly one of the two states on disk, and the drain holds an
+/// advisory lock on the claimed file for as long as it talks to the server —
+/// a claim nobody holds is one whose drain died mid-send.
+const CLAIMED: &str = ".sending.json";
+
 /// First retry delay, doubling to a ceiling.
 ///
 /// Slower than the flag queue's fifteen seconds: a flag change is cheap to
@@ -82,6 +88,11 @@ pub struct Queued {
     /// attempt it again until a person does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub given_up: bool,
+    /// A drain has claimed this message and is talking to the server right
+    /// now. It can be neither taken back nor discarded until that ends. Read
+    /// from where the file is, never stored.
+    #[serde(skip)]
+    pub sending: bool,
 }
 
 impl Queued {
@@ -155,6 +166,7 @@ impl Outbox {
                 next_attempt_ms: now_ms.saturating_add(retry_delay_ms(1)),
                 last_error: Some(why.to_string()),
                 given_up: false,
+                sending: false,
             }),
             Outcome::Sent(_) => Err(Error::Draft(
                 "that message was sent; queueing it would send it twice".into(),
@@ -186,21 +198,38 @@ impl Outbox {
             next_attempt_ms: now_ms,
             last_error: None,
             given_up: false,
+            sending: false,
         })
     }
 
     /// Everything waiting, oldest first — the order they should go out in.
+    ///
+    /// Includes messages a drain is sending right now, marked
+    /// [`Queued::sending`]: they have not left yet, and a list that dropped
+    /// them for the length of an SMTP conversation would tell the person
+    /// their message had gone.
     pub fn list(&self) -> Result<Vec<Queued>> {
+        let mut queued = self.entries(EXTENSION);
+        queued.extend(self.entries(CLAIMED).into_iter().map(|mut entry| {
+            entry.sending = true;
+            entry
+        }));
+        queued.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(queued)
+    }
+
+    /// The readable records whose file name ends in `suffix`.
+    fn entries(&self, suffix: &str) -> Vec<Queued> {
         let Ok(entries) = fs::read_dir(&self.root) else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
-        let mut queued: Vec<Queued> = entries
+        entries
             .flatten()
             .filter(|entry| {
                 entry
                     .file_name()
                     .to_str()
-                    .is_some_and(|name| name.ends_with(EXTENSION))
+                    .is_some_and(|name| name.ends_with(suffix))
             })
             .filter_map(|entry| {
                 let text = fs::read_to_string(entry.path()).ok()?;
@@ -218,9 +247,7 @@ impl Outbox {
                     }
                 }
             })
-            .collect();
-        queued.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(queued)
+            .collect()
     }
 
     #[must_use]
@@ -229,7 +256,15 @@ impl Outbox {
     }
 
     /// Drops one, because it went or because the user discarded it.
+    ///
+    /// Refused while a drain is sending it: discarding a message that may be
+    /// arriving in the recipients' inboxes would only hide that it went.
     pub fn remove(&self, id: &str) -> Result<()> {
+        if self.claim_path(id).exists() {
+            return Err(Error::Draft(
+                "that message is being sent right now and cannot be discarded".into(),
+            ));
+        }
         match fs::remove_file(self.path(id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -257,17 +292,19 @@ impl Outbox {
             next_attempt_ms: not_before_ms,
             last_error: None,
             given_up: false,
+            sending: false,
         })
     }
 
     /// Takes a queued message back, returning its draft — the undo for a
     /// send that has not gone yet.
     ///
-    /// `None` means it already left (or never existed), and the caller must
-    /// say so rather than reopen a composer for a message the recipients
-    /// already have. The take is a rename, so a drain running concurrently
-    /// cannot send what was cancelled or cancel what was sent: whichever
-    /// claims the file first wins, and the other finds it gone.
+    /// `None` means it already left, is being sent right now, or never
+    /// existed, and the caller must say so rather than reopen a composer for a
+    /// message the recipients have or are about to have. The take is a rename,
+    /// and so is the drain's claim before it sends, so the two cannot both
+    /// win: whichever renames the file first has it, and the other finds it
+    /// gone.
     pub fn cancel(&self, id: &str) -> Result<Option<Draft>> {
         if !crate::drafts::is_valid_id(id) {
             return Ok(None);
@@ -325,24 +362,30 @@ impl Outbox {
         now_ms: i64,
     ) -> Result<DrainOutcome> {
         let mut outcome = DrainOutcome::default();
+        outcome.given_up += self.recover_interrupted()?;
 
-        for mut queued in self.list()? {
-            if !queued.is_live() || queued.next_attempt_ms > now_ms {
+        for listed in self.entries(EXTENSION) {
+            if !listed.is_live() || listed.next_attempt_ms > now_ms {
                 outcome.skipped += 1;
                 continue;
             }
-            // The listing is a snapshot; a cancel may have claimed the file
-            // since. Checked immediately before the send, because sending a
-            // message the user just took back is the unforgivable direction
-            // of this race.
-            if !self.path(&queued.id).exists() {
+            // Claim before sending. The listing is a snapshot: an Undo may
+            // have taken the message since, and sending a message the user
+            // just took back is the unforgivable direction of this race.
+            let Some((mut queued, claim)) = self.claim(&listed.id)? else {
+                outcome.skipped += 1;
+                continue;
+            };
+            if !queued.is_live() || queued.next_attempt_ms > now_ms {
+                // Changed between the listing and the claim.
+                self.release(&queued, &claim.path)?;
                 outcome.skipped += 1;
                 continue;
             }
 
             match send(&queued.draft) {
                 Outcome::Sent(filed) => {
-                    self.remove(&queued.id)?;
+                    remove_if_present(&claim.path)?;
                     outcome.sent.push((queued.id, filed));
                 }
                 Outcome::NotSent(why) => {
@@ -358,7 +401,7 @@ impl Outbox {
                             now_ms.saturating_add(retry_delay_ms(queued.attempts));
                         outcome.deferred += 1;
                     }
-                    self.write(&queued)?;
+                    self.release(&queued, &claim.path)?;
                 }
                 Outcome::Rejected(why) => {
                     // Refused outright — a login the server will not take, a
@@ -367,7 +410,7 @@ impl Outbox {
                     // refused identically; the message waits for a person.
                     queued.given_up = true;
                     queued.last_error = Some(why.to_string());
-                    self.write(&queued)?;
+                    self.release(&queued, &claim.path)?;
                     outcome.given_up += 1;
                 }
                 Outcome::Ambiguous(why) => {
@@ -381,13 +424,80 @@ impl Outbox {
                     );
                     queued.given_up = true;
                     queued.last_error = Some(why.to_string());
-                    self.write(&queued)?;
+                    self.release(&queued, &claim.path)?;
                     outcome.given_up += 1;
                 }
             }
+            drop(claim);
         }
 
         Ok(outcome)
+    }
+
+    /// Takes a message for sending: renames it to its claimed name and locks
+    /// the claimed file. `None` when it is no longer waiting.
+    fn claim(&self, id: &str) -> Result<Option<(Queued, Claim)>> {
+        let path = self.claim_path(id);
+        match fs::rename(self.path(id), &path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let file = fs::File::open(&path)?;
+        file.lock()?;
+        let text = fs::read_to_string(&path)?;
+        let queued = serde_json::from_str(&text)
+            .map_err(|why| Error::Draft(format!("queued message {id} is unreadable: {why}")))?;
+        Ok(Some((queued, Claim { path, _file: file })))
+    }
+
+    /// Puts a claimed message back in the queue, with its new retry state.
+    ///
+    /// Written to the waiting name first and the claim removed second, so a
+    /// crash between the two leaves a message both waiting and claimed —
+    /// which recovery resolves in favour of the waiting copy — and never one
+    /// that is neither.
+    fn release(&self, queued: &Queued, claim: &Path) -> Result<()> {
+        self.write(queued)?;
+        remove_if_present(claim)
+    }
+
+    /// Settles claims whose drain died mid-send.
+    ///
+    /// A claim whose lock can be taken is held by nobody. Its message may or
+    /// may not have reached the server, which is exactly the ambiguous case:
+    /// it is given up, never retried automatically. A claim still locked
+    /// belongs to a drain that is running, and is left alone.
+    fn recover_interrupted(&self) -> Result<usize> {
+        let mut recovered = 0;
+        for claimed in self.entries(CLAIMED) {
+            let path = self.claim_path(&claimed.id);
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(fs::TryLockError::WouldBlock) => continue,
+                Err(fs::TryLockError::Error(why)) => return Err(why.into()),
+            }
+            if self.path(&claimed.id).exists() {
+                // Released, but the claim was not yet removed.
+                remove_if_present(&path)?;
+                continue;
+            }
+            let mut queued = claimed;
+            queued.given_up = true;
+            queued.last_error = Some(
+                "sending was interrupted; it may have been delivered, so it was not retried".into(),
+            );
+            self.release(&queued, &path)?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    fn claim_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}{CLAIMED}"))
     }
 
     fn read(&self, id: &str) -> Result<Option<Queued>> {
@@ -425,6 +535,21 @@ fn with_message_id(draft: &Draft, id: &str) -> Draft {
     let mut draft = draft.clone();
     draft.ensure_message_id(id);
     draft
+}
+
+/// A message claimed for sending. The open, locked file is what tells a
+/// running drain's claim from an abandoned one; dropping it releases the lock.
+struct Claim {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -794,5 +919,109 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], seen[1]);
         assert_eq!(seen[0].as_deref(), Some("0000000000000010@example.com"));
+    }
+
+    #[test]
+    fn an_undo_during_the_send_cannot_take_back_what_is_going_out() {
+        // The drain claims the message before it talks to the server, so an
+        // Undo that lands mid-conversation finds it gone and says so, instead
+        // of reopening a composer for a message the recipients are getting.
+        let (_dir, outbox) = outbox();
+        outbox
+            .schedule("0000000000000011", &draft("going"), 0)
+            .unwrap();
+        let mut taken_back = None;
+        let outcome = outbox
+            .drain_with(
+                |_| {
+                    taken_back = Some(outbox.cancel("0000000000000011").unwrap());
+                    Outcome::Sent(b"bytes".to_vec())
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(outcome.sent.len(), 1);
+        assert_eq!(
+            taken_back,
+            Some(None),
+            "Undo handed back a message that was being sent"
+        );
+        assert_eq!(outbox.count(), 0);
+    }
+
+    #[test]
+    fn a_failed_send_that_was_being_undone_comes_back_once() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .schedule("0000000000000012", &draft("offline"), 0)
+            .unwrap();
+        let mut taken_back = None;
+        outbox
+            .drain_with(
+                |_| {
+                    taken_back = Some(outbox.cancel("0000000000000012").unwrap());
+                    refused()
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(taken_back, Some(None));
+        let queued = outbox.list().unwrap();
+        assert_eq!(queued.len(), 1, "the message was lost or duplicated");
+        assert_eq!(queued[0].attempts, 1);
+    }
+
+    #[test]
+    fn a_message_in_flight_is_listed_and_cannot_be_discarded() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .schedule("0000000000000013", &draft("in flight"), 0)
+            .unwrap();
+        outbox
+            .drain_with(
+                |_| {
+                    let listed = outbox.list().unwrap();
+                    assert_eq!(
+                        listed.len(),
+                        1,
+                        "a message being sent vanished from the list"
+                    );
+                    assert!(listed[0].sending);
+                    assert!(outbox.remove("0000000000000013").is_err());
+                    refused()
+                },
+                0,
+            )
+            .unwrap();
+        assert!(!outbox.list().unwrap()[0].sending);
+    }
+
+    #[test]
+    fn a_send_interrupted_by_a_crash_is_never_retried_automatically() {
+        // A claim nobody holds is a drain that died mid-send: the message may
+        // have been delivered, so it waits for a person.
+        let (dir, outbox) = outbox();
+        outbox
+            .schedule("0000000000000014", &draft("crashed"), 0)
+            .unwrap();
+        let root = dir.path().join(DIRECTORY);
+        std::fs::rename(
+            root.join("0000000000000014.outgoing.json"),
+            root.join("0000000000000014.sending.json"),
+        )
+        .unwrap();
+        let outcome = outbox
+            .drain_with(|_| panic!("an interrupted send was attempted again"), 0)
+            .unwrap();
+        assert_eq!(outcome.given_up, 1);
+        let queued = &outbox.list().unwrap()[0];
+        assert!(queued.given_up && !queued.sending);
+        assert!(
+            queued
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("may have been delivered")
+        );
     }
 }
