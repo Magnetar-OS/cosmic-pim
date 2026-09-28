@@ -1193,14 +1193,18 @@ pub fn upsert_vevent(text: &str, event: &Event) -> String {
     // the result was one event's identity carrying another's content. Two
     // events derive the same file name more easily than it looks — see
     // `store::sanitise_file_stem` — so this is reachable from Import.
-    let existing: Vec<(String, Option<EventTime>)> =
-        parse_ics(text, &event.calendar_id, &event.file_name)
-            .iter()
-            .map(|e| (e.uid.clone(), e.recurrence_id))
-            .collect();
-    let target = existing
+    //
+    // The position is the component's place in the *text*, which is what the
+    // patcher counts. The parsed list skips components it cannot use (a
+    // VEVENT with no usable DTSTART), so an index into it named the wrong
+    // component whenever one of those came first (audit F-12).
+    let target = vevent_identities(text, &event.calendar_id, &event.file_name)
         .iter()
-        .position(|(uid, rid)| uid == &event.uid && *rid == event.recurrence_id);
+        .position(|identity| {
+            identity
+                .as_ref()
+                .is_some_and(|(uid, rid)| uid == &event.uid && *rid == event.recurrence_id)
+        });
 
     // The component already exists: patch it where it lies, so every byte the
     // model does not own survives untouched. Only the insert path below
@@ -1499,13 +1503,161 @@ fn exdate_line(event: &Event, exdate: NaiveDateTime) -> String {
     }
 }
 
+/// What removing a record from a document came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    /// The record is gone and something worth keeping remains: write this.
+    Rewritten(String),
+    /// The record was the last one in the document: delete the file.
+    Emptied,
+    /// Nothing in the document is that record. Nothing may be written or
+    /// deleted — above all not the file, which holds somebody else's records.
+    NotFound,
+}
+
+/// A top-level component's line range in [`crate::patch::logical_lines`]
+/// order, with whether it is a record (VEVENT or VTODO).
+struct ComponentRange {
+    name: String,
+    start: usize,
+    end: usize,
+}
+
+/// Every component directly inside the VCALENDAR, in document order.
+fn top_level_components(lines: &[crate::patch::ContentLine<'_>]) -> Vec<ComponentRange> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut open: Option<(String, usize)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(name) = line.begins() {
+            depth += 1;
+            if depth == 2 {
+                open = Some((name.to_ascii_uppercase(), i));
+            }
+            continue;
+        }
+        if line.ends().is_some() {
+            if depth == 2
+                && let Some((name, start)) = open.take()
+            {
+                out.push(ComponentRange {
+                    name,
+                    start,
+                    end: i,
+                });
+            }
+            depth = depth.saturating_sub(1);
+        }
+    }
+    out
+}
+
+/// A property value with RFC 5545 TEXT escaping undone — how `UID:a\,b`
+/// compares equal to the `a,b` the parser handed the model.
+fn unescape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'N') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// The UID a component's own lines carry, unescaped.
+fn component_uid(
+    lines: &[crate::patch::ContentLine<'_>],
+    range: &ComponentRange,
+) -> Option<String> {
+    let mut depth = 0usize;
+    for line in &lines[range.start + 1..range.end] {
+        if line.begins().is_some() {
+            depth += 1;
+        } else if line.ends().is_some() {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 && line.name() == "UID" {
+            return Some(unescape_text(line.value().trim()));
+        }
+    }
+    None
+}
+
+/// The `(uid, recurrence-id)` of every VEVENT, in the order they stand in the
+/// text; `None` for one the parser cannot use (no usable DTSTART).
+///
+/// Each VEVENT is parsed on its own, beside the document's VTIMEZONEs, so
+/// the recurrence-id is resolved exactly as [`parse_ics`] resolves it while
+/// the position stays the component's place in the text — the two orders a
+/// patch and a parse disagree on whenever the parser skips a component.
+fn vevent_identities(
+    text: &str,
+    calendar_id: &str,
+    file_name: &str,
+) -> Vec<Option<(String, Option<EventTime>)>> {
+    let lines = crate::patch::logical_lines(text);
+    let components = top_level_components(&lines);
+    components
+        .iter()
+        .filter(|c| c.name == "VEVENT")
+        .map(|target| {
+            let mut alone = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                let inside_another_vevent = components.iter().any(|c| {
+                    c.name == "VEVENT" && c.start != target.start && i >= c.start && i <= c.end
+                });
+                if !inside_another_vevent {
+                    alone.push_str(line.raw());
+                }
+            }
+            parse_ics(&alone, calendar_id, file_name)
+                .into_iter()
+                .next()
+                .map(|event| (event.uid, event.recurrence_id))
+        })
+        .collect()
+}
+
+/// Rewrites `text` without the components at `drop` (indices into
+/// `components`), deciding whether anything worth keeping remains.
+fn without_components(
+    lines: &[crate::patch::ContentLine<'_>],
+    components: &[ComponentRange],
+    drop: &[usize],
+) -> Removal {
+    if drop.is_empty() {
+        return Removal::NotFound;
+    }
+    let records_kept = components
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| !drop.contains(i) && (c.name == "VEVENT" || c.name == "VTODO"))
+        .count();
+    if records_kept == 0 {
+        // Nothing left but the calendar wrapper and its timezones.
+        return Removal::Emptied;
+    }
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let dropped = drop.iter().any(|&d| {
+            let c = &components[d];
+            i >= c.start && i <= c.end
+        });
+        if !dropped {
+            out.push_str(line.raw());
+        }
+    }
+    Removal::Rewritten(out)
+}
+
 /// Removes every `component` carrying `uid`, leaving the rest of the document
 /// byte-for-byte.
-///
-/// `None` when nothing would be left worth keeping — no VEVENT and no VTODO
-/// remain — in which case the caller should delete the file rather than write
-/// an empty calendar. `None` is also returned when no component matched, since
-/// there is then nothing to write.
 ///
 /// This exists because deleting a record used to unlink its whole file. A
 /// `.ics` may hold several records: two tasks, an imported pair of events with
@@ -1514,134 +1666,67 @@ fn exdate_line(event: &Event, exdate: NaiveDateTime) -> String {
 /// It is the delete twin of the write bug that [`upsert_vtodo`] fixed, on the
 /// same files, in the opposite direction.
 ///
+/// [`Removal::NotFound`] is its own answer rather than folded into "delete
+/// the file": the two once shared `None`, and a UID the raw text spelled
+/// escaped (`UID:a\,b`) matched nothing and unlinked a file of other
+/// people's events (audit F-11). UIDs are compared unescaped.
+///
 /// Every component sharing the uid goes: a recurring event's overrides are the
 /// same event as their master, and leaving them behind would resurrect the
 /// series as a scatter of orphaned instances.
 #[must_use]
-pub fn remove_by_uid(text: &str, component: &str, uid: &str) -> Option<String> {
+pub fn remove_by_uid(text: &str, component: &str, uid: &str) -> Removal {
     let lines = crate::patch::logical_lines(text);
-
-    // One pass to decide, because a component's UID is not known until its
-    // lines have been read, and the decision covers the whole range.
-    let mut ranges: Vec<(usize, usize, bool)> = Vec::new(); // start, end, remove
-    let mut records_kept = 0usize;
-    let mut start = None;
-    let mut is_record = false;
-    let mut matches = false;
-    let mut nested = 0usize;
-
-    for (i, line) in lines.iter().enumerate() {
-        if let Some(name) = line.begins() {
-            if start.is_some() {
-                nested += 1;
-            } else if name.eq_ignore_ascii_case("VEVENT") || name.eq_ignore_ascii_case("VTODO") {
-                start = Some(i);
-                is_record = name.eq_ignore_ascii_case(component);
-                matches = false;
-            }
-            continue;
-        }
-        if line.ends().is_some() {
-            if nested > 0 {
-                nested -= 1;
-            } else if let Some(from) = start.take() {
-                let remove = is_record && matches;
-                if !remove {
-                    records_kept += 1;
-                }
-                ranges.push((from, i, remove));
-            }
-            continue;
-        }
-        if start.is_some() && nested == 0 && line.name() == "UID" && line.value().trim() == uid {
-            matches = true;
-        }
-    }
-
-    if !ranges.iter().any(|(_, _, remove)| *remove) {
-        return None;
-    }
-    if records_kept == 0 {
-        // Nothing left but the calendar wrapper.
-        return None;
-    }
-
-    let mut out = String::with_capacity(text.len());
-    for (i, line) in lines.iter().enumerate() {
-        let dropped = ranges
-            .iter()
-            .any(|(from, to, remove)| *remove && i >= *from && i <= *to);
-        if !dropped {
-            out.push_str(line.raw());
-        }
-    }
-    Some(out)
+    let components = top_level_components(&lines);
+    let drop: Vec<usize> = components
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.name.eq_ignore_ascii_case(component)
+                && component_uid(&lines, c).as_deref() == Some(uid)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    without_components(&lines, &components, &drop)
 }
 
-/// Removes the VEVENT whose `RECURRENCE-ID` matches `rid` from a document.
+/// Removes the one VEVENT with this `uid` and `RECURRENCE-ID` from a document.
 ///
-/// Returns `None` when no component matches, or when the match is the only
-/// VEVENT in the document — an empty calendar file is not a meaningful thing
-/// to write, and the caller should delete the file instead.
+/// Matched by identity — UID *and* recurrence-id, resolved the way the
+/// parser resolves them — never by position alone. A match on the
+/// recurrence-id alone took another event's component (every non-recurring
+/// event has none), and positions counted over the parsed list pointed at the
+/// wrong text whenever the parser had skipped a component (audit F-11, F-12).
+/// Every record in the document counts towards [`Removal::Emptied`], a VTODO
+/// beside the events included.
 #[must_use]
 pub fn remove_vevent(
     text: &str,
     calendar_id: &str,
     file_name: &str,
+    uid: &str,
     rid: Option<EventTime>,
-) -> Option<String> {
-    use crate::patch::logical_lines;
-
-    let rids: Vec<Option<EventTime>> = parse_ics(text, calendar_id, file_name)
+) -> Removal {
+    let lines = crate::patch::logical_lines(text);
+    let components = top_level_components(&lines);
+    let identities = vevent_identities(text, calendar_id, file_name);
+    let Some(nth_vevent) = identities.iter().position(|identity| {
+        identity
+            .as_ref()
+            .is_some_and(|(u, r)| u == uid && *r == rid)
+    }) else {
+        return Removal::NotFound;
+    };
+    let Some(index) = components
         .iter()
-        .map(|e| e.recurrence_id)
-        .collect();
-    if rids.len() < 2 {
-        return None;
-    }
-    let target = rids.iter().position(|r| *r == rid)?;
-
-    let lines = logical_lines(text);
-    let mut out = String::with_capacity(text.len());
-    let mut vevent_index = 0usize;
-    let mut inside: Option<(usize, bool)> = None; // (nesting depth, skipping)
-
-    for line in &lines {
-        match inside {
-            None => {
-                if line.begins().as_deref() == Some("VEVENT") {
-                    let skipping = vevent_index == target;
-                    inside = Some((0, skipping));
-                    vevent_index += 1;
-                    if !skipping {
-                        out.push_str(line.raw());
-                    }
-                    continue;
-                }
-                out.push_str(line.raw());
-            }
-            Some((depth, skipping)) => {
-                if line.begins().is_some() {
-                    inside = Some((depth + 1, skipping));
-                } else if line.ends().is_some() {
-                    if depth == 0 {
-                        inside = None;
-                        if skipping {
-                            continue;
-                        }
-                        out.push_str(line.raw());
-                        continue;
-                    }
-                    inside = Some((depth - 1, skipping));
-                }
-                if !skipping {
-                    out.push_str(line.raw());
-                }
-            }
-        }
-    }
-
-    Some(out)
+        .enumerate()
+        .filter(|(_, c)| c.name == "VEVENT")
+        .nth(nth_vevent)
+        .map(|(i, _)| i)
+    else {
+        return Removal::NotFound;
+    };
+    without_components(&lines, &components, &[index])
 }
 
 /// Serialises one event as a complete single-VEVENT iCalendar document.
@@ -2908,7 +2993,11 @@ mod recurrence_id_tests {
         ]);
         let rid = parse_ics(&text, "personal", "series.ics")[1].recurrence_id;
 
-        let out = remove_vevent(&text, "personal", "series.ics", rid).expect("a match");
+        let Removal::Rewritten(out) =
+            remove_vevent(&text, "personal", "series.ics", "series@test", rid)
+        else {
+            panic!("the override was not found");
+        };
         let events = parse_ics(&out, "personal", "series.ics");
 
         assert_eq!(events.len(), 1);
@@ -2918,7 +3007,69 @@ mod recurrence_id_tests {
     #[test]
     fn removing_the_last_component_asks_for_file_deletion_instead() {
         let text = doc(&["DTSTART:20260803T090000Z\r\nSUMMARY:Only one"]);
-        assert!(remove_vevent(&text, "personal", "one.ics", None).is_none());
+        assert_eq!(
+            remove_vevent(&text, "personal", "one.ics", "series@test", None),
+            Removal::Emptied
+        );
+    }
+
+    #[test]
+    fn a_uid_that_is_escaped_in_the_file_is_still_found_and_nothing_else_goes() {
+        // `UID:a\,b` is the uid `a,b`. Compared raw it matched nothing, and
+        // "nothing matched" used to mean "delete the file" — taking the other
+        // event with it.
+        let text = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+BEGIN:VEVENT\r\nUID:a\\,b\r\nDTSTART:20260803T090000Z\r\nSUMMARY:Mine\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:other\r\nDTSTART:20260804T090000Z\r\nSUMMARY:Theirs\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let Removal::Rewritten(out) = remove_by_uid(text, "VEVENT", "a,b") else {
+            panic!("the escaped uid was not found");
+        };
+        let events = parse_ics(&out, "c", "f.ics");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].summary, "Theirs");
+    }
+
+    #[test]
+    fn a_record_that_is_not_there_is_not_found_rather_than_a_file_to_delete() {
+        let text = doc(&["DTSTART:20260803T090000Z\r\nSUMMARY:Someone else"]);
+        assert_eq!(remove_by_uid(&text, "VEVENT", "missing"), Removal::NotFound);
+        assert_eq!(
+            remove_vevent(&text, "personal", "one.ics", "missing", None),
+            Removal::NotFound
+        );
+    }
+
+    #[test]
+    fn removing_the_last_event_beside_a_task_keeps_the_task() {
+        let text = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+BEGIN:VEVENT\r\nUID:e\r\nDTSTART:20260803T090000Z\r\nSUMMARY:Event\r\nEND:VEVENT\r\n\
+BEGIN:VTODO\r\nUID:t\r\nSUMMARY:Task\r\nEND:VTODO\r\n\
+END:VCALENDAR\r\n";
+        let Removal::Rewritten(out) = remove_vevent(text, "c", "f.ics", "e", None) else {
+            panic!("the file was emptied while a task was still in it");
+        };
+        assert!(out.contains("UID:t"));
+        assert!(!out.contains("UID:e"));
+    }
+
+    #[test]
+    fn saving_an_event_patches_it_even_after_an_unusable_component() {
+        // The parser skips a VEVENT with no DTSTART, so a position counted
+        // over the parsed events pointed one component too early in the text.
+        let text = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+BEGIN:VEVENT\r\nUID:broken\r\nSUMMARY:No start\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:good\r\nDTSTART:20260803T090000Z\r\nSUMMARY:Before\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let mut event = parse_ics(text, "c", "f.ics").remove(0);
+        event.summary = "After".into();
+        let out = upsert_vevent(text, &event);
+        assert!(
+            out.contains("UID:broken\r\nSUMMARY:No start"),
+            "the wrong component was patched:\n{out}"
+        );
+        assert!(out.contains("SUMMARY:After"));
+        assert_eq!(out.matches("UID:good").count(), 1);
     }
 
     #[test]

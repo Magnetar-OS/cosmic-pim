@@ -42,6 +42,14 @@ pub enum StoreError {
         file: std::path::PathBuf,
     },
 
+    /// A record to delete is not in the file the index placed it in. The
+    /// file holds other records, so nothing was written and nothing unlinked.
+    #[error("{uid} is not in {file}; nothing was deleted")]
+    RecordNotFound {
+        uid: String,
+        file: std::path::PathBuf,
+    },
+
     /// A guarded write lost a race: the file changed between the caller's read
     /// and its write, and the incoming version was parked at `conflict` rather
     /// than being dropped on the floor.
@@ -642,14 +650,21 @@ impl Store {
             &text,
             &event.calendar_id,
             &event.file_name,
+            &event.uid,
             event.recurrence_id,
         ) {
-            Some(rest) => {
+            crate::ical::Removal::Rewritten(rest) => {
                 crate::atomic::write(&path, &rest, None)?;
             }
-            // The override was the only component left; an empty calendar
+            // The override was the only record left; an empty calendar
             // document is not worth keeping.
-            None => vdir::delete_event(&meta, &event.file_name)?,
+            crate::ical::Removal::Emptied => vdir::delete_event(&meta, &event.file_name)?,
+            crate::ical::Removal::NotFound => {
+                return Err(StoreError::RecordNotFound {
+                    uid: event.uid.clone(),
+                    file: path,
+                });
+            }
         }
         self.index.sync_calendar(&meta)?;
         Ok(())

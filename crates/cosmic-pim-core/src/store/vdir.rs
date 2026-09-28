@@ -199,11 +199,16 @@ pub fn remove_record(
     let path = meta.path.join(file_name);
     match std::fs::read_to_string(&path) {
         Ok(text) => match crate::ical::remove_by_uid(&text, component, uid) {
-            Some(rest) => atomic::write(&path, &rest, None)
+            crate::ical::Removal::Rewritten(rest) => atomic::write(&path, &rest, None)
                 .map(|_| ())
                 .map_err(Into::into),
-            // Nothing of value would be left, or the record was not in there.
-            None => delete_event(meta, file_name),
+            crate::ical::Removal::Emptied => delete_event(meta, file_name),
+            // The file holds other records and not this one. Unlinking it
+            // would delete them; the caller's picture of the file is wrong.
+            crate::ical::Removal::NotFound => Err(StoreError::RecordNotFound {
+                uid: uid.to_owned(),
+                file: path,
+            }),
         },
         // Already gone; deleting what is not there is not an error a user can
         // act on.

@@ -61,6 +61,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   pull puts the item back (audit F-17).
 - An automatic three-way merge clears a conflict recorded for the same
   resource on an earlier pass (audit F-20).
+- Deleting an event or task whose record cannot be found in its file (an
+  escaped `UID`, a stale index) is an error instead of unlinking the whole
+  file and every other record in it; a VTODO beside the last event is kept
+  (audit F-11).
+- Saving an event in a file that also holds a VEVENT without a usable DTSTART
+  patches the right component instead of the one before it (audit F-12).
 
 ### Changed
 
@@ -80,6 +86,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `unpushed_base` take `&mut self` (they re-read the sidecar).
 - `caldav::Conflict` has a new public field `kind`; code building a `Conflict`
   literal must set it. `CalDavStore` gains `queued_delete` (default `false`).
+- `ical::remove_by_uid` returns `ical::Removal` (`Rewritten(String)`,
+  `Emptied`, `NotFound`); `ical::remove_vevent` takes the `uid` as well and
+  returns `Removal`. `StoreError::RecordNotFound { uid, file }` is new.
 
 ### Added
 
