@@ -11,6 +11,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 - `AccountStore::save` no longer drops an account another app added on the
   second save from a long-lived handle (audit F-01).
+- Writes through `atomic::write` stage in a per-writer temp file, so two
+  processes writing one file no longer publish a mix of both (audit F-02).
 
 ### Changed
 

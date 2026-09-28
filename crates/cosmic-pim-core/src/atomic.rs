@@ -45,6 +45,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The `(size, mtime)` a caller read a file at, used as a concurrency token.
@@ -109,19 +110,31 @@ pub fn state_of(path: &Path) -> Result<Option<FileState>, Error> {
     }))
 }
 
-/// Sibling temp path for `target`: `<dir>/.<name>.tmp`.
+/// Sibling temp path for `target`: `<dir>/.<name>.<pid>-<n>.tmp`.
 ///
 /// The leading dot matters beyond tidiness: the vdir watcher skips
 /// `.*.tmp`, so staging a write here does not wake the UI for a file that is
 /// about to be renamed away.
+///
+/// The process id and a per-process counter make the name private to this
+/// one write. The suite's apps and its sync daemon write the same files, and
+/// a name derived from the target alone was shared between them: the second
+/// writer truncated the first one's staged bytes, and the first rename could
+/// publish a mixture of both.
 fn temp_path_for(target: &Path) -> Result<PathBuf, Error> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = target
         .parent()
         .ok_or_else(|| Error::NoParent(target.to_path_buf()))?;
     let name = target
         .file_name()
         .ok_or_else(|| Error::NoFileName(target.to_path_buf()))?;
-    Ok(parent.join(format!(".{}.tmp", name.to_string_lossy())))
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(
+        ".{}.{}-{n}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
 }
 
 /// Sibling conflict path for `target`: `<name>.<unix-seconds>.conflict`.
@@ -209,18 +222,31 @@ pub fn write_bytes(
 
     // Write and flush the temp file to stable storage before it is a candidate
     // for the rename. `fs::write` alone would only reach the page cache.
-    {
-        let mut file = fs::File::create(&temp_path)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
+    // `create_new`: the name is ours alone, so finding it taken means another
+    // writer is mid-write, and truncating it would tear that write.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+    if let Err(why) = file.write_all(contents).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(why.into());
     }
+    drop(file);
 
     // The concurrency check happens as late as possible — after the expensive
     // write, immediately before the swap — to make the TOCTOU window as small
     // as it can be without filesystem locking.
-    if let Some(expected_state) = expected
-        && state_of(target)? != Some(expected_state)
-    {
+    let diverged = match expected {
+        Some(expected_state) => {
+            state_of(target).inspect_err(|_| {
+                let _ = fs::remove_file(&temp_path);
+            })? != Some(expected_state)
+        }
+        None => false,
+    };
+    if diverged {
         let conflict = conflict_path_for(target)?;
         // The temp already holds the incoming bytes, fsynced. Promote it rather
         // than re-writing, so the conflict copy costs nothing extra.
@@ -293,6 +319,25 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(strays.is_empty(), "temp file left behind: {strays:?}");
+    }
+
+    #[test]
+    fn another_writers_staged_temp_is_left_alone() {
+        // The app and the sync daemon write the same collection. A temp file
+        // name derived from the target alone is shared by both, so one
+        // writer truncated the other's staged bytes and renamed them away.
+        let d = dir();
+        let target = d.path().join("event.ics");
+        let theirs = d.path().join(".event.ics.tmp");
+        fs::write(&theirs, "their half-written bytes").unwrap();
+
+        write(&target, "ours", None).expect("write");
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "ours");
+        assert_eq!(
+            fs::read_to_string(&theirs).expect("the other writer's temp was taken"),
+            "their half-written bytes"
+        );
     }
 
     #[test]
