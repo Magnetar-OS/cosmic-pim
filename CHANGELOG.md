@@ -76,6 +76,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   none, mailed by someone other than the organizer (when the caller passes the
   sender), or targeting an event this account organizes returns
   `Outcome::NotFromOrganizer` and changes nothing (audit F-38).
+- A maildir's sync sidecar is changed only under its lock and over a fresh
+  read, so a flag, move or delete the app queues while a sync pass holds the
+  mailbox is no longer erased by the pass's cursor commit; a pushed change no
+  longer settles a newer one for the same message (Envelope audit F-02).
 
 ### Changed
 
@@ -101,6 +105,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `itip::apply(collection, ics, me, sender: Option<&str>)` takes the mail's
   sender; `itip::Outcome` gains `NotFromOrganizer`; `itip::Participant` gains
   `sent_by`; `Itip::is_from_organizer(me, sender)` is new.
+- `mail::push::PushQueue`: `pending(&self) -> Result<Vec<PendingPush>>`;
+  `resolve(&mut self, pushed: &PendingPush)` and `defer(&mut self, pushed:
+  &PendingPush, failure, error, next_attempt_ms)` settle only that exact
+  queued operation.
 
 ### Added
 

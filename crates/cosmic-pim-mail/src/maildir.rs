@@ -220,17 +220,27 @@ impl MaildirStore {
         self.index.get(&uid).map(|rel| self.root.join(rel))
     }
 
-    fn write_sidecar(&self) -> Result<()> {
+    /// The one way the sidecar changes: under the maildir's lock, over a
+    /// fresh read of the file, then written back whole.
+    ///
+    /// A sync pass holds a store per mailbox from open to cursor commit,
+    /// across network fetches, while the app marks, flags and archives
+    /// through stores of its own on the same maildir. Writing this handle's
+    /// snapshot, as this store once did, erased every write the app queued
+    /// meanwhile — the local file had already changed, so the UI showed
+    /// success, and the server never heard of it (Envelope audit F-02).
+    fn update(&mut self, change: impl FnOnce(&mut Sidecar)) -> Result<()> {
         let path = self.root.join(SIDECAR);
-        let json = serde_json::to_string_pretty(&Sidecar {
-            cursor: self.cursor,
-            pending: self.pending.clone(),
-        })
-        .map_err(|source| Error::Sidecar {
+        let _lock = atomic::lock(&path)?;
+        let mut sidecar = read_sidecar(&self.root)?;
+        change(&mut sidecar);
+        let json = serde_json::to_string_pretty(&sidecar).map_err(|source| Error::Sidecar {
             path: path.clone(),
             source,
         })?;
         atomic::write(&path, &json, None)?;
+        self.cursor = sidecar.cursor;
+        self.pending = sidecar.pending;
         Ok(())
     }
 }
@@ -320,8 +330,7 @@ impl MailStore for MaildirStore {
     }
 
     fn commit_cursor(&mut self, cursor: Cursor) -> Result<()> {
-        self.cursor = cursor;
-        self.write_sidecar()
+        self.update(|sidecar| sidecar.cursor = cursor)
     }
 
     fn reset(&mut self, uid_validity: u32) -> Result<()> {
@@ -332,12 +341,13 @@ impl MailStore for MaildirStore {
         // Every queued write names a UID in the *old* numbering. Replaying one
         // after a renumbering applies the user's change to whatever message now
         // holds that number, which is worse than dropping it.
-        self.pending.clear();
-        self.cursor = Cursor {
-            uid_validity,
-            ..Cursor::default()
-        };
-        self.write_sidecar()
+        self.update(|sidecar| {
+            sidecar.pending.clear();
+            sidecar.cursor = Cursor {
+                uid_validity,
+                ..Cursor::default()
+            };
+        })
     }
 
     fn keywords(&self) -> Vec<String> {
@@ -355,29 +365,36 @@ impl MailStore for MaildirStore {
 }
 
 impl PushQueue for MaildirStore {
-    fn pending(&self) -> Vec<PendingPush> {
-        self.pending.clone()
+    /// What is queued, read from disk: another handle — the app's, while
+    /// this one is a sync pass — may have queued since this one was opened.
+    fn pending(&self) -> Result<Vec<PendingPush>> {
+        Ok(read_sidecar(&self.root)?.pending)
     }
 
     fn enqueue(&mut self, op: PushOp) -> Result<()> {
-        crate::push::enqueue_into(&mut self.pending, op);
-        self.write_sidecar()
+        self.update(|sidecar| crate::push::enqueue_into(&mut sidecar.pending, op))
     }
 
-    fn resolve(&mut self, uid: u32) -> Result<()> {
-        self.pending.retain(|entry| entry.op.uid() != uid);
-        self.write_sidecar()
+    fn resolve(&mut self, pushed: &PendingPush) -> Result<()> {
+        self.update(|sidecar| crate::push::resolve_in(&mut sidecar.pending, pushed))
     }
 
     fn defer(
         &mut self,
-        uid: u32,
+        pushed: &PendingPush,
         failure: Failure,
         error: &str,
         next_attempt_ms: i64,
     ) -> Result<()> {
-        crate::push::defer_in(&mut self.pending, uid, failure, error, next_attempt_ms);
-        self.write_sidecar()
+        self.update(|sidecar| {
+            crate::push::defer_in(
+                &mut sidecar.pending,
+                pushed,
+                failure,
+                error,
+                next_attempt_ms,
+            );
+        })
     }
 }
 
@@ -810,6 +827,71 @@ mod queue_tests {
     }
 
     #[test]
+    fn a_write_queued_by_the_app_survives_the_sync_passs_cursor_commit() {
+        // The sync pass opens its store, then spends seconds on the network;
+        // the user archives a message through the app's own store meanwhile.
+        // The pass's commit must not write its stale queue over the archive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("INBOX");
+        let mut pass = MaildirStore::open(&path).unwrap();
+        let mut app = MaildirStore::open(&path).unwrap();
+
+        app.enqueue(PushOp::Move {
+            uid: 7,
+            destination: "Archive".into(),
+        })
+        .unwrap();
+        pass.commit_cursor(Cursor {
+            uid_validity: 1,
+            last_uid: 9,
+            ..Cursor::default()
+        })
+        .unwrap();
+
+        let reopened = MaildirStore::open(&path).unwrap();
+        let pending = reopened.pending().unwrap();
+        assert_eq!(pending.len(), 1, "the archive queued mid-pass was lost");
+        assert_eq!(pending[0].op.uid(), 7);
+        assert_eq!(reopened.state().unwrap().cursor.last_uid, 9);
+    }
+
+    #[test]
+    fn a_pushed_change_does_not_settle_a_newer_one_for_the_same_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("INBOX");
+        let mut pass = MaildirStore::open(&path).unwrap();
+        pass.enqueue(PushOp::SetFlags {
+            uid: 3,
+            flags: seen(),
+        })
+        .unwrap();
+        let pushed = crate::push::queued_for(&pass, 3);
+
+        MaildirStore::open(&path)
+            .unwrap()
+            .enqueue(PushOp::SetFlags {
+                uid: 3,
+                flags: Flags::default(),
+            })
+            .unwrap();
+        pass.resolve(&pushed).unwrap();
+
+        let pending = pass.pending().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the newer change was dropped as if pushed"
+        );
+        assert_eq!(
+            pending[0].op,
+            PushOp::SetFlags {
+                uid: 3,
+                flags: Flags::default()
+            }
+        );
+    }
+
+    #[test]
     fn a_queued_write_survives_a_restart() {
         // The whole reason the queue is on disk. A flag change lost to a crash
         // before it was pushed diverges silently and permanently.
@@ -825,8 +907,8 @@ mod queue_tests {
                 .unwrap();
         }
         let store = MaildirStore::open(&path).unwrap();
-        assert_eq!(store.pending().len(), 1);
-        assert_eq!(store.pending()[0].op.uid(), 4);
+        assert_eq!(store.pending().unwrap().len(), 1);
+        assert_eq!(store.pending().unwrap()[0].op.uid(), 4);
     }
 
     #[test]
@@ -838,11 +920,16 @@ mod queue_tests {
             let mut store = MaildirStore::open(&path).unwrap();
             store.enqueue(PushOp::Delete { uid: 9 }).unwrap();
             store
-                .defer(9, Failure::User, "NO [NOPERM] read-only mailbox", 0)
+                .defer(
+                    &crate::push::queued_for(&store, 9),
+                    Failure::User,
+                    "NO [NOPERM] read-only mailbox",
+                    0,
+                )
                 .unwrap();
         }
         let store = MaildirStore::open(&path).unwrap();
-        let entry = &store.pending()[0];
+        let entry = &store.pending().unwrap()[0];
         assert_eq!(entry.blocked, Some(Failure::User));
         assert!(entry.last_error.as_deref().unwrap().contains("NOPERM"));
     }
@@ -860,7 +947,7 @@ mod queue_tests {
             .unwrap();
         store.reset(2).unwrap();
         assert!(
-            store.pending().is_empty(),
+            store.pending().unwrap().is_empty(),
             "a queued write would have been applied to a different message"
         );
     }

@@ -913,23 +913,23 @@ impl MailStore for MemoryMailbox {
 }
 
 impl PushQueue for MemoryMailbox {
-    fn pending(&self) -> Vec<push::PendingPush> {
+    fn pending(&self) -> Result<Vec<push::PendingPush>> {
         self.queue.pending()
     }
     fn enqueue(&mut self, op: push::PushOp) -> Result<()> {
         self.queue.enqueue(op)
     }
-    fn resolve(&mut self, uid: u32) -> Result<()> {
-        self.queue.resolve(uid)
+    fn resolve(&mut self, pushed: &push::PendingPush) -> Result<()> {
+        self.queue.resolve(pushed)
     }
     fn defer(
         &mut self,
-        uid: u32,
+        pushed: &push::PendingPush,
         failure: push::Failure,
         error: &str,
         next_attempt_ms: i64,
     ) -> Result<()> {
-        self.queue.defer(uid, failure, error, next_attempt_ms)
+        self.queue.defer(pushed, failure, error, next_attempt_ms)
     }
 }
 

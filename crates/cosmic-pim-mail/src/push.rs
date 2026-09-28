@@ -181,7 +181,9 @@ impl PendingPush {
 /// implementations and this has one, but the backoff schedule still has to be
 /// exercisable without a disk.
 pub trait PushQueue {
-    fn pending(&self) -> Vec<PendingPush>;
+    /// What is queued now. Fallible because a store shared between processes
+    /// answers from disk, where another process may have queued since.
+    fn pending(&self) -> crate::Result<Vec<PendingPush>>;
 
     /// Adds an operation, or replaces an existing one for the same UID and
     /// resets it to "due now".
@@ -197,13 +199,20 @@ pub trait PushQueue {
     /// true, and enqueueing flags after a move must not cancel the move.
     fn enqueue(&mut self, op: PushOp) -> crate::Result<()>;
 
-    /// Drops the entry for `uid` — it succeeded.
-    fn resolve(&mut self, uid: u32) -> crate::Result<()>;
+    /// Drops the entry `pushed` — it succeeded — unless a different operation
+    /// for the same message has been queued since.
+    ///
+    /// A drain works from a snapshot and spends a network round trip per
+    /// entry; a flag the user changes meanwhile replaces the entry for that
+    /// UID. Settling by UID alone dropped that newer change as if it had
+    /// reached the server.
+    fn resolve(&mut self, pushed: &PendingPush) -> crate::Result<()>;
 
-    /// Records a failure and reschedules, or blocks the entry.
+    /// Records a failure of `pushed` and reschedules, or blocks the entry —
+    /// again only while it is still the queued operation for its message.
     fn defer(
         &mut self,
-        uid: u32,
+        pushed: &PendingPush,
         failure: Failure,
         error: &str,
         next_attempt_ms: i64,
@@ -311,7 +320,16 @@ impl DrainOutcome {
 pub fn drain(server: &mut impl Writeback, queue: &mut impl PushQueue, now_ms: i64) -> DrainOutcome {
     let mut outcome = DrainOutcome::default();
 
-    for entry in queue.pending() {
+    let pending = match queue.pending() {
+        Ok(pending) => pending,
+        Err(why) => {
+            tracing::warn!(%why, "could not read the writeback queue; nothing was pushed");
+            outcome.deferred += 1;
+            return outcome;
+        }
+    };
+
+    for entry in pending {
         if !entry.is_live() || entry.next_attempt_ms > now_ms {
             outcome.skipped += 1;
             continue;
@@ -326,7 +344,7 @@ pub fn drain(server: &mut impl Writeback, queue: &mut impl PushQueue, now_ms: i6
 
         match result {
             Ok(()) => {
-                if let Err(why) = queue.resolve(uid) {
+                if let Err(why) = queue.resolve(&entry) {
                     tracing::warn!(uid, %why, "push succeeded but the queue entry survived");
                 }
                 if matches!(entry.op, PushOp::Move { .. } | PushOp::Delete { .. }) {
@@ -357,7 +375,7 @@ pub fn drain(server: &mut impl Writeback, queue: &mut impl PushQueue, now_ms: i6
                         entry.next_attempt_ms
                     }
                 };
-                if let Err(e) = queue.defer(uid, failure, &why.to_string(), next) {
+                if let Err(e) = queue.defer(&entry, failure, &why.to_string(), next) {
                     tracing::warn!(uid, %e, "could not record a writeback failure");
                 }
             }
@@ -375,8 +393,8 @@ pub struct MemoryQueue {
 }
 
 impl PushQueue for MemoryQueue {
-    fn pending(&self) -> Vec<PendingPush> {
-        self.entries.clone()
+    fn pending(&self) -> crate::Result<Vec<PendingPush>> {
+        Ok(self.entries.clone())
     }
 
     fn enqueue(&mut self, op: PushOp) -> crate::Result<()> {
@@ -384,21 +402,27 @@ impl PushQueue for MemoryQueue {
         Ok(())
     }
 
-    fn resolve(&mut self, uid: u32) -> crate::Result<()> {
-        self.entries.retain(|e| e.op.uid() != uid);
+    fn resolve(&mut self, pushed: &PendingPush) -> crate::Result<()> {
+        resolve_in(&mut self.entries, pushed);
         Ok(())
     }
 
     fn defer(
         &mut self,
-        uid: u32,
+        pushed: &PendingPush,
         failure: Failure,
         error: &str,
         next_attempt_ms: i64,
     ) -> crate::Result<()> {
-        defer_in(&mut self.entries, uid, failure, error, next_attempt_ms);
+        defer_in(&mut self.entries, pushed, failure, error, next_attempt_ms);
         Ok(())
     }
+}
+
+/// The settle rule, shared like [`enqueue_into`]: only the operation that was
+/// pushed goes, never a newer one queued for the same message meanwhile.
+pub(crate) fn resolve_in(entries: &mut Vec<PendingPush>, pushed: &PendingPush) {
+    entries.retain(|e| e.op != pushed.op);
 }
 
 /// The enqueue rule, shared by every [`PushQueue`] implementation so the
@@ -431,12 +455,12 @@ pub(crate) fn enqueue_into(entries: &mut Vec<PendingPush>, op: PushOp) {
 
 pub(crate) fn defer_in(
     entries: &mut [PendingPush],
-    uid: u32,
+    pushed: &PendingPush,
     failure: Failure,
     error: &str,
     next_attempt_ms: i64,
 ) {
-    if let Some(entry) = entries.iter_mut().find(|e| e.op.uid() == uid) {
+    if let Some(entry) = entries.iter_mut().find(|e| e.op == pushed.op) {
         entry.last_error = Some(error.to_owned());
         match failure {
             Failure::Retry => {
@@ -447,6 +471,17 @@ pub(crate) fn defer_in(
             other => entry.blocked = Some(other),
         }
     }
+}
+
+/// The queued entry for `uid`, for tests that settle one by hand.
+#[cfg(test)]
+pub(crate) fn queued_for(queue: &impl PushQueue, uid: u32) -> PendingPush {
+    queue
+        .pending()
+        .expect("the queue is readable")
+        .into_iter()
+        .find(|entry| entry.op.uid() == uid)
+        .expect("that uid is queued")
 }
 
 #[cfg(test)]
@@ -608,10 +643,17 @@ mod tests {
     fn re_enqueueing_the_same_uid_replaces_rather_than_appends() {
         let mut queue = MemoryQueue::default();
         queue.enqueue(set_flags(1)).unwrap();
-        queue.defer(1, Failure::Retry, "boom", 999_999).unwrap();
+        queue
+            .defer(
+                &crate::push::queued_for(&queue, 1),
+                Failure::Retry,
+                "boom",
+                999_999,
+            )
+            .unwrap();
         queue.enqueue(set_flags(1)).unwrap();
 
-        let pending = queue.pending();
+        let pending = queue.pending().unwrap();
         assert_eq!(pending.len(), 1, "the queue accumulated duplicates");
         assert_eq!(
             pending[0].attempts, 0,
@@ -632,7 +674,7 @@ mod tests {
             .unwrap();
         queue.enqueue(set_flags(1)).unwrap();
 
-        let pending = queue.pending();
+        let pending = queue.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert!(
             matches!(pending[0].op, PushOp::Move { .. }),
@@ -650,7 +692,7 @@ mod tests {
 
         assert_eq!(outcome.deferred, 1);
         assert!(!outcome.is_stuck());
-        let entry = &queue.pending()[0];
+        let entry = &queue.pending().unwrap()[0];
         assert_eq!(entry.attempts, 1);
         assert_eq!(entry.next_attempt_ms, retry_delay_ms(1));
         assert!(entry.is_live());
@@ -675,7 +717,10 @@ mod tests {
 
         assert_eq!(outcome.needs_reconcile, 1);
         assert_eq!(outcome.deferred, 0, "a renumbering was scheduled for retry");
-        assert_eq!(queue.pending()[0].blocked, Some(Failure::Reconcile));
+        assert_eq!(
+            queue.pending().unwrap()[0].blocked,
+            Some(Failure::Reconcile)
+        );
     }
 
     #[test]
@@ -688,14 +733,25 @@ mod tests {
 
         assert_eq!(outcome.needs_user, 1);
         assert!(outcome.is_stuck());
-        assert_eq!(queue.pending()[0].attempts, 0, "a retry slot was consumed");
+        assert_eq!(
+            queue.pending().unwrap()[0].attempts,
+            0,
+            "a retry slot was consumed"
+        );
     }
 
     #[test]
     fn a_blocked_entry_is_not_attempted_again() {
         let mut queue = MemoryQueue::default();
         queue.enqueue(set_flags(1)).unwrap();
-        queue.defer(1, Failure::User, "[NOPERM]", 0).unwrap();
+        queue
+            .defer(
+                &crate::push::queued_for(&queue, 1),
+                Failure::User,
+                "[NOPERM]",
+                0,
+            )
+            .unwrap();
 
         let mut server = FakeServer::default();
         let outcome = drain(&mut server, &mut queue, i64::MAX);
@@ -711,24 +767,40 @@ mod tests {
         let mut queue = MemoryQueue::default();
         queue.enqueue(set_flags(1)).unwrap();
         queue
-            .defer(1, Failure::User, "[AUTHENTICATIONFAILED]", 0)
+            .defer(
+                &crate::push::queued_for(&queue, 1),
+                Failure::User,
+                "[AUTHENTICATIONFAILED]",
+                0,
+            )
             .unwrap();
         queue.enqueue(set_flags(1)).unwrap();
-        assert!(queue.pending()[0].is_live());
+        assert!(queue.pending().unwrap()[0].is_live());
     }
 
     #[test]
     fn an_entry_that_is_not_due_yet_is_skipped_not_attempted() {
         let mut queue = MemoryQueue::default();
         queue.enqueue(set_flags(1)).unwrap();
-        queue.defer(1, Failure::Retry, "boom", 10_000).unwrap();
+        queue
+            .defer(
+                &crate::push::queued_for(&queue, 1),
+                Failure::Retry,
+                "boom",
+                10_000,
+            )
+            .unwrap();
 
         let mut server = FakeServer::default();
         let outcome = drain(&mut server, &mut queue, 5_000);
 
         assert_eq!(outcome.skipped, 1);
         assert!(server.calls.is_empty());
-        assert_eq!(queue.pending()[0].attempts, 1, "an attempt was consumed");
+        assert_eq!(
+            queue.pending().unwrap()[0].attempts,
+            1,
+            "an attempt was consumed"
+        );
     }
 
     #[test]
@@ -741,7 +813,7 @@ mod tests {
         let outcome = drain(&mut server, &mut queue, 0);
 
         assert_eq!(outcome.succeeded, 2);
-        assert!(queue.pending().is_empty());
+        assert!(queue.pending().unwrap().is_empty());
     }
 
     #[test]

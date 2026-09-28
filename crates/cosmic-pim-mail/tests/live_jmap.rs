@@ -886,7 +886,7 @@ fn a_local_flag_change_reaches_the_server_before_the_pull_can_undo_it() {
         "the flag change never went out"
     );
     assert!(
-        store.pending().is_empty(),
+        store.pending().unwrap().is_empty(),
         "the queue entry outlived its push"
     );
 

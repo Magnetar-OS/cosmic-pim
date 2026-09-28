@@ -440,7 +440,7 @@ fn queued_flag_changes_are_pushed_before_the_pull_reads_them_back() {
 
     assert_eq!(outcome.pushed.succeeded, 1);
     assert!(
-        store.pending().is_empty(),
+        store.pending().unwrap().is_empty(),
         "the queue kept a successful push"
     );
 
