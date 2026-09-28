@@ -87,6 +87,9 @@ pub struct Participant {
     pub name: Option<String>,
     /// `ACCEPTED`, `DECLINED`, `TENTATIVE`, `NEEDS-ACTION` — uppercased.
     pub partstat: Option<String>,
+    /// `SENT-BY`: someone acting for this person (a delegate, an assistant),
+    /// lowercased and `mailto:`-stripped.
+    pub sent_by: Option<String>,
 }
 
 /// What an iTIP payload says, read from its first VEVENT.
@@ -115,6 +118,23 @@ impl Itip {
     pub fn is_addressed_to(&self, me: &str) -> bool {
         let me = normalise_email(me);
         !me.is_empty() && self.attendees.iter().any(|a| a.email == me)
+    }
+
+    /// Whether a REQUEST or CANCEL is the organizer's own: it names an
+    /// organizer who is not `me`, and a known `sender` is that organizer or
+    /// the one acting for them.
+    #[must_use]
+    pub fn is_from_organizer(&self, me: &str, sender: Option<&str>) -> bool {
+        let Some(organizer) = &self.organizer else {
+            return false;
+        };
+        if organizer.email.is_empty() || organizer.email == normalise_email(me) {
+            return false;
+        }
+        sender.is_none_or(|sender| {
+            let sender = normalise_email(sender);
+            sender == organizer.email || organizer.sent_by.as_deref() == Some(sender.as_str())
+        })
     }
 
     /// Whether this payload may overwrite an event stored with
@@ -213,6 +233,7 @@ fn participant(params: &str, value: &str) -> Participant {
         email: normalise_email(value),
         name: param(params, "CN"),
         partstat: param(params, "PARTSTAT").map(|p| p.to_ascii_uppercase()),
+        sent_by: param(params, "SENT-BY").map(|p| normalise_email(&p)),
     }
 }
 
@@ -460,6 +481,12 @@ pub enum Outcome {
     /// REQUEST/CANCEL whose attendees do not include this account. A
     /// forwarded or mislabelled invite; not ours to act on.
     NotForMe,
+    /// REQUEST/CANCEL that does not come from the event's organizer: it names
+    /// none, names a different one from the stored event, was mailed by
+    /// someone else, or targets an event this account organizes. Nothing was
+    /// touched. Anyone who learns a UID can write such a message, and applying
+    /// it would let them rewrite or delete the event.
+    NotFromOrganizer,
     /// REPLY or CANCEL naming a UID this collection does not hold.
     NoMatch,
     /// PUBLISH, COUNTER, REFRESH… — recognised and left alone.
@@ -487,7 +514,14 @@ impl Outcome {
 /// Applies one iTIP payload to a vdir collection directory.
 ///
 /// `me` is the account address the mail arrived at, for the attendee gate.
-pub fn apply(collection: &Path, ics: &str, me: &str) -> Result<Outcome> {
+///
+/// `sender` is who the message came from, where the caller knows it — the
+/// mail's `From`. A REQUEST or CANCEL is accepted only from its ORGANIZER (or
+/// the ORGANIZER's `SENT-BY`), so a known sender is checked against that.
+/// `None` skips only this one check; the payload's ORGANIZER is still
+/// compared with the stored event's, and an event this account organizes is
+/// never rewritten or cancelled by mail (RFC 5546 section 6.1).
+pub fn apply(collection: &Path, ics: &str, me: &str, sender: Option<&str>) -> Result<Outcome> {
     let Some(itip) = parse(ics) else {
         return Ok(Outcome::Ignored);
     };
@@ -500,14 +534,20 @@ pub fn apply(collection: &Path, ics: &str, me: &str) -> Result<Outcome> {
             if !itip.is_addressed_to(me) {
                 return Ok(Outcome::NotForMe);
             }
-            apply_request(collection, ics, &itip)
+            if !itip.is_from_organizer(me, sender) {
+                return Ok(Outcome::NotFromOrganizer);
+            }
+            apply_request(collection, ics, &itip, me)
         }
         Method::Reply => apply_reply(collection, &itip),
         Method::Cancel => {
             if !itip.is_addressed_to(me) {
                 return Ok(Outcome::NotForMe);
             }
-            apply_cancel(collection, &itip)
+            if !itip.is_from_organizer(me, sender) {
+                return Ok(Outcome::NotFromOrganizer);
+            }
+            apply_cancel(collection, &itip, me)
         }
         Method::Publish | Method::Other => Ok(Outcome::Ignored),
     }
@@ -590,7 +630,36 @@ fn unused_name(collection: &Path, uid: &str) -> String {
     name
 }
 
-fn apply_request(collection: &Path, ics: &str, itip: &Itip) -> Result<Outcome> {
+/// Whether a stored event may be changed by a payload from `itip`'s
+/// organizer: the stored event names that organizer, or none, and does not
+/// name `me` as its organizer.
+fn stored_organizer_matches(stored: &str, itip: &Itip, me: &str) -> bool {
+    let Some(stored) = stored_organizer(stored) else {
+        return true;
+    };
+    stored != normalise_email(me)
+        && itip
+            .organizer
+            .as_ref()
+            .is_some_and(|organizer| organizer.email == stored)
+}
+
+/// The ORGANIZER address of the stored file's first component.
+fn stored_organizer(ics: &str) -> Option<String> {
+    let mut depth = 0usize;
+    for line in logical_lines(ics) {
+        if line.begins().is_some() {
+            depth += 1;
+        } else if line.ends().is_some() {
+            depth = depth.saturating_sub(1);
+        } else if depth == 2 && line.name() == "ORGANIZER" {
+            return Some(normalise_email(line.value()));
+        }
+    }
+    None
+}
+
+fn apply_request(collection: &Path, ics: &str, itip: &Itip, me: &str) -> Result<Outcome> {
     let stripped = strip_method(ics);
 
     match find_by_uid(collection, &itip.uid) {
@@ -604,6 +673,9 @@ fn apply_request(collection: &Path, ics: &str, itip: &Itip) -> Result<Outcome> {
         Some(path) => {
             let stored = std::fs::read_to_string(&path)
                 .map_err(|why| Error::internal(format!("reading {}: {why}", path.display())))?;
+            if !stored_organizer_matches(&stored, itip, me) {
+                return Ok(Outcome::NotFromOrganizer);
+            }
             if !itip.supersedes(stored_sequence(&stored)) {
                 return Ok(Outcome::Stale);
             }
@@ -677,12 +749,15 @@ fn apply_reply(collection: &Path, itip: &Itip) -> Result<Outcome> {
     })
 }
 
-fn apply_cancel(collection: &Path, itip: &Itip) -> Result<Outcome> {
+fn apply_cancel(collection: &Path, itip: &Itip, me: &str) -> Result<Outcome> {
     let Some(path) = find_by_uid(collection, &itip.uid) else {
         return Ok(Outcome::NoMatch);
     };
     let stored = std::fs::read_to_string(&path)
         .map_err(|why| Error::internal(format!("reading {}: {why}", path.display())))?;
+    if !stored_organizer_matches(&stored, itip, me) {
+        return Ok(Outcome::NotFromOrganizer);
+    }
     if !itip.supersedes(stored_sequence(&stored)) {
         return Ok(Outcome::Stale);
     }
@@ -1699,7 +1774,7 @@ SUMMARY:Someone else's meeting\r\nORGANIZER:mailto:boss@org.example\r\n\
 ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\n\
 END:VEVENT\r\nEND:VCALENDAR\r\n";
 
-        let outcome = apply(dir.path(), invitation, "me@example.com").expect("apply");
+        let outcome = apply(dir.path(), invitation, "me@example.com", None).expect("apply");
         assert!(matches!(outcome, Outcome::Created { .. }), "{outcome:?}");
 
         // The appointment that was already there is untouched.
@@ -1733,7 +1808,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     fn a_request_lands_as_a_file_with_the_organizers_bytes() {
         let dir = collection();
 
-        let outcome = apply(dir.path(), &request(0), "ada@example.com").expect("apply");
+        let outcome = apply(dir.path(), &request(0), "ada@example.com", None).expect("apply");
 
         let Outcome::Created { file } = outcome else {
             panic!("expected Created, got {outcome:?}");
@@ -1751,7 +1826,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     fn a_forwarded_invitation_is_not_applied() {
         let dir = collection();
 
-        let outcome = apply(dir.path(), &request(0), "bystander@example.com").expect("apply");
+        let outcome = apply(dir.path(), &request(0), "bystander@example.com", None).expect("apply");
 
         assert_eq!(outcome, Outcome::NotForMe);
         assert_eq!(
@@ -1764,14 +1839,14 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn an_update_replaces_and_a_stale_resend_does_not() {
         let dir = collection();
-        apply(dir.path(), &request(1), "ada@example.com").expect("first");
+        apply(dir.path(), &request(1), "ada@example.com", None).expect("first");
 
         let newer = request(2).replace("SUMMARY:Planning", "SUMMARY:Planning (moved)");
-        let outcome = apply(dir.path(), &newer, "ada@example.com").expect("second");
+        let outcome = apply(dir.path(), &newer, "ada@example.com", None).expect("second");
         assert!(matches!(outcome, Outcome::Updated { .. }));
 
         // The old sequence arriving late — out-of-order delivery.
-        let stale = apply(dir.path(), &request(1), "ada@example.com").expect("third");
+        let stale = apply(dir.path(), &request(1), "ada@example.com", None).expect("third");
         assert_eq!(stale, Outcome::Stale);
 
         let file = find_by_uid(dir.path(), "meet-1@org.example").expect("file");
@@ -1785,9 +1860,9 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn a_series_cancel_removes_the_file() {
         let dir = collection();
-        apply(dir.path(), &request(1), "ada@example.com").expect("request");
+        apply(dir.path(), &request(1), "ada@example.com", None).expect("request");
 
-        let outcome = apply(dir.path(), &cancel(2, None), "ada@example.com").expect("cancel");
+        let outcome = apply(dir.path(), &cancel(2, None), "ada@example.com", None).expect("cancel");
 
         assert!(matches!(outcome, Outcome::Cancelled { .. }));
         assert!(find_by_uid(dir.path(), "meet-1@org.example").is_none());
@@ -1798,12 +1873,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         // THE bug this module exists to not have: the organizer cancels one
         // Tuesday and the whole weekly series vanishes.
         let dir = collection();
-        apply(dir.path(), &request(1), "ada@example.com").expect("request");
+        apply(dir.path(), &request(1), "ada@example.com", None).expect("request");
 
         let outcome = apply(
             dir.path(),
             &cancel(2, Some("20270112T100000")),
             "ada@example.com",
+            None,
         )
         .expect("cancel");
 
@@ -1820,9 +1896,9 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn a_stale_cancel_deletes_nothing() {
         let dir = collection();
-        apply(dir.path(), &request(5), "ada@example.com").expect("request");
+        apply(dir.path(), &request(5), "ada@example.com", None).expect("request");
 
-        let outcome = apply(dir.path(), &cancel(1, None), "ada@example.com").expect("cancel");
+        let outcome = apply(dir.path(), &cancel(1, None), "ada@example.com", None).expect("cancel");
 
         assert_eq!(outcome, Outcome::Stale);
         assert!(
@@ -1841,9 +1917,10 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
              ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:colleague@example.com\r\n",
         );
         let dir = collection();
-        apply(dir.path(), &with_colleague, "ada@example.com").expect("request");
+        apply(dir.path(), &with_colleague, "ada@example.com", None).expect("request");
 
-        let outcome = apply(dir.path(), &reply("DECLINED"), "ada@example.com").expect("reply");
+        let outcome =
+            apply(dir.path(), &reply("DECLINED"), "ada@example.com", None).expect("reply");
 
         let Outcome::ReplyApplied { file, updated } = outcome else {
             panic!("expected ReplyApplied, got {outcome:?}");
@@ -1864,7 +1941,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     fn a_reply_for_an_unknown_event_reports_no_match() {
         let dir = collection();
         assert_eq!(
-            apply(dir.path(), &reply("ACCEPTED"), "ada@example.com").expect("reply"),
+            apply(dir.path(), &reply("ACCEPTED"), "ada@example.com", None).expect("reply"),
             Outcome::NoMatch
         );
     }
@@ -1874,7 +1951,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         let publish = request(0).replace("METHOD:REQUEST", "METHOD:PUBLISH");
         let dir = collection();
         assert_eq!(
-            apply(dir.path(), &publish, "ada@example.com").expect("apply"),
+            apply(dir.path(), &publish, "ada@example.com", None).expect("apply"),
             Outcome::Ignored
         );
     }
@@ -1930,5 +2007,61 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
             parsed.recurrence_id.as_deref(),
             Some("20270112T100000;TZID=Europe/Athens")
         );
+    }
+
+    #[test]
+    fn a_cancel_from_someone_other_than_the_organizer_deletes_nothing() {
+        // Anyone who learns a UID can mail a CANCEL with a high SEQUENCE.
+        let dir = tempfile::tempdir().expect("tempdir");
+        apply(dir.path(), &request(1), "ada@example.com", None).expect("request");
+
+        let spoofed = cancel(9, None).replace("boss@org.example", "mallory@evil.example");
+        let outcome = apply(dir.path(), &spoofed, "ada@example.com", None).expect("cancel");
+        assert_eq!(outcome, Outcome::NotFromOrganizer);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "the event was deleted"
+        );
+
+        // Copying the right ORGANIZER into the payload is not enough when the
+        // mail itself came from someone else.
+        let outcome = apply(
+            dir.path(),
+            &cancel(9, None),
+            "ada@example.com",
+            Some("mallory@evil.example"),
+        )
+        .expect("cancel");
+        assert_eq!(outcome, Outcome::NotFromOrganizer);
+
+        let outcome = apply(
+            dir.path(),
+            &cancel(9, None),
+            "ada@example.com",
+            Some("Boss@Org.Example"),
+        )
+        .expect("cancel");
+        assert!(matches!(outcome, Outcome::Cancelled { .. }), "{outcome:?}");
+    }
+
+    #[test]
+    fn an_event_this_account_organizes_is_never_changed_by_mail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mine = request(1).replace("METHOD:REQUEST\r\n", "").replace(
+            "ORGANIZER;CN=Boss:mailto:boss@org.example",
+            "ORGANIZER:mailto:ada@example.com",
+        );
+        std::fs::write(dir.path().join("mine.ics"), &mine).expect("write");
+
+        // A forged CANCEL naming me as organizer, and one naming the old one.
+        for forged in [
+            cancel(9, None).replace("boss@org.example", "ada@example.com"),
+            cancel(9, None),
+        ] {
+            let outcome = apply(dir.path(), &forged, "ada@example.com", None).expect("cancel");
+            assert_eq!(outcome, Outcome::NotFromOrganizer);
+        }
+        assert!(dir.path().join("mine.ics").exists());
     }
 }

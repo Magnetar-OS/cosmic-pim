@@ -71,6 +71,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   message. A genuinely signed part wrapped beside unsigned text (the MIME-
   wrapping spoof) no longer gives that text the sender's "Verified" verdict;
   encryption is likewise read from the top-level part only (audit F-45).
+- iTIP: a REQUEST or CANCEL is applied only when it comes from the event's
+  organizer. One naming a different organizer from the stored event, naming
+  none, mailed by someone other than the organizer (when the caller passes the
+  sender), or targeting an event this account organizes returns
+  `Outcome::NotFromOrganizer` and changes nothing (audit F-38).
 
 ### Changed
 
@@ -93,6 +98,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `ical::remove_by_uid` returns `ical::Removal` (`Rewritten(String)`,
   `Emptied`, `NotFound`); `ical::remove_vevent` takes the `uid` as well and
   returns `Removal`. `StoreError::RecordNotFound { uid, file }` is new.
+- `itip::apply(collection, ics, me, sender: Option<&str>)` takes the mail's
+  sender; `itip::Outcome` gains `NotFromOrganizer`; `itip::Participant` gains
+  `sent_by`; `Itip::is_from_organizer(me, sender)` is new.
 
 ### Added
 
