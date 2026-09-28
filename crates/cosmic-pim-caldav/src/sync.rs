@@ -46,7 +46,7 @@
 use crate::dav::CaldavClient;
 use crate::error::Result;
 use crate::plan::plan_sync;
-use crate::store::{CalDavStore, Conflict, RemoteEvent};
+use crate::store::{CalDavStore, Conflict, ConflictKind, RemoteEvent};
 
 /// What one cycle did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -93,23 +93,50 @@ pub fn sync_collection(
     calendar_url: &str,
     store: &mut impl CalDavStore,
 ) -> Result<SyncOutcome> {
-    let mut outcome = SyncOutcome::default();
-    let local = store.state()?;
-
     // 1. ctag.
     let remote_ctag = client.get_ctag(calendar_url)?;
-    if let (Some(remote), Some(stored)) = (remote_ctag.as_deref(), local.ctag.as_deref())
-        && remote == stored
-    {
-        outcome.unchanged = true;
-        return Ok(outcome);
+    if ctag_unchanged(store, remote_ctag.as_deref())? {
+        return Ok(SyncOutcome {
+            unchanged: true,
+            ..SyncOutcome::default()
+        });
     }
 
     // 2. list.
     let listing = client.list_events(calendar_url)?;
 
+    reconcile(store, remote_ctag.as_deref(), &listing, |hrefs| {
+        client.fetch_events(calendar_url, hrefs)
+    })
+}
+
+/// Whether the server's ctag says nothing changed since the last commit.
+fn ctag_unchanged(store: &impl CalDavStore, remote_ctag: Option<&str>) -> Result<bool> {
+    let local = store.state()?;
+    Ok(matches!(
+        (remote_ctag, local.ctag.as_deref()),
+        (Some(remote), Some(stored)) if remote == stored
+    ))
+}
+
+/// Steps 3–6 of a cycle: plan against the listing, fetch what changed through
+/// `fetch`, apply, and commit the ctag if everything applied.
+///
+/// Separate from [`sync_collection`] so the reconciliation — every rule
+/// about conflicts, deletions and the ctag — is tested against a scripted
+/// listing through the same code that runs against a server, rather than
+/// through a copy that must be kept in step with it.
+fn reconcile(
+    store: &mut impl CalDavStore,
+    remote_ctag: Option<&str>,
+    listing: &crate::dav::PropfindEventsResult,
+    fetch: impl FnOnce(&[String]) -> Result<Vec<(String, String)>>,
+) -> Result<SyncOutcome> {
+    let mut outcome = SyncOutcome::default();
+    let local = store.state()?;
+
     // 3. plan.
-    let mut plan = plan_sync(&listing, &local.entries);
+    let mut plan = plan_sync(listing, &local.entries);
     outcome.guard_tripped = plan.guard_tripped;
     if plan.guard_tripped {
         // Confirm-on-second-sight: one empty listing is a hiccup; the same
@@ -125,10 +152,9 @@ pub fn sync_collection(
         let confirmed = genuinely_empty
             && store
                 .empty_sighting()?
-                .is_some_and(|sighting| sighting.ctag.as_deref() == remote_ctag.as_deref());
+                .is_some_and(|sighting| sighting.ctag.as_deref() == remote_ctag);
         if confirmed {
             tracing::info!(
-                calendar_url,
                 held = local.entries.len(),
                 "empty listing confirmed on second sight; applying the emptying"
             );
@@ -138,13 +164,12 @@ pub fn sync_collection(
             store.clear_empty_sighting()?;
         } else {
             tracing::warn!(
-                calendar_url,
                 held = local.entries.len(),
                 "server listed no events while we hold some; \
                  skipping deletions until a second cycle confirms"
             );
             if genuinely_empty {
-                store.record_empty_sighting(remote_ctag.as_deref())?;
+                store.record_empty_sighting(remote_ctag)?;
             }
         }
     } else {
@@ -154,7 +179,7 @@ pub fn sync_collection(
     }
 
     // 4. fetch.
-    let bodies = client.fetch_events(calendar_url, &plan.to_fetch)?;
+    let bodies = fetch(&plan.to_fetch)?;
     let etags: std::collections::HashMap<&str, &str> = listing
         .entries
         .iter()
@@ -176,6 +201,29 @@ pub fn sync_collection(
             );
             continue;
         };
+
+        // Deleted here, changed there. Putting the event back would undo the
+        // user's deletion without asking; letting the queued DELETE win would
+        // discard the server's change without asking. Both are recorded, and
+        // the queued DELETE waits for the answer.
+        if store.queued_delete(href)? {
+            tracing::warn!(
+                href,
+                "the server changed a resource this device deleted; recording a conflict"
+            );
+            store.record_conflict(&Conflict {
+                href: href.clone(),
+                kind: ConflictKind::DeletedHere,
+                local: String::new(),
+                remote: ics.clone(),
+                remote_etag: (*etag).to_owned(),
+                base: None,
+            })?;
+            applied.insert(href.as_str());
+            outcome.conflicts += 1;
+            continue;
+        }
+
         // Both sides changed. With the base in hand, edits to different
         // properties are not a disagreement — merge them and move on. Only a
         // genuine overlap (or a missing base) is recorded for the user.
@@ -211,6 +259,7 @@ pub fn sync_collection(
             );
             store.record_conflict(&Conflict {
                 href: href.clone(),
+                kind: ConflictKind::BothEdited,
                 local,
                 remote: ics.clone(),
                 remote_etag: (*etag).to_owned(),
@@ -240,13 +289,32 @@ pub fn sync_collection(
         .count();
     if outcome.missing_bodies > 0 {
         tracing::warn!(
-            calendar_url,
             count = outcome.missing_bodies,
             "server listed events it did not return bodies for; retrying next cycle"
         );
     }
 
     for href in &plan.to_delete {
+        // Deleted there, changed here. Removing the file would take the
+        // user's unsent edit with it — "a pull never overwrites an unsent
+        // local edit" covers a deletion too.
+        if let Some(local) = store.unpushed_local(href)? {
+            tracing::warn!(
+                href,
+                "the server deleted a resource this device changed; recording a conflict"
+            );
+            let base = store.unpushed_base(href)?;
+            store.record_conflict(&Conflict {
+                href: href.clone(),
+                kind: ConflictKind::DeletedOnServer,
+                local,
+                remote: String::new(),
+                remote_etag: String::new(),
+                base,
+            })?;
+            outcome.conflicts += 1;
+            continue;
+        }
         store.remove(href)?;
         outcome.deleted += 1;
     }
@@ -255,10 +323,9 @@ pub fn sync_collection(
     // A resource the listing reported as failed was neither fetched nor
     // deleted, so whatever changed it is still unapplied.
     if outcome.fully_applied() && listing.failed_uris.is_empty() {
-        store.commit_ctag(remote_ctag.as_deref())?;
+        store.commit_ctag(remote_ctag)?;
     } else {
         tracing::info!(
-            calendar_url,
             missing_bodies = outcome.missing_bodies,
             guard_tripped = outcome.guard_tripped,
             failed_in_listing = listing.failed_uris.len(),
@@ -272,113 +339,23 @@ pub fn sync_collection(
 mod tests {
     use super::*;
     use crate::dav::{CalDavEventEntry, PropfindEventsResult};
-    use crate::store::{CollectionState, MemoryStore};
-    use std::collections::HashMap;
+    use crate::store::MemoryStore;
 
-    /// The cycle without the HTTP client, so reconciliation can be tested
-    /// against a scripted server. Mirrors `sync_collection` step for step; the
-    /// only thing it does not exercise is the wire, which `dav.rs` covers.
+    /// The cycle against a scripted listing: the real reconciliation, with
+    /// the fetch answered from `bodies` instead of a server.
     fn run(
         store: &mut impl CalDavStore,
         remote_ctag: Option<&str>,
         listing: &PropfindEventsResult,
         bodies: &[(String, String)],
     ) -> Result<SyncOutcome> {
-        let mut outcome = SyncOutcome::default();
-        let local: CollectionState = store.state()?;
-
-        if let (Some(remote), Some(stored)) = (remote_ctag, local.ctag.as_deref())
-            && remote == stored
-        {
-            outcome.unchanged = true;
-            return Ok(outcome);
+        if ctag_unchanged(store, remote_ctag)? {
+            return Ok(SyncOutcome {
+                unchanged: true,
+                ..SyncOutcome::default()
+            });
         }
-
-        let mut plan = plan_sync(listing, &local.entries);
-        outcome.guard_tripped = plan.guard_tripped;
-        if plan.guard_tripped {
-            let genuinely_empty = listing.failed_uris.is_empty();
-            let confirmed = genuinely_empty
-                && store
-                    .empty_sighting()?
-                    .is_some_and(|sighting| sighting.ctag.as_deref() == remote_ctag);
-            if confirmed {
-                plan.to_delete = local.entries.keys().cloned().collect();
-                plan.to_delete.sort();
-                outcome.guard_tripped = false;
-                store.clear_empty_sighting()?;
-            } else if genuinely_empty {
-                store.record_empty_sighting(remote_ctag)?;
-            }
-        } else {
-            store.clear_empty_sighting()?;
-        }
-
-        let etags: HashMap<&str, &str> = listing
-            .entries
-            .iter()
-            .map(|e| (e.uri.as_str(), e.etag.as_str()))
-            .collect();
-
-        let mut applied = std::collections::HashSet::new();
-        for (href, ics) in bodies {
-            let Some(etag) = etags.get(href.as_str()) else {
-                continue;
-            };
-            if let Some(local) = store.unpushed_local(href)?
-                && local != *ics
-            {
-                let base = store.unpushed_base(href)?;
-                if let Some(merged) = base
-                    .as_deref()
-                    .and_then(|base| cosmic_pim_core::merge::merge3(base, &local, ics))
-                {
-                    store.apply_merged(
-                        &merged,
-                        &RemoteEvent {
-                            href: href.clone(),
-                            etag: (*etag).to_owned(),
-                            ics: ics.clone(),
-                        },
-                    )?;
-                    applied.insert(href.clone());
-                    outcome.auto_merged += 1;
-                    continue;
-                }
-                store.record_conflict(&Conflict {
-                    href: href.clone(),
-                    local,
-                    remote: ics.clone(),
-                    remote_etag: (*etag).to_owned(),
-                    base,
-                })?;
-                applied.insert(href.clone());
-                outcome.conflicts += 1;
-                continue;
-            }
-            store.upsert(&RemoteEvent {
-                href: href.clone(),
-                etag: (*etag).to_owned(),
-                ics: ics.clone(),
-            })?;
-            applied.insert(href.clone());
-            outcome.fetched += 1;
-        }
-        outcome.missing_bodies = plan
-            .to_fetch
-            .iter()
-            .filter(|h| !applied.contains(*h))
-            .count();
-
-        for href in &plan.to_delete {
-            store.remove(href)?;
-            outcome.deleted += 1;
-        }
-
-        if outcome.fully_applied() && listing.failed_uris.is_empty() {
-            store.commit_ctag(remote_ctag)?;
-        }
-        Ok(outcome)
+        reconcile(store, remote_ctag, listing, |_| Ok(bodies.to_vec()))
     }
 
     const ICS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
@@ -930,5 +907,71 @@ mod tests {
             Some("ctag-1"),
             "the ctag advanced over skipped deletions, so they are never reconsidered"
         );
+    }
+
+    fn held(store: &mut MemoryStore, href: &str) {
+        store
+            .upsert(&RemoteEvent {
+                href: href.into(),
+                etag: "\"1\"".into(),
+                ics: ICS.into(),
+            })
+            .unwrap();
+        store.commit_ctag(Some("ctag-1")).unwrap();
+    }
+
+    #[test]
+    fn a_server_delete_of_an_event_edited_here_is_a_conflict_not_a_loss() {
+        // The edit has not reached the server, and the server deleted the
+        // event meanwhile. Removing the file would take the edit with it.
+        let mut store = MemoryStore::default();
+        held(&mut store, "/a.ics");
+        held(&mut store, "/b.ics");
+        store.unpushed.insert("/a.ics".into(), "my edit".into());
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/b.ics", "\"1\"")], &[]),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            store.events.contains_key("/a.ics"),
+            "the edited event was deleted"
+        );
+        assert_eq!(outcome.conflicts, 1);
+        assert_eq!(store.conflicts[0].kind, ConflictKind::DeletedOnServer);
+        assert_eq!(store.conflicts[0].local, "my edit");
+    }
+
+    #[test]
+    fn a_server_edit_of_an_event_deleted_here_is_a_conflict_not_a_resurrection() {
+        let mut store = MemoryStore::default();
+        held(&mut store, "/a.ics");
+        store.events.remove("/a.ics");
+        store
+            .upsert(&RemoteEvent {
+                href: "/a.ics".into(),
+                etag: "\"1\"".into(),
+                ics: ICS.into(),
+            })
+            .unwrap();
+        store.deleted.insert("/a.ics".into());
+        let changed = ICS.replace("SUMMARY:X", "SUMMARY:Moved");
+
+        let outcome = run(
+            &mut store,
+            Some("ctag-2"),
+            &listing(&[("/a.ics", "\"2\"")], &[]),
+            &[("/a.ics".into(), changed.clone())],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.fetched, 0, "the deleted event was put back");
+        assert_eq!(outcome.conflicts, 1);
+        assert_eq!(store.conflicts[0].kind, ConflictKind::DeletedHere);
+        assert_eq!(store.conflicts[0].remote, changed);
     }
 }

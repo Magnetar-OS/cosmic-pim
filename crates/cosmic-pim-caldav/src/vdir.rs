@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 use crate::dav::Flavor;
 use crate::error::{Error, Result};
 use crate::push::{PendingPush, PushOp, PushQueue};
-use crate::store::{CalDavStore, CollectionState, Conflict, EmptySighting, RemoteEvent};
+use crate::store::{
+    CalDavStore, CollectionState, Conflict, ConflictKind, EmptySighting, RemoteEvent,
+};
 
 const STATE_FILE: &str = ".caldav-state.json";
 
@@ -378,27 +380,42 @@ impl VdirStore {
         self.state.conflicts.iter().find(|c| c.href == href)
     }
 
-    /// Take the server's version: the local edit is discarded.
+    /// Take the server's version: the local change is discarded.
     ///
-    /// The remote bytes recorded at detection time are written to the file and
-    /// its etag is already current, so this completes without touching the
-    /// network. The queued push goes with the edit it was carrying.
+    /// For an edit the server also edited, the remote bytes recorded at
+    /// detection time are written to the file and its etag is already
+    /// current. For an edit the server deleted, the file is deleted here too.
+    /// For a deletion the server refused because it had changed the event,
+    /// the event comes back with the server's text. None of the three needs
+    /// the network, and the queued push goes with the change it was carrying.
     pub fn resolve_conflict_take_remote(&mut self, href: &str) -> Result<bool> {
         let dir = self.meta.path.clone();
         self.update(|state, flavor| {
             let Some(conflict) = state.conflicts.iter().find(|c| c.href == href).cloned() else {
                 return Ok(false);
             };
-            upsert_into(
-                state,
-                flavor,
-                &dir,
-                &RemoteEvent {
-                    href: conflict.href.clone(),
-                    etag: conflict.remote_etag.clone(),
-                    ics: conflict.remote.clone(),
-                },
-            )?;
+            match conflict.kind {
+                ConflictKind::BothEdited | ConflictKind::DeletedHere => upsert_into(
+                    state,
+                    flavor,
+                    &dir,
+                    &RemoteEvent {
+                        href: conflict.href.clone(),
+                        etag: conflict.remote_etag.clone(),
+                        ics: conflict.remote.clone(),
+                    },
+                )?,
+                ConflictKind::DeletedOnServer => {
+                    if let Some(entry) = state.entries.remove(href) {
+                        let path = dir.join(&entry.file);
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+            }
             state.pending.retain(|e| e.op.href() != href);
             state.conflicts.retain(|c| c.href != href);
             Ok(true)
@@ -425,6 +442,43 @@ impl VdirStore {
             let Some(conflict) = state.conflicts.iter().find(|c| c.href == href).cloned() else {
                 return Ok(false);
             };
+
+            match conflict.kind {
+                ConflictKind::DeletedHere => {
+                    // The deletion stands: re-queued against the server's
+                    // current etag, so it is accepted this time rather than
+                    // refused exactly as the first one was.
+                    if let Some(entry) = state.entries.get_mut(href) {
+                        entry.etag = conflict.remote_etag.clone();
+                    }
+                    let etag = Some(conflict.remote_etag.clone()).filter(|e| !e.is_empty());
+                    enqueue_into(
+                        state,
+                        PushOp::Delete {
+                            href: href.to_owned(),
+                            etag,
+                        },
+                    );
+                    state.conflicts.retain(|c| c.href != href);
+                    return Ok(true);
+                }
+                ConflictKind::DeletedOnServer => {
+                    // The server no longer has it, so this is a create again:
+                    // no etag, and the PUT carries If-None-Match rather than
+                    // an If-Match nothing on the server can satisfy. The file
+                    // keeps its name.
+                    if let Some(entry) = state.entries.remove(href) {
+                        state.entries.insert(
+                            href.to_owned(),
+                            SidecarEntry {
+                                file: entry.file,
+                                etag: String::new(),
+                            },
+                        );
+                    }
+                }
+                ConflictKind::BothEdited => {}
+            }
 
             if let Some(text) = merged {
                 let file = file_name_for(state, flavor, &conflict.href);
@@ -591,7 +645,13 @@ fn enqueue_into(state: &mut SidecarState, op: PushOp) {
 /// [`VdirStore::queue_put_with_base`] on a sidecar already under the lock.
 fn queue_put_into(state: &mut SidecarState, flavor: Flavor, href: &str, base: Option<&str>) {
     let file = file_name_for(state, flavor, href);
-    let etag = state.entries.get(href).map(|e| e.etag.clone());
+    // An empty etag is a resource the server no longer has — see
+    // `ConflictKind::DeletedOnServer` — and a PUT for it is a create.
+    let etag = state
+        .entries
+        .get(href)
+        .map(|e| e.etag.clone())
+        .filter(|etag| !etag.is_empty());
     let already_pending = state.pending.iter().any(|entry| entry.op.href() == href);
     enqueue_into(
         state,
@@ -797,13 +857,24 @@ impl CalDavStore for VdirStore {
         Ok(std::fs::read_to_string(self.meta.path.join(&entry.file)).ok())
     }
 
+    fn queued_delete(&mut self, href: &str) -> Result<bool> {
+        self.refresh()?;
+        Ok(self
+            .state
+            .pending
+            .iter()
+            .any(|entry| matches!(&entry.op, PushOp::Delete { href: h, .. } if h == href)))
+    }
+
     fn record_conflict(&mut self, conflict: &Conflict) -> Result<()> {
         self.update(|state, _| {
             // The etag moves to the server's current value; the payload does
             // not. Recording the etag is what stops the next cycle re-fetching
             // the same divergence, and it is exactly the If-Match a resolution
             // will need.
-            if let Some(entry) = state.entries.get_mut(&conflict.href) {
+            if conflict.kind != ConflictKind::DeletedOnServer
+                && let Some(entry) = state.entries.get_mut(&conflict.href)
+            {
                 entry.etag = conflict.remote_etag.clone();
             }
 
@@ -858,6 +929,10 @@ impl CalDavStore for VdirStore {
             );
             state.pending.retain(|entry| entry.op.href() != remote.href);
             queue_put_into(state, flavor, &remote.href, Some(&remote.ics));
+            // A conflict recorded for this resource on an earlier pass is
+            // settled by the merge; left behind, the UI would keep asking
+            // about a disagreement that no longer exists (audit F-20).
+            state.conflicts.retain(|c| c.href != remote.href);
             Ok(())
         })
     }
@@ -1475,12 +1550,102 @@ mod conflict_tests {
         std::fs::read_to_string(store.collection().path.join("a.ics")).unwrap()
     }
 
+    fn deleted_on_server(store: &mut VdirStore) {
+        store
+            .record_conflict(&Conflict {
+                href: HREF.into(),
+                kind: ConflictKind::DeletedOnServer,
+                local: LOCAL_EDIT.into(),
+                remote: String::new(),
+                remote_etag: String::new(),
+                base: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn keeping_an_edit_the_server_deleted_creates_it_again() {
+        let (_dir, mut store) = diverged();
+        deleted_on_server(&mut store);
+        assert!(store.resolve_conflict_keep_local(HREF, None).unwrap());
+
+        assert_eq!(file(&store), LOCAL_EDIT);
+        let pending = store.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].blocked);
+        assert!(
+            matches!(&pending[0].op, PushOp::Put { etag: None, .. }),
+            "a re-create must not carry an If-Match nothing can satisfy: {:?}",
+            pending[0].op
+        );
+        assert!(store.conflicts().is_empty());
+    }
+
+    #[test]
+    fn accepting_the_servers_deletion_deletes_it_here() {
+        let (_dir, mut store) = diverged();
+        deleted_on_server(&mut store);
+        assert!(store.resolve_conflict_take_remote(HREF).unwrap());
+
+        assert!(!store.collection().path.join("a.ics").exists());
+        assert!(store.entry_for(HREF).is_none());
+        assert!(store.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keeping_a_deletion_the_server_refused_sends_it_against_the_new_etag() {
+        let (_dir, mut store) = diverged();
+        store.queue_delete(HREF).unwrap();
+        std::fs::remove_file(store.collection().path.join("a.ics")).unwrap();
+        store
+            .record_conflict(&Conflict {
+                href: HREF.into(),
+                kind: ConflictKind::DeletedHere,
+                local: String::new(),
+                remote: SERVER_V2.into(),
+                remote_etag: "\"v2\"".into(),
+                base: None,
+            })
+            .unwrap();
+
+        assert!(store.resolve_conflict_keep_local(HREF, None).unwrap());
+        let pending = store.pending().unwrap();
+        assert!(
+            matches!(&pending[0].op, PushOp::Delete { etag: Some(etag), .. } if etag == "\"v2\""),
+            "{:?}",
+            pending[0].op
+        );
+        assert!(!pending[0].blocked);
+        assert!(!store.collection().path.join("a.ics").exists());
+    }
+
+    #[test]
+    fn an_automatic_merge_settles_a_conflict_recorded_earlier() {
+        let (_dir, mut store) = diverged();
+        record(&mut store);
+        store
+            .apply_merged(
+                LOCAL_EDIT,
+                &RemoteEvent {
+                    href: HREF.into(),
+                    etag: "\"v3\"".into(),
+                    ics: SERVER_V2.into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store.conflicts().is_empty(),
+            "a conflict the merge settled was still waiting for the user"
+        );
+    }
+
     /// Applying what the pull would apply, once it has decided this is a
     /// conflict. Mirrors the branch in `crate::sync`.
     fn record(store: &mut VdirStore) {
         let local = store.unpushed_local(HREF).unwrap().expect("an unsent edit");
         store
             .record_conflict(&Conflict {
+                kind: ConflictKind::BothEdited,
                 href: HREF.into(),
                 local,
                 remote: SERVER_V2.into(),

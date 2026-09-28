@@ -53,6 +53,14 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   same resource queued during it (audit F-09, Slate F-06).
 - A CalDAV create is sent with `If-None-Match: *`, and the ETag a PUT returns
   is recorded, so the next edit carries the right `If-Match` (audit F-18).
+- A server-side delete of an event or contact edited here and not yet pushed
+  is recorded as a conflict instead of removing the file and the edit (audit
+  F-08).
+- A deletion made here that the server refused because it changed the resource
+  is recorded as a conflict instead of staying parked forever while the next
+  pull puts the item back (audit F-17).
+- An automatic three-way merge clears a conflict recorded for the same
+  resource on an earlier pass (audit F-20).
 
 ### Changed
 
@@ -70,6 +78,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   pushed: &PendingPush, error)` act only on the entry they were handed.
   `PendingPush` gains `revision: u64`. `CalDavStore::unpushed_local` and
   `unpushed_base` take `&mut self` (they re-read the sidecar).
+- `caldav::Conflict` has a new public field `kind`; code building a `Conflict`
+  literal must set it. `CalDavStore` gains `queued_delete` (default `false`).
 
 ### Added
 
@@ -79,6 +89,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `cosmic_pim_core::atomic::lock(target) -> Result<Lock, Error>`: an exclusive
   cross-process advisory lock (`flock` on a sibling `.<name>.lock`) for a
   file's read-modify-write cycle (audit O-01).
+- `caldav::ConflictKind` (`BothEdited`, `DeletedOnServer`, `DeletedHere`) and
+  `Conflict::kind`. `conflict::take_remote` / `keep_local` (and the
+  `VdirStore` resolvers) do the right thing per kind: accept or undo the
+  server's deletion, or restore or re-send the local deletion (audit O-08).
+
 
 
 

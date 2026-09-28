@@ -92,9 +92,16 @@ pub struct CollectionState {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Conflict {
     pub href: String,
-    /// What the local file holds — the user's unsent edit.
+    /// Which two changes collided. Decides which of the texts below exist
+    /// and what each resolution does.
+    #[serde(default)]
+    pub kind: ConflictKind,
+    /// What the local file holds — the user's unsent edit. Empty for
+    /// [`ConflictKind::DeletedHere`], where the local change is a deletion.
     pub local: String,
-    /// What the server holds now, verbatim.
+    /// What the server holds now, verbatim. Empty for
+    /// [`ConflictKind::DeletedOnServer`], where the server's change is a
+    /// deletion.
     pub remote: String,
     /// The etag of [`Conflict::remote`], which is also what a subsequent
     /// `If-Match` must carry for a resolution to be accepted.
@@ -104,6 +111,30 @@ pub struct Conflict {
     /// against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+}
+
+/// The two changes a [`Conflict`] records.
+///
+/// Edit against edit was the only shape once, and the other two had no home:
+/// a pull that found the server had deleted a resource this device had
+/// edited removed the file and the edit with it, and a deletion made here
+/// that the server refused (it had changed the resource) stayed parked
+/// forever while the next pull put the event back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConflictKind {
+    /// Both sides changed the resource. Taking the remote side writes the
+    /// server's text; keeping the local side re-pushes this device's.
+    #[default]
+    BothEdited,
+    /// The server deleted a resource this device changed and had not pushed.
+    /// Taking the remote side deletes it here too; keeping the local side
+    /// creates it on the server again.
+    DeletedOnServer,
+    /// This device deleted a resource the server has since changed. Taking
+    /// the remote side restores it here with the server's text; keeping the
+    /// local side deletes it on the server.
+    DeletedHere,
 }
 
 /// What the mass-delete guard saw: the server listed **nothing** while we hold
@@ -154,6 +185,14 @@ pub trait CalDavStore {
     /// A store with no writeback queue has no unsent changes by definition and
     /// answers `None`.
     fn unpushed_local(&mut self, href: &str) -> Result<Option<String>>;
+
+    /// Whether a deletion of `href` made on this device is waiting to reach
+    /// the server. A pull that finds the server changed such a resource
+    /// records a [`ConflictKind::DeletedHere`] conflict instead of putting
+    /// the event back.
+    fn queued_delete(&mut self, _href: &str) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Parks the server's version of a resource that diverged from ours.
     ///
@@ -214,6 +253,8 @@ pub struct MemoryStore {
     pub unpushed: HashMap<String, String>,
     /// The last-synced bytes behind each unsent change, where captured.
     pub bases: HashMap<String, String>,
+    /// Hrefs deleted here whose deletion has not reached the server.
+    pub deleted: std::collections::HashSet<String>,
     pub conflicts: Vec<Conflict>,
     pub sighting: Option<EmptySighting>,
 }
@@ -247,6 +288,10 @@ impl CalDavStore for MemoryStore {
 
     fn unpushed_local(&mut self, href: &str) -> Result<Option<String>> {
         Ok(self.unpushed.get(href).cloned())
+    }
+
+    fn queued_delete(&mut self, href: &str) -> Result<bool> {
+        Ok(self.deleted.contains(href))
     }
 
     fn record_conflict(&mut self, conflict: &Conflict) -> Result<()> {

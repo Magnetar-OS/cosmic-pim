@@ -137,6 +137,7 @@ mod tests {
         let local = store.unpushed_local(HREF).unwrap().unwrap();
         store
             .record_conflict(&Conflict {
+                kind: cosmic_pim_caldav::ConflictKind::BothEdited,
                 href: HREF.into(),
                 local,
                 remote: SERVER_V2.into(),

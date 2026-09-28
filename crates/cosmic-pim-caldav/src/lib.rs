@@ -49,6 +49,6 @@ pub use dav::{
 pub use error::{Disposition, Error, Result};
 pub use feed::{FeedOutcome, FeedState};
 pub use plan::{SyncPlan, plan_sync};
-pub use store::{CalDavStore, CollectionState, Conflict, RemoteEvent};
+pub use store::{CalDavStore, CollectionState, Conflict, ConflictKind, RemoteEvent};
 pub use sync::{SyncOutcome, sync_collection};
 pub use vdir::{VdirStore, is_local_only, mark_local_only, unmark_local_only};
