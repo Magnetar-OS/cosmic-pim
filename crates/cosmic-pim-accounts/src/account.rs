@@ -377,10 +377,9 @@ struct AccountsFile {
 pub struct AccountStore {
     path: PathBuf,
     secrets: SecretStore,
+    /// The accounts as of this handle's last read or write. Refreshed by
+    /// every change and by [`Self::reload`]; never written back wholesale.
     accounts: Vec<Account>,
-    /// The ids this handle has seen on disk, so [`Self::save`] can tell an
-    /// account it never knew about from one it deliberately removed.
-    known: std::collections::HashSet<String>,
 }
 
 impl AccountStore {
@@ -395,9 +394,19 @@ impl AccountStore {
         Ok(Self {
             path: path.to_path_buf(),
             secrets,
-            known: accounts.iter().map(|a| a.id.clone()).collect(),
             accounts,
         })
+    }
+
+    /// Re-reads the accounts from disk.
+    ///
+    /// For a long-lived handle — an app's — before it shows or routes by
+    /// what it holds: collection bindings and mail endpoints are written by
+    /// the other apps and by sync, and a snapshot from startup goes stale.
+    /// Changes through this handle re-read on their own and do not need it.
+    pub fn reload(&mut self) -> Result<()> {
+        self.accounts = Self::read(&self.path)?;
+        Ok(())
     }
 
     /// The accounts currently on disk, or none when the file is not there yet.
@@ -438,22 +447,31 @@ impl AccountStore {
     /// wrong place.
     pub fn add(&mut self, account: Account, password: &str) -> Result<()> {
         self.secrets.store(&account.secret_slot(), password)?;
-        self.accounts.push(account);
-        self.save()
+        self.change(|accounts| {
+            accounts.push(account);
+            Ok(())
+        })
     }
 
     /// Removes an account and forgets its password.
+    ///
+    /// The account leaves `accounts.toml` first and its secrets second: a
+    /// removal that fails to save leaves an account with its credentials,
+    /// not one that is still listed and can no longer sign in.
     pub fn remove(&mut self, id: &str) -> Result<()> {
-        let Some(index) = self.accounts.iter().position(|a| a.id == id) else {
-            return Err(Error::UnknownAccount(id.to_owned()));
-        };
-        let account = self.accounts.remove(index);
-        self.secrets.forget(&account.secret_slot());
+        let account = self.change(|accounts| {
+            let index = accounts
+                .iter()
+                .position(|a| a.id == id)
+                .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?;
+            Ok(accounts.remove(index))
+        })?;
         // Both slots: an account that was migrated between mechanisms has a
         // value in each, and leaving either behind means a removed account's
         // credentials outlive it in the keychain.
+        self.secrets.forget(&account.secret_slot());
         self.secrets.forget(&account.credential_slot());
-        self.save()
+        Ok(())
     }
 
     pub fn set_password(&mut self, id: &str, password: &str) -> Result<()> {
@@ -485,8 +503,10 @@ impl AccountStore {
         account.auth = AuthMethod::OAuth;
         account.provider = Some(provider_id.to_owned());
         self.store_credential_for(&account, credential)?;
-        self.accounts.push(account);
-        self.save()
+        self.change(|accounts| {
+            accounts.push(account);
+            Ok(())
+        })
     }
 
     /// Replaces an account's OAuth grant — after a refresh, or a re-sign-in.
@@ -532,15 +552,11 @@ impl AccountStore {
         calendar_href: &str,
         collection_id: &str,
     ) -> Result<()> {
-        let account = self
-            .accounts
-            .iter_mut()
-            .find(|a| a.id == account_id)
-            .ok_or_else(|| Error::UnknownAccount(account_id.to_owned()))?;
-        account
-            .collections
-            .insert(calendar_href.to_owned(), collection_id.to_owned());
-        self.save()
+        self.change_account(account_id, |account| {
+            account
+                .collections
+                .insert(calendar_href.to_owned(), collection_id.to_owned());
+        })
     }
 
     /// Records where this account's mail lives, or clears it.
@@ -550,65 +566,53 @@ impl AccountStore {
     /// with a CalDAV URL, and Envelope fills this in later. Neither should have
     /// to know the other's fields to write its own.
     pub fn set_mail_endpoint(&mut self, id: &str, mail: Option<MailEndpoint>) -> Result<()> {
-        let account = self
-            .accounts
-            .iter_mut()
-            .find(|a| a.id == id)
-            .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?;
-        account.mail = mail;
-        self.save()
+        self.change_account(id, |account| account.mail = mail)
     }
 
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<()> {
-        let account = self
-            .accounts
-            .iter_mut()
-            .find(|a| a.id == id)
-            .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?;
-        account.enabled = enabled;
-        self.save()
+        self.change_account(id, |account| account.enabled = enabled)
     }
 
-    /// Writes the accounts, merged with whatever is on disk *now*.
-    ///
-    /// The suite runs sync in an app and in a daemon, and both need
-    /// credentials, so both hold a store over one `accounts.toml`. Writing
-    /// this handle's list wholesale made whichever process saved second
-    /// discard the other's work — and one of the writers is
-    /// `cosmic_pim_auth::resolve` persisting a refreshed OAuth token, which
-    /// is a credential the user must re-authenticate to replace.
-    ///
-    /// Merging is per account rather than per file, which is the granularity
-    /// the conflict actually has: two processes touching different accounts
-    /// both succeed, and only two touching the same one race — where last
-    /// writer wins, as it must without locking. A deletion is not undone by
-    /// the merge, because `known` distinguishes an account this handle
-    /// removed from one it simply never saw.
-    fn save(&mut self) -> Result<()> {
-        let mut merged = self.accounts.clone();
-        for account in Self::read(&self.path)? {
-            let held = self.accounts.iter().any(|a| a.id == account.id);
-            let deleted_here = self.known.contains(&account.id);
-            if !held && !deleted_here {
-                merged.push(account);
-            }
-        }
-        // Only what this handle holds: an account merged in from disk was
-        // never held here, so on a later save it must still read as "never
-        // saw" rather than "deleted here".
-        self.known = self.accounts.iter().map(|a| a.id.clone()).collect();
+    /// Changes one account as it is on disk now. See [`Self::change`].
+    fn change_account(&mut self, id: &str, change: impl FnOnce(&mut Account)) -> Result<()> {
+        self.change(|accounts| {
+            let account = accounts
+                .iter_mut()
+                .find(|a| a.id == id)
+                .ok_or_else(|| Error::UnknownAccount(id.to_owned()))?;
+            change(account);
+            Ok(())
+        })
+    }
 
-        let text =
-            toml::to_string_pretty(&AccountsFile { accounts: merged }).map_err(Error::config)?;
-
+    /// The one way `accounts.toml` changes: under its lock, applied to the
+    /// file as it is *now*, and written back.
+    ///
+    /// Three apps and a sync daemon each hold a store over this one file.
+    /// Writing a handle's own list — even merged per account, as this once
+    /// did — kept the lost update for the accounts a handle held: one
+    /// process setting a mail endpoint was reverted by another toggling the
+    /// same account, and a stale handle wrote back an account another
+    /// process had removed, whose secret was already forgotten (audit F-10).
+    /// Applying each change to a fresh read under `atomic::lock` touches
+    /// exactly what the change names; an account removed elsewhere is
+    /// [`Error::UnknownAccount`] here, not resurrected.
+    fn change<T>(&mut self, change: impl FnOnce(&mut Vec<Account>) -> Result<T>) -> Result<T> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _lock = cosmic_pim_core::atomic::lock(&self.path)
+            .map_err(|why| Error::config(format!("locking {}: {why}", self.path.display())))?;
+        let mut accounts = Self::read(&self.path)?;
+        let value = change(&mut accounts)?;
+
+        let text = toml::to_string_pretty(&AccountsFile { accounts }).map_err(Error::config)?;
         // Atomic and fsynced: a torn accounts.toml loses every account, and the
         // passwords in the keychain then have nothing pointing at them.
         cosmic_pim_core::atomic::write(&self.path, &text, None)
-            .map(|_| ())
-            .map_err(|why| Error::config(format!("writing {}: {why}", self.path.display())))
+            .map_err(|why| Error::config(format!("writing {}: {why}", self.path.display())))?;
+        self.accounts = Self::read(&self.path)?;
+        Ok(value)
     }
 }
 
@@ -1018,5 +1022,49 @@ mod tests {
             AccountStore::open(&path, secrets),
             Err(Error::Config(_))
         ));
+    }
+
+    #[test]
+    fn a_stale_handle_neither_resurrects_a_removed_account_nor_reverts_another_ones_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("accounts.toml");
+        let secrets = || SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
+
+        let mut setup = AccountStore::open(&path, secrets()).unwrap();
+        let mut gone = account();
+        gone.id = "gone".into();
+        setup.add(gone, "pw").unwrap();
+        let mut kept = account();
+        kept.id = "kept".into();
+        setup.add(kept, "pw").unwrap();
+
+        // Slate's long-lived handle, opened while both accounts existed.
+        let mut stale = AccountStore::open(&path, secrets()).unwrap();
+
+        // Elsewhere: Envelope removes one account and sets the other's mail.
+        let mut other = AccountStore::open(&path, secrets()).unwrap();
+        other.remove("gone").unwrap();
+        other
+            .set_mail_endpoint("kept", Some(MailEndpoint::tls("imap.example.com")))
+            .unwrap();
+
+        // Slate toggles the kept account from its stale view.
+        stale.set_enabled("kept", false).unwrap();
+
+        let now = AccountStore::open(&path, secrets()).unwrap();
+        assert!(now.get("gone").is_none(), "a removed account came back");
+        let kept = now.get("kept").unwrap();
+        assert!(!kept.enabled);
+        assert!(
+            kept.mail.is_some(),
+            "another process's edit to the account was reverted"
+        );
+        assert!(
+            matches!(
+                stale.set_enabled("gone", true),
+                Err(Error::UnknownAccount(_))
+            ),
+            "a stale handle edited an account that no longer exists"
+        );
     }
 }

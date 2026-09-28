@@ -80,6 +80,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   read, so a flag, move or delete the app queues while a sync pass holds the
   mailbox is no longer erased by the pass's cursor commit; a pushed change no
   longer settles a newer one for the same message (Envelope audit F-02).
+- `AccountStore` applies every change to `accounts.toml` as it is on disk now,
+  under the file's lock: a long-lived handle no longer writes back an account
+  another app removed, nor reverts another app's edit to an account it holds
+  (audit F-10). An account is removed from the file before its secrets are
+  forgotten.
 
 ### Changed
 
@@ -122,6 +127,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `Conflict::kind`. `conflict::take_remote` / `keep_local` (and the
   `VdirStore` resolvers) do the right thing per kind: accept or undo the
   server's deletion, or restore or re-send the local deletion (audit O-08).
+- `AccountStore::reload(&mut self) -> Result<()>`: re-read the accounts for a
+  long-lived handle before showing or routing by them (Slate audit F-15).
+
 
 
 
