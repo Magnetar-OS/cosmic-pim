@@ -70,6 +70,16 @@ pub struct Draft {
     pub references: Vec<String>,
     /// Files to send with it.
     pub attachments: Vec<Attachment>,
+    /// The `Message-ID` this message goes out under, without angle brackets.
+    ///
+    /// Set once and kept: the copy that goes to the server and the copy filed
+    /// to Sent must carry the same id, or the sender's own copy never threads
+    /// with the replies to it — and a message retried from the outbox must
+    /// keep the id it was first attempted under, so a server or a recipient
+    /// that already has it can tell the second copy for what it is. `None`
+    /// until something assigns one; [`Self::build`] then mints a fresh id,
+    /// which is right for a message built exactly once.
+    pub message_id: Option<String>,
 }
 
 /// One file to send, already read into memory.
@@ -183,6 +193,7 @@ impl Draft {
             // somebody sent you is a decision, not a default — see `forward`
             // for why the honest version of that is not this one.
             attachments: Vec::new(),
+            message_id: None,
         }
     }
 
@@ -245,7 +256,8 @@ impl Draft {
 
         let mut builder = LettreMessage::builder()
             .from(mailbox(&self.from)?)
-            .subject(self.subject.clone());
+            .subject(self.subject.clone())
+            .message_id(self.message_id.as_ref().map(|id| format!("<{id}>")));
 
         if keep_bcc {
             builder = builder.keep_bcc();
@@ -309,6 +321,26 @@ impl Draft {
         builder
             .multipart(parts)
             .map_err(|why| Error::Draft(why.to_string()))
+    }
+
+    /// Gives this draft a `Message-ID`, unless it already has one.
+    ///
+    /// `local` must be unique to this message — a queue id or a draft id —
+    /// and the domain comes from the sender's own address, as RFC 5322
+    /// section 3.6.4 recommends, so the id is globally unique without a
+    /// random component and stable across every rebuild of the same message.
+    pub fn ensure_message_id(&mut self, local: &str) {
+        if self.message_id.is_some() {
+            return;
+        }
+        let domain = self
+            .from
+            .address
+            .rsplit_once('@')
+            .map(|(_, domain)| domain.trim())
+            .filter(|domain| domain.contains('.'))
+            .unwrap_or("cosmic-pim.invalid");
+        self.message_id = Some(format!("{local}@{domain}"));
     }
 
     /// What the attachments add up to.
@@ -438,6 +470,9 @@ impl Draft {
                 .next(),
             references: crate::threading::parse_references(&message.references),
             attachments,
+            // The mirror's id names the server copy of an unfinished draft,
+            // not the message it will become.
+            message_id: None,
         }
     }
 }

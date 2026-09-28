@@ -63,17 +63,38 @@ struct FakeSmtp {
     transcript: mpsc::Receiver<Vec<String>>,
 }
 
+/// How the scripted server behaves at the points a real one can fail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    /// A clean session: every command succeeds.
+    Accept,
+    /// A 4xx at `MAIL FROM` — a definite non-acceptance, the retryable class.
+    TempFailAtMail,
+    /// 535 at `AUTH` — a definite non-acceptance that waiting will not fix.
+    RejectAuth,
+    /// The whole message and its terminating dot arrive, and then the
+    /// connection is reset before any reply: the server may well have queued
+    /// it. The shape a mobile network produces when it drops mid-send.
+    ResetAfterDot,
+}
+
 impl FakeSmtp {
-    /// `accept` false makes the server reject at `MAIL FROM` with a 4xx — a
-    /// definite non-acceptance, which is the retryable class.
     fn start(accept: bool) -> Self {
+        Self::scripted(if accept {
+            Script::Accept
+        } else {
+            Script::TempFailAtMail
+        })
+    }
+
+    fn scripted(script: Script) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let (sender, transcript) = mpsc::channel();
 
         thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
-                let lines = serve(stream, accept);
+                let lines = serve(stream, script);
                 let _ = sender.send(lines);
             }
         });
@@ -100,7 +121,7 @@ impl FakeSmtp {
     }
 }
 
-fn serve(stream: TcpStream, accept: bool) -> Vec<String> {
+fn serve(stream: TcpStream, script: Script) -> Vec<String> {
     let mut out = stream.try_clone().expect("clone");
     let mut reader = BufReader::new(stream);
     let mut seen = Vec::new();
@@ -129,9 +150,13 @@ fn serve(stream: TcpStream, accept: bool) -> Vec<String> {
         } else if upper.starts_with("HELO") {
             let _ = write!(out, "250 canned.example\r\n");
         } else if upper.starts_with("AUTH") {
-            let _ = write!(out, "235 2.7.0 Authentication successful\r\n");
+            let _ = if script == Script::RejectAuth {
+                write!(out, "535 5.7.8 Authentication credentials invalid\r\n")
+            } else {
+                write!(out, "235 2.7.0 Authentication successful\r\n")
+            };
         } else if upper.starts_with("MAIL FROM") {
-            let _ = if accept {
+            let _ = if script != Script::TempFailAtMail {
                 write!(out, "250 2.1.0 Ok\r\n")
             } else {
                 write!(out, "451 4.3.0 Try again later\r\n")
@@ -141,6 +166,16 @@ fn serve(stream: TcpStream, accept: bool) -> Vec<String> {
         } else if upper == "DATA" {
             in_data = true;
             let _ = write!(out, "354 End data with <CR><LF>.<CR><LF>\r\n");
+            if script == Script::ResetAfterDot {
+                // Let the body and its dot land in our receive buffer, then
+                // close without reading them. The kernel answers a close over
+                // unread bytes with a RST, so the client's wait for the reply
+                // fails with ECONNRESET — after it handed everything over.
+                let _ = out.flush();
+                thread::sleep(std::time::Duration::from_millis(300));
+                seen.push("<reset>".into());
+                return seen;
+            }
         } else if upper == "QUIT" {
             let _ = write!(out, "221 2.0.0 Bye\r\n");
             break;
@@ -298,4 +333,63 @@ fn an_unreachable_server_is_safe_to_retry() {
 
     let outcome = send(&endpoint, &password(), &draft);
     assert!(outcome.is_retryable(), "{:?}", outcome.error());
+}
+
+fn short_draft() -> Draft {
+    let mut draft = Draft::new(me());
+    draft.to.push(to("ada@example.com"));
+    draft.subject = "Hello".into();
+    draft.body = "Hi.".into();
+    draft
+}
+
+#[test]
+fn a_connection_lost_after_the_message_was_handed_over_is_never_retried() {
+    // The duplicate-send case: the dot went out, the reply never came back.
+    // The server may have queued the message, so an automatic retry would
+    // deliver it twice.
+    let server = FakeSmtp::scripted(Script::ResetAfterDot);
+    let outcome = send(&server.endpoint(), &password(), &short_draft());
+    assert!(
+        matches!(outcome, Outcome::Ambiguous(_)),
+        "a send lost after DATA was classed as safe to retry: {:?}",
+        outcome.error()
+    );
+    assert!(server.transcript().lines.iter().any(|l| l == "<reset>"));
+}
+
+#[test]
+fn a_refused_login_is_a_definite_no_that_retrying_will_not_fix() {
+    // 535 before MAIL FROM: nothing was handed over, so it is not ambiguous —
+    // and the password will not get better by waiting, so it is not a retry.
+    let server = FakeSmtp::scripted(Script::RejectAuth);
+    let outcome = send(&server.endpoint(), &password(), &short_draft());
+    assert!(
+        matches!(outcome, Outcome::Rejected(_)),
+        "a refused login was reported as {:?}",
+        outcome
+    );
+    assert!(!outcome.is_retryable());
+}
+
+#[test]
+fn the_wire_copy_and_the_filed_copy_are_one_message() {
+    // One Message-ID and one Date on both: the Sent copy threads with the
+    // replies to what actually went out, and a resend can be recognised.
+    let server = FakeSmtp::start(true);
+    let mut draft = short_draft();
+    draft.bcc.push(to("secret@example.org"));
+    let Outcome::Sent(filed) = send(&server.endpoint(), &password(), &draft) else {
+        panic!("the send did not succeed");
+    };
+    let wire = server.transcript().message();
+    let filed = String::from_utf8(filed).unwrap();
+    let header = |text: &str, name: &str| {
+        text.lines()
+            .find(|line| line.to_ascii_lowercase().starts_with(&format!("{name}:")))
+            .map(str::to_owned)
+    };
+    let id = header(&wire, "message-id").expect("the wire copy has no Message-ID");
+    assert_eq!(Some(id), header(&filed, "message-id"));
+    assert_eq!(header(&wire, "date"), header(&filed, "date"));
 }

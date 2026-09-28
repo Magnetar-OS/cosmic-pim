@@ -521,7 +521,7 @@ impl Session {
 
         let message = match draft.build(true) {
             Ok(message) => message.formatted(),
-            Err(why) => return Outcome::NotSent(why),
+            Err(why) => return Outcome::Rejected(why),
         };
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&message);
 
@@ -552,7 +552,9 @@ impl Session {
             // Gmail acknowledged the submission; its own Sent copy follows.
             200..=299 => Outcome::Sent(message),
             // The request itself was refused before acceptance.
-            400..=499 => Outcome::NotSent(Self::refuse(status, "messages.send", &body)),
+            400..=499 => {
+                crate::smtp::http_refusal(status, Self::refuse(status, "messages.send", &body))
+            }
             // The server had the message when it failed; it may yet deliver.
             _ => Outcome::Ambiguous(Self::refuse(status, "messages.send", &body)),
         }

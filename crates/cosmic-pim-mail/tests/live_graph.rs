@@ -727,7 +727,13 @@ fn a_refused_send_stays_queued_rather_than_vanishing() {
         .expect("drain");
 
     assert!(outcome.sent.is_empty());
-    assert_eq!(outcome.deferred, 1, "a refused send was not rescheduled");
+    // A 400 is refused the same way on every attempt: it stops at once and
+    // waits for a person, rather than burning twelve attempts over five hours.
+    assert_eq!(
+        outcome.given_up, 1,
+        "a request refused as malformed was retried"
+    );
+    assert_eq!(outcome.deferred, 0);
     assert_eq!(outbox.count(), 1, "a refused send vanished from the queue");
     assert!(server.submitted().is_empty());
 }

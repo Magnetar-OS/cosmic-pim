@@ -27,13 +27,31 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `itip::build_reply` quotes a CN that holds `:`, `;` or `,` instead of
   backslash-escaping it, so organizers can match the replying attendee (audit
   F-07).
+- SMTP: a connection lost or timed out after the message was handed over
+  (after DATA) is reported as `Outcome::Ambiguous` instead of retryable, so
+  the outbox no longer sends it twice; a refused login is no longer reported
+  as "may have been delivered" (audit F-30).
+- The copy sent over SMTP and the copy filed to Sent are one message with one
+  `Message-ID` and `Date`, and a queued message keeps its `Message-ID` across
+  retries (audit F-32).
+- A send the server refuses for good (a draft that cannot be built, 5xx at
+  login or recipient, a 4xx other than 401/408/429 from Gmail or Graph) stops
+  at once instead of retrying twelve times over five hours (audit F-33).
 
 ### Changed
 
 - `jmap::Session::query` returns `(ids, applied_limit)`: the limit the server
   actually applied, which RFC 8620 lets it clamp (audit F-06).
+- `smtp::Outcome` gains `Rejected(Error)`: not delivered, and retrying
+  unchanged will be refused again. Callers that match on `Outcome` must handle
+  it; the outbox marks such a message given up and keeps it.
 
 ### Added
+
+- `compose::Draft::message_id` and `Draft::ensure_message_id(local)`: the
+  `Message-ID` a message goes out under. The outbox assigns one from the queue
+  id.
+
 
 ## [1.1.0] - 2026-09-22
 

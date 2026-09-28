@@ -487,7 +487,7 @@ impl Session {
 
         let message = match draft.build(true) {
             Ok(message) => message.formatted(),
-            Err(why) => return Outcome::NotSent(why),
+            Err(why) => return Outcome::Rejected(why),
         };
         let encoded = base64::engine::general_purpose::STANDARD.encode(&message);
 
@@ -516,7 +516,7 @@ impl Session {
         match status {
             // 202 Accepted is the documented success.
             200..=299 => Outcome::Sent(message),
-            400..=499 => Outcome::NotSent(Self::refuse(status, "sendMail", &body)),
+            400..=499 => crate::smtp::http_refusal(status, Self::refuse(status, "sendMail", &body)),
             // The server had the message when it failed; it may yet deliver.
             _ => Outcome::Ambiguous(Self::refuse(status, "sendMail", &body)),
         }

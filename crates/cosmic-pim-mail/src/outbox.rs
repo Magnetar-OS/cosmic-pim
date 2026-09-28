@@ -150,7 +150,7 @@ impl Outbox {
         match outcome {
             Outcome::NotSent(why) => self.write(&Queued {
                 id: id.to_owned(),
-                draft: draft.clone(),
+                draft: with_message_id(draft, id),
                 attempts: 1,
                 next_attempt_ms: now_ms.saturating_add(retry_delay_ms(1)),
                 last_error: Some(why.to_string()),
@@ -159,6 +159,9 @@ impl Outbox {
             Outcome::Sent(_) => Err(Error::Draft(
                 "that message was sent; queueing it would send it twice".into(),
             )),
+            Outcome::Rejected(why) => Err(Error::Draft(format!(
+                "that message was refused and would be refused again: {why}"
+            ))),
             Outcome::Ambiguous(_) => Err(Error::Draft(
                 "that message may already have been delivered and must not be retried \
                  automatically"
@@ -178,7 +181,7 @@ impl Outbox {
     pub fn submit(&self, id: &str, draft: &Draft, now_ms: i64) -> Result<()> {
         self.write(&Queued {
             id: id.to_owned(),
-            draft: draft.clone(),
+            draft: with_message_id(draft, id),
             attempts: 0,
             next_attempt_ms: now_ms,
             last_error: None,
@@ -249,7 +252,7 @@ impl Outbox {
         }
         self.write(&Queued {
             id: id.to_owned(),
-            draft: draft.clone(),
+            draft: with_message_id(draft, id),
             attempts: 0,
             next_attempt_ms: not_before_ms,
             last_error: None,
@@ -357,6 +360,16 @@ impl Outbox {
                     }
                     self.write(&queued)?;
                 }
+                Outcome::Rejected(why) => {
+                    // Refused outright — a login the server will not take, a
+                    // recipient it will not accept, a draft that cannot be
+                    // built. Twelve more attempts over five hours would be
+                    // refused identically; the message waits for a person.
+                    queued.given_up = true;
+                    queued.last_error = Some(why.to_string());
+                    self.write(&queued)?;
+                    outcome.given_up += 1;
+                }
                 Outcome::Ambiguous(why) => {
                     // It may have been delivered. Nothing automatic touches it
                     // again — that is the invariant, and this is the one place
@@ -404,6 +417,14 @@ impl Outbox {
     fn path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}{EXTENSION}"))
     }
+}
+
+/// The draft as it is queued: with the `Message-ID` it will keep for every
+/// attempt, so a retry is recognisably the same message.
+fn with_message_id(draft: &Draft, id: &str) -> Draft {
+    let mut draft = draft.clone();
+    draft.ensure_message_id(id);
+    draft
 }
 
 #[cfg(test)]
@@ -727,5 +748,51 @@ mod tests {
                 .is_err()
         );
         assert_eq!(outbox.count(), 0);
+    }
+
+    #[test]
+    fn a_refusal_that_will_repeat_stops_at_once_and_keeps_the_message() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .submit("0000000000000009", &draft("bad login"), 0)
+            .unwrap();
+        let outcome = outbox
+            .drain_with(
+                |_| Outcome::Rejected(Error::Smtp("535 bad credentials".into())),
+                0,
+            )
+            .unwrap();
+        assert_eq!(outcome.given_up, 1);
+        let queued = &outbox.list().unwrap()[0];
+        assert!(
+            queued.given_up,
+            "a refusal that will repeat was scheduled again"
+        );
+        assert_eq!(queued.draft.subject, "bad login");
+    }
+
+    #[test]
+    fn every_attempt_of_a_queued_message_carries_the_same_message_id() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .queue("0000000000000010", &draft("x"), &refused(), 0)
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut now = 0;
+        for _ in 0..2 {
+            now += MAX_DELAY_MS + 1;
+            outbox
+                .drain_with(
+                    |draft| {
+                        seen.push(draft.message_id.clone());
+                        refused()
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(seen[0].as_deref(), Some("0000000000000010@example.com"));
     }
 }

@@ -20,6 +20,11 @@
 //!   response we could not parse, a connection dropped after the dot. The
 //!   message may be in the recipient's inbox right now.
 //!
+//! A third outcome sits beside the first: the server said no *and* will say no
+//! again — a refused login, a rejected recipient, a draft that cannot be built.
+//! [`Outcome::Rejected`] is as safe as `NotSent` (nothing was delivered) and as
+//! final as `Ambiguous` (nothing automatic should try again).
+//!
 //! An automatic retry on the second class sends the message twice, and there is
 //! no way to take one back. So [`Outcome::Ambiguous`] is terminal: the send is
 //! recorded, the user is told, and *they* decide whether to send it again. A
@@ -37,9 +42,7 @@
 //! copy that went to the server did not: the recipients must not learn who was
 //! blind-copied, and the sender must not lose the only record that they were.
 
-use lettre::Transport as _;
-
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::imap::Security;
 use crate::sasl::Credentials;
 
@@ -78,6 +81,11 @@ pub enum Outcome {
     Sent(Vec<u8>),
     /// The server definitely did not accept it. Safe to retry unchanged.
     NotSent(Error),
+    /// The server definitely did not accept it, and sending it again unchanged
+    /// will be refused the same way: the draft cannot be built, the login was
+    /// refused, a recipient was rejected. Nothing was delivered, and nothing
+    /// automatic should try again — a person has to change something first.
+    Rejected(Error),
     /// It may or may not have been delivered.
     ///
     /// **Never retry this automatically.** Surface it, and let the user decide.
@@ -101,7 +109,7 @@ impl Outcome {
     pub fn error(&self) -> Option<&Error> {
         match self {
             Self::Sent(_) => None,
-            Self::NotSent(error) | Self::Ambiguous(error) => Some(error),
+            Self::NotSent(error) | Self::Rejected(error) | Self::Ambiguous(error) => Some(error),
         }
     }
 }
@@ -110,87 +118,210 @@ impl Outcome {
 ///
 /// Returns [`Outcome`] rather than `Result` because the caller has to act on
 /// *which* failure this was, and a `Result` invites treating them the same.
+///
+/// # Where the point of no return is
+///
+/// The SMTP conversation is driven one step at a time rather than through
+/// `lettre`'s one-call transport, because only the step tells the two failure
+/// classes apart. `lettre` reports a reset connection as the same `Network`
+/// error whether it happened during the greeting or after the terminating
+/// dot, and a socket read timeout on Linux surfaces as `WouldBlock`, which its
+/// timeout test does not recognise — so a send whose reply was lost after the
+/// server had the whole message used to come back as safe to retry, and the
+/// outbox sent it again a minute later.
+///
+/// - Connecting, TLS, `AUTH`, `MAIL FROM`, `RCPT TO` and `DATA` all happen
+///   before the message exists on the server. A failure there is
+///   [`Outcome::NotSent`], or [`Outcome::Rejected`] when the server answered
+///   with a permanent 5xx.
+/// - From the first byte of the message on, only an explicit reply to the
+///   dot is conclusive: 4xx is `NotSent`, 5xx is `Rejected`. Anything else —
+///   a reset, a timeout, a reply that does not parse — is
+///   [`Outcome::Ambiguous`].
 pub fn send(
     endpoint: &SmtpEndpoint,
     credentials: &Credentials,
     draft: &crate::compose::Draft,
 ) -> Outcome {
-    // Built twice, deliberately: the copy that goes over the wire has no `Bcc`
-    // header, the copy filed to Sent does. Building one and stripping a header
-    // afterwards would mean editing RFC 5322 bytes, which is the thing this
-    // crate does not do.
-    let outgoing = match draft.build(false) {
+    // Built once, then copied: the copy filed to Sent keeps its `Bcc` header
+    // and the copy that goes over the wire drops it, and everything else —
+    // Date, Message-ID, the MIME boundaries — is the same message, so the
+    // sender's copy threads with the replies to what actually went out.
+    let mut message = match draft.build(true) {
         Ok(message) => message,
-        Err(why) => return Outcome::NotSent(why),
+        Err(why) => return Outcome::Rejected(why),
     };
-    let filed = match draft.build(true) {
-        Ok(message) => message.formatted(),
-        Err(why) => return Outcome::NotSent(why),
-    };
+    let filed = message.formatted();
+    message
+        .headers_mut()
+        .remove::<lettre::message::header::Bcc>();
+    let wire = message.formatted();
 
-    let transport = match transport(endpoint, credentials) {
-        Ok(transport) => transport,
-        Err(why) => return Outcome::NotSent(why),
-    };
-
-    match transport.send(&outgoing) {
-        Ok(_) => Outcome::Sent(filed),
-        Err(why) => classify(&why),
+    match submit(endpoint, credentials, message.envelope(), &wire) {
+        Ok(()) => Outcome::Sent(filed),
+        Err(outcome) => outcome,
     }
 }
 
-/// Which side of the acceptance line a failure fell on.
-///
-/// A timeout counts as ambiguous even though it usually is not: a timeout
-/// during `DATA` is indistinguishable from a timeout during `EHLO`, and the
-/// cost of being wrong in the two directions is not symmetric. Being wrong
-/// towards "ambiguous" costs the user a button press; being wrong the other way
-/// sends the message twice.
-fn classify(error: &lettre::transport::smtp::Error) -> Outcome {
-    let wrapped = Error::Smtp(error.to_string());
-    if error.is_permanent()
-        || error.is_timeout()
-        || error.is_response()
-        || error.is_client()
-        || error.is_transport_shutdown()
-    {
-        Outcome::Ambiguous(wrapped)
+/// How long any one step of the conversation may take before it is given up
+/// on — `lettre`'s own default.
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn submit(
+    endpoint: &SmtpEndpoint,
+    credentials: &Credentials,
+    envelope: &lettre::address::Envelope,
+    wire: &[u8],
+) -> std::result::Result<(), Outcome> {
+    use lettre::transport::smtp::commands::{Data, Mail, Rcpt};
+    use lettre::transport::smtp::extension::{Extension, MailBodyParameter, MailParameter};
+
+    let mut connection = connect(endpoint, credentials).map_err(|why| before_data(&why))?;
+
+    // The same internationalisation rules `lettre`'s own send applies: ask for
+    // SMTPUTF8 and 8BITMIME when the message needs them, and refuse to send
+    // what the server has said it cannot carry.
+    let info = connection.server_info();
+    let mut options = Vec::new();
+    let non_ascii = envelope
+        .from()
+        .into_iter()
+        .chain(envelope.to())
+        .any(|address| !AsRef::<str>::as_ref(address).is_ascii());
+    if non_ascii {
+        if !info.supports_feature(Extension::SmtpUtfEight) {
+            return Err(Outcome::Rejected(Error::Smtp(
+                "a recipient address is not ASCII and the server does not accept SMTPUTF8".into(),
+            )));
+        }
+        options.push(MailParameter::SmtpUtfEight);
+    }
+    if !wire.is_ascii() {
+        if !info.supports_feature(Extension::EightBitMime) {
+            return Err(Outcome::Rejected(Error::Smtp(
+                "the message is not ASCII and the server does not accept 8BITMIME".into(),
+            )));
+        }
+        options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+    }
+
+    let handshake = (|| {
+        connection.command(Mail::new(envelope.from().cloned(), options))?;
+        for recipient in envelope.to() {
+            connection.command(Rcpt::new(recipient.clone(), vec![]))?;
+        }
+        connection.command(Data)
+    })();
+    if let Err(why) = handshake {
+        connection.abort();
+        return Err(before_data(&why));
+    }
+
+    // The point of no return: from here the server may hold the message.
+    let reply = connection.message(wire);
+    match reply {
+        Ok(_) => {
+            // Delivered. A failed QUIT costs nothing that matters.
+            if let Err(why) = connection.quit() {
+                tracing::debug!(%why, "SMTP QUIT failed after an accepted message");
+            }
+            Ok(())
+        }
+        Err(why) => {
+            connection.abort();
+            Err(after_data(&why))
+        }
+    }
+}
+
+fn connect(
+    endpoint: &SmtpEndpoint,
+    credentials: &Credentials,
+) -> std::result::Result<
+    lettre::transport::smtp::client::SmtpConnection,
+    lettre::transport::smtp::Error,
+> {
+    use lettre::transport::smtp::authentication::{
+        Credentials as SmtpCredentials, DEFAULT_MECHANISMS, Mechanism,
+    };
+    use lettre::transport::smtp::client::{SmtpConnection, TlsParameters};
+    use lettre::transport::smtp::extension::ClientId;
+
+    let hello = ClientId::default();
+    let wrapper = match endpoint.security {
+        Security::Tls => Some(TlsParameters::new(endpoint.host.clone())?),
+        Security::StartTls | Security::Plaintext => None,
+    };
+    let mut connection = SmtpConnection::connect(
+        (endpoint.host.as_str(), endpoint.port),
+        Some(STEP_TIMEOUT),
+        &hello,
+        wrapper.as_ref(),
+        None,
+    )?;
+    if endpoint.security == Security::StartTls {
+        // Required, not opportunistic: a server that stops advertising
+        // STARTTLS must not be handed the password in the clear.
+        connection.starttls(&TlsParameters::new(endpoint.host.clone())?, &hello)?;
+    }
+    // Submission without encryption sends the password in the clear. It
+    // exists for a server on `localhost` and for the test harness, and the UI
+    // is expected to say so.
+
+    // Pinned rather than negotiated when the credential is a token. The
+    // strongest advertised mechanism would otherwise win, and Gmail advertises
+    // PLAIN alongside XOAUTH2 — so an access token would go out as a PLAIN
+    // password and be refused, with the refusal reading as a bad password.
+    let mechanisms: &[Mechanism] = if credentials.is_oauth2() {
+        &[Mechanism::Xoauth2]
     } else {
-        // Connection refused, TLS handshake, an explicit 4xx: the server said
-        // no before the message was ever handed over.
+        DEFAULT_MECHANISMS
+    };
+    connection.auth(
+        mechanisms,
+        &SmtpCredentials::new(endpoint.username.clone(), credentials.expose().to_owned()),
+    )?;
+    Ok(connection)
+}
+
+/// A failure before the message was handed over: never ambiguous.
+///
+/// A permanent (5xx) answer — a refused login, a rejected sender or
+/// recipient — will be given again to the same request, so it is
+/// [`Outcome::Rejected`]. Everything else (no route, a TLS failure, a 4xx, a
+/// dropped connection) may well succeed later.
+fn before_data(error: &lettre::transport::smtp::Error) -> Outcome {
+    let wrapped = Error::Smtp(error.to_string());
+    if error.is_permanent() || error.is_client() {
+        Outcome::Rejected(wrapped)
+    } else {
         Outcome::NotSent(wrapped)
     }
 }
 
-fn transport(endpoint: &SmtpEndpoint, credentials: &Credentials) -> Result<lettre::SmtpTransport> {
-    use lettre::transport::smtp::authentication::{Credentials as SmtpCredentials, Mechanism};
-
-    let builder = match endpoint.security {
-        Security::Tls => lettre::SmtpTransport::relay(&endpoint.host),
-        Security::StartTls => lettre::SmtpTransport::starttls_relay(&endpoint.host),
-        // Submission without encryption sends the password in the clear. It
-        // exists for a server on `localhost` and for the test harness, and the
-        // UI is expected to say so.
-        Security::Plaintext => Ok(lettre::SmtpTransport::builder_dangerous(&endpoint.host)),
-    }
-    .map_err(|why| Error::Smtp(why.to_string()))?;
-
-    let builder = builder
-        .port(endpoint.port)
-        .credentials(SmtpCredentials::new(
-            endpoint.username.clone(),
-            credentials.expose().to_owned(),
-        ));
-
-    // Pinned rather than negotiated when the credential is a token. lettre
-    // picks the strongest mechanism the server advertises, and Gmail advertises
-    // PLAIN alongside XOAUTH2 — so an access token would go out as a PLAIN
-    // password and be refused, with the refusal reading as a bad password.
-    Ok(if credentials.is_oauth2() {
-        builder.authentication(vec![Mechanism::Xoauth2]).build()
+/// A failure once the message was on its way.
+///
+/// Only an explicit answer to the terminating dot settles it; a lost answer
+/// is the case that sends a message twice when guessed wrong.
+fn after_data(error: &lettre::transport::smtp::Error) -> Outcome {
+    let wrapped = Error::Smtp(error.to_string());
+    if error.is_transient() {
+        Outcome::NotSent(wrapped)
+    } else if error.is_permanent() {
+        Outcome::Rejected(wrapped)
     } else {
-        builder.build()
-    })
+        Outcome::Ambiguous(wrapped)
+    }
+}
+
+/// How an HTTP submission API's refusal classifies, for the Gmail and Graph
+/// engines: 401 (a token that renewal fixes), 408 and 429 (come back later)
+/// may be retried, and every other 4xx will be refused the same way again.
+pub(crate) fn http_refusal(status: u16, error: Error) -> Outcome {
+    match status {
+        401 | 408 | 429 => Outcome::NotSent(error),
+        _ => Outcome::Rejected(error),
+    }
 }
 
 #[cfg(test)]
@@ -228,8 +359,8 @@ mod tests {
             &Draft::new(Mailbox::default()),
         );
         assert!(
-            outcome.is_retryable(),
-            "validation was reported as ambiguous"
+            matches!(outcome, Outcome::Rejected(_)),
+            "a draft that cannot be built was reported as {outcome:?}; retrying it cannot help"
         );
         assert!(
             outcome.error().unwrap().to_string().contains("no sender"),
