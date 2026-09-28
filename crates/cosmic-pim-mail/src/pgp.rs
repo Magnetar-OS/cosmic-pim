@@ -181,41 +181,68 @@ fn protocol_of(part: &mail_parser::MessagePart<'_>) -> Option<String> {
         .map(|value| value.trim().to_ascii_lowercase())
 }
 
-/// RFC 3156 §4: `multipart/encrypted` naming the PGP protocol.
+/// The message's own top-level entity — the only part a verdict about *the
+/// message* may be read from.
+///
+/// A signed or encrypted part further down is something the message
+/// *contains*: a forwarded message, or a genuinely signed part an attacker
+/// wrapped beside text of their own (the MIME-wrapping spoof). Treating the
+/// first such part found anywhere as the message's own gave the attacker's
+/// text the real sender's tick (audit F-45).
+fn root<'a>(message: &'a mail_parser::Message<'a>) -> Option<&'a mail_parser::MessagePart<'a>> {
+    message.parts.first()
+}
+
+/// Whether `part` is a `multipart/<subtype>` naming `protocol`.
+fn is_multipart(part: &mail_parser::MessagePart<'_>, subtype: &str, protocol: &str) -> bool {
+    part.content_type()
+        .is_some_and(|ct| ct.ctype().eq_ignore_ascii_case("multipart"))
+        && part
+            .content_type()
+            .and_then(|ct| ct.subtype())
+            .is_some_and(|sub| sub.eq_ignore_ascii_case(subtype))
+        && protocol_of(part).as_deref() == Some(protocol)
+}
+
+/// The children of a multipart part, in order.
+fn children<'a>(
+    message: &'a mail_parser::Message<'a>,
+    part: &mail_parser::MessagePart<'_>,
+) -> Vec<&'a mail_parser::MessagePart<'a>> {
+    let mail_parser::PartType::Multipart(ids) = &part.body else {
+        return Vec::new();
+    };
+    ids.iter()
+        .filter_map(|id| message.parts.get(usize::try_from(*id).ok()?))
+        .collect()
+}
+
+/// RFC 3156 §4: the message is `multipart/encrypted` naming the PGP protocol.
 ///
 /// The protocol check is what keeps S/MIME out. Both formats use the same
 /// multipart wrappers and differ only here, so a client that matches on the
 /// wrapper alone reports every S/MIME message as broken PGP.
 fn is_pgp_encrypted(message: &mail_parser::Message<'_>) -> bool {
-    message.parts.iter().any(|part| {
-        part.content_type()
-            .is_some_and(|ct| ct.ctype().eq_ignore_ascii_case("multipart"))
-            && part
-                .content_type()
-                .and_then(|ct| ct.subtype())
-                .is_some_and(|sub| sub.eq_ignore_ascii_case("encrypted"))
-            && protocol_of(part).as_deref() == Some("application/pgp-encrypted")
-    })
+    root(message).is_some_and(|part| is_multipart(part, "encrypted", "application/pgp-encrypted"))
 }
 
-/// The armored ciphertext of a `multipart/encrypted` message: the second
+/// The armored ciphertext of a `multipart/encrypted` message: its second
 /// part, per RFC 3156 §4 — the first is the version control part.
 fn encrypted_payload(message: &mail_parser::Message<'_>) -> Option<Vec<u8>> {
-    if !is_pgp_encrypted(message) {
+    let root = root(message)?;
+    if !is_multipart(root, "encrypted", "application/pgp-encrypted") {
         return None;
     }
-    message
-        .parts
-        .iter()
-        .find(|part| {
-            part.content_type().is_some_and(|ct| {
-                ct.ctype().eq_ignore_ascii_case("application")
-                    && ct
-                        .subtype()
-                        .is_some_and(|s| s.eq_ignore_ascii_case("octet-stream"))
-            })
+    let payload = *children(message, root).get(1)?;
+    payload
+        .content_type()
+        .is_some_and(|ct| {
+            ct.ctype().eq_ignore_ascii_case("application")
+                && ct
+                    .subtype()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("octet-stream"))
         })
-        .map(|part| part.contents().to_vec())
+        .then(|| payload.contents().to_vec())
 }
 
 /// The byte range the signature covers, plus the armored signature.
@@ -225,26 +252,17 @@ fn encrypted_payload(message: &mail_parser::Message<'_>) -> Option<Vec<u8>> {
 /// The signed range runs from the part's *header* offset to its end, because
 /// the signature was computed over the transmitted entity — headers included,
 /// not merely its decoded body.
+///
+/// Only the message's root is looked at — see [`root`]. A message whose
+/// signed part sits deeper, beside unsigned parts, is not a signed message.
 fn signed_parts(message: &mail_parser::Message<'_>) -> Option<(std::ops::Range<usize>, String)> {
-    let wrapper = message.parts.iter().find(|part| {
-        part.content_type()
-            .is_some_and(|ct| ct.ctype().eq_ignore_ascii_case("multipart"))
-            && part
-                .content_type()
-                .and_then(|ct| ct.subtype())
-                .is_some_and(|sub| sub.eq_ignore_ascii_case("signed"))
-            && protocol_of(part).as_deref() == Some("application/pgp-signature")
-    })?;
-
-    let mail_parser::PartType::Multipart(children) = &wrapper.body else {
+    let wrapper = root(message)?;
+    if !is_multipart(wrapper, "signed", "application/pgp-signature") {
         return None;
-    };
-    let content = message
-        .parts
-        .get(usize::try_from(*children.first()?).ok()?)?;
-    let signature_part = message
-        .parts
-        .get(usize::try_from(*children.get(1)?).ok()?)?;
+    }
+    let parts = children(message, wrapper);
+    let content = *parts.first()?;
+    let signature_part = *parts.get(1)?;
 
     let armored = String::from_utf8(signature_part.contents().to_vec()).ok()?;
     if !armored.contains("BEGIN PGP SIGNATURE") {
@@ -569,5 +587,31 @@ Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; bound
         let (secret, _) = identity("him@example.com");
         let raw = b"From: him@example.com\r\n\r\nplain text\r\n";
         assert!(decrypt(raw, &secret, "").is_none());
+    }
+
+    /// The MIME-wrapping spoof: an attacker takes a genuinely signed message
+    /// from the real sender, attaches it beside text of their own, and sends
+    /// the whole thing under the sender's name. Only the part that was signed
+    /// is authentic; a verdict for the message must not cover the rest.
+    #[test]
+    fn a_signed_part_nested_beside_unsigned_text_does_not_verify_the_message() {
+        let (secret, certificate) = identity("him@example.com");
+        let genuine =
+            String::from_utf8(signed_message(&secret, "him@example.com", "old text")).unwrap();
+        let (_, signed_body) = genuine.split_once("\r\n\r\n").unwrap();
+        let wrapped = format!(
+            "From: him@example.com\r\nTo: her@example.com\r\nSubject: Urgent\r\n\
+             MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"OUT\"\r\n\r\n\
+             --OUT\r\nContent-Type: text/plain\r\n\r\nPay the new account today.\r\n\
+             --OUT\r\nContent-Type: multipart/signed; micalg=pgp-sha256; \
+             protocol=\"application/pgp-signature\"; boundary=\"BB\"\r\n\r\n{signed_body}\r\n\
+             --OUT--\r\n"
+        );
+
+        let verdict = examine(wrapped.as_bytes(), &[certificate]).verdict;
+        assert!(
+            !matches!(verdict, Verdict::Verified { .. }),
+            "a message was verified by a signature covering only part of it: {verdict:?}"
+        );
     }
 }

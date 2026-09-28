@@ -67,6 +67,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   (audit F-11).
 - Saving an event in a file that also holds a VEVENT without a usable DTSTART
   patches the right component instead of the one before it (audit F-12).
+- OpenPGP: only a signature on the message's own top-level part verifies the
+  message. A genuinely signed part wrapped beside unsigned text (the MIME-
+  wrapping spoof) no longer gives that text the sender's "Verified" verdict;
+  encryption is likewise read from the top-level part only (audit F-45).
 
 ### Changed
 
