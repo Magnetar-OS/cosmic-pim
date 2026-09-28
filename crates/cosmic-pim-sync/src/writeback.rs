@@ -137,6 +137,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         VdirStore::open(meta)
             .unwrap()
             .pending()
+            .unwrap()
             .into_iter()
             .map(|p| p.op.href().to_owned())
             .collect()
@@ -241,7 +242,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         assert!(queue_save_with_base(dir.path(), &id, "a.ics", Some(ICS)).unwrap());
 
         let meta = crate::provision::open_collection(dir.path(), &id).unwrap();
-        let store = VdirStore::open(meta).unwrap();
+        let mut store = VdirStore::open(meta).unwrap();
         assert_eq!(
             store.unpushed_base("/dav/cal/a.ics").unwrap().as_deref(),
             Some(ICS),

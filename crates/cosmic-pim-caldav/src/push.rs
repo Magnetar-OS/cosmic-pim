@@ -110,6 +110,17 @@ pub struct PendingPush {
     /// the server changes the same resource; `None` merely disables that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// Which enqueue this entry came from, unique within its collection.
+    ///
+    /// A drain takes a snapshot of the queue and then spends seconds on the
+    /// network per entry; meanwhile the app may queue a newer edit of the same
+    /// resource, which replaces the entry under the same href. The outcome of
+    /// pushing the old one must not settle the new one — a success would drop
+    /// an edit that never reached the server. [`PushQueue::resolve`],
+    /// [`PushQueue::defer`] and [`PushQueue::park`] act only on the entry
+    /// whose revision they were handed.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// The queue operations a store must support for writeback to work.
@@ -119,7 +130,9 @@ pub struct PendingPush {
 /// to be exercisable without a disk, which is what the in-memory impl in the
 /// tests is for.
 pub trait PushQueue {
-    fn pending(&self) -> Vec<PendingPush>;
+    /// What is queued now. `&mut` and fallible because a store shared between
+    /// processes re-reads its queue from disk to answer.
+    fn pending(&mut self) -> Result<Vec<PendingPush>>;
 
     /// Adds an operation, or resets an existing one for the same href to
     /// "due now".
@@ -129,11 +142,16 @@ pub trait PushQueue {
     /// one entry per keystroke would replay a stale state on top of a fresh one.
     fn enqueue(&mut self, op: PushOp) -> Result<()>;
 
-    /// Drops the entry for `href` — it succeeded.
-    fn resolve(&mut self, href: &str) -> Result<()>;
+    /// Drops the entry `pushed` — it succeeded — unless a newer edit has
+    /// replaced it since.
+    ///
+    /// `etag` is what the server answered a PUT with, when it did: the store
+    /// records it as the resource's current etag, so the next push of the
+    /// same resource carries the right `If-Match`.
+    fn resolve(&mut self, pushed: &PendingPush, etag: Option<&str>) -> Result<()>;
 
-    /// Records a failure and reschedules.
-    fn defer(&mut self, href: &str, error: &str, next_attempt_ms: i64) -> Result<()>;
+    /// Records a failure of `pushed` and reschedules it.
+    fn defer(&mut self, pushed: &PendingPush, error: &str, next_attempt_ms: i64) -> Result<()>;
 
     /// Stops attempting an operation without discarding it.
     ///
@@ -141,7 +159,7 @@ pub trait PushQueue {
     /// until something else happens — see [`PendingPush::blocked`]. Dropping
     /// the entry instead would lose the edit; retrying it instead would spend
     /// the rest of the day proving the same point to the same server.
-    fn park(&mut self, href: &str, error: &str) -> Result<()>;
+    fn park(&mut self, pushed: &PendingPush, error: &str) -> Result<()>;
 
     /// The iCalendar text to PUT for a queued file, or `None` if it is gone.
     fn payload(&self, file: &str) -> Option<String>;
@@ -191,10 +209,18 @@ impl DrainOutcome {
 pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> DrainOutcome {
     let mut outcome = DrainOutcome::default();
 
+    let pending = match queue.pending() {
+        Ok(pending) => pending,
+        Err(why) => {
+            tracing::warn!(%why, "could not read the writeback queue; nothing was pushed");
+            outcome.deferred = 1;
+            return outcome;
+        }
+    };
+
     if queue.read_only() {
         // Nothing here can ever succeed; the server will 403 every attempt.
         // Draining anyway would burn the backoff schedule and fill the log.
-        let pending = queue.pending();
         if !pending.is_empty() {
             tracing::warn!(
                 count = pending.len(),
@@ -205,7 +231,7 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
         return outcome;
     }
 
-    for entry in queue.pending() {
+    for entry in pending {
         if entry.blocked {
             // Held for a reconcile or for the user. Attempting it would repeat
             // a failure we have already classified as unrepeatable.
@@ -220,23 +246,27 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
         let href = entry.op.href().to_owned();
         let result = match &entry.op {
             PushOp::Put { href, file, etag } => match queue.payload(file) {
-                Some(ics) => client.put_event(href, &ics, etag.as_deref()).map(|_| ()),
+                Some(ics) => client.put_event(href, &ics, etag.as_deref()),
                 None => {
                     // The file was deleted after the PUT was queued. There is
                     // nothing to send and never will be; a delete for the same
                     // href will have been queued separately.
                     tracing::info!(file, "queued PUT has no payload on disk; dropping it");
-                    let _ = queue.resolve(href);
+                    if let Err(why) = queue.resolve(&entry, None) {
+                        tracing::warn!(href, %why, "could not drop a PUT with no payload");
+                    }
                     outcome.abandoned += 1;
                     continue;
                 }
             },
-            PushOp::Delete { href, etag } => client.delete_event(href, etag.as_deref()),
+            PushOp::Delete { href, etag } => {
+                client.delete_event(href, etag.as_deref()).map(|()| None)
+            }
         };
 
         match result {
-            Ok(()) => {
-                if let Err(why) = queue.resolve(&href) {
+            Ok(etag) => {
+                if let Err(why) = queue.resolve(&entry, etag.as_deref()) {
                     tracing::warn!(href, %why, "push succeeded but the queue entry survived");
                 }
                 outcome.succeeded += 1;
@@ -251,7 +281,7 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
                     let attempts = entry.attempts.saturating_add(1);
                     let next = now_ms.saturating_add(retry_delay_ms(attempts));
                     tracing::warn!(href, attempts, %why, "push failed; will retry");
-                    if let Err(e) = queue.defer(&href, &why.to_string(), next) {
+                    if let Err(e) = queue.defer(&entry, &why.to_string(), next) {
                         tracing::warn!(href, %e, "could not record a push failure");
                     }
                     outcome.deferred += 1;
@@ -264,7 +294,7 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
                         href, %why,
                         "push rejected as out of date; parking it for reconciliation"
                     );
-                    if let Err(e) = queue.park(&href, &why.to_string()) {
+                    if let Err(e) = queue.park(&entry, &why.to_string()) {
                         tracing::warn!(href, %e, "could not park a stale push");
                     }
                     outcome.needs_reconcile += 1;
@@ -274,7 +304,7 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
                         href, %why,
                         "push refused in a way only the user can fix; parking it"
                     );
-                    if let Err(e) = queue.park(&href, &why.to_string()) {
+                    if let Err(e) = queue.park(&entry, &why.to_string()) {
                         tracing::warn!(href, %e, "could not park a refused push");
                     }
                     outcome.needs_user += 1;
@@ -288,7 +318,7 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
                         href, %why,
                         "push rejected outright; dropping it from the queue"
                     );
-                    if let Err(e) = queue.resolve(&href) {
+                    if let Err(e) = queue.resolve(&entry, None) {
                         tracing::warn!(href, %e, "could not drop a rejected push");
                     }
                     outcome.rejected += 1;
@@ -298,6 +328,17 @@ pub fn drain(client: &CaldavClient, queue: &mut impl PushQueue, now_ms: i64) -> 
     }
 
     outcome
+}
+
+/// The queued entry for `href`, for tests that settle one by hand.
+#[cfg(test)]
+pub(crate) fn entry_for_href(queue: &mut impl PushQueue, href: &str) -> PendingPush {
+    queue
+        .pending()
+        .expect("the queue is readable")
+        .into_iter()
+        .find(|entry| entry.op.href() == href)
+        .expect("that href is queued")
 }
 
 #[cfg(test)]
@@ -313,8 +354,8 @@ mod tests {
     }
 
     impl PushQueue for MemoryQueue {
-        fn pending(&self) -> Vec<PendingPush> {
-            self.entries.clone()
+        fn pending(&mut self) -> Result<Vec<PendingPush>> {
+            Ok(self.entries.clone())
         }
         fn enqueue(&mut self, op: PushOp) -> Result<()> {
             let href = op.href().to_owned();
@@ -324,6 +365,7 @@ mod tests {
                 existing.attempts = 0;
                 existing.last_error = None;
                 existing.blocked = false;
+                existing.revision += 1;
             } else {
                 self.entries.push(PendingPush {
                     op,
@@ -332,15 +374,18 @@ mod tests {
                     last_error: None,
                     blocked: false,
                     base: None,
+                    revision: 1,
                 });
             }
             Ok(())
         }
-        fn resolve(&mut self, href: &str) -> Result<()> {
-            self.entries.retain(|e| e.op.href() != href);
+        fn resolve(&mut self, pushed: &PendingPush, _etag: Option<&str>) -> Result<()> {
+            self.entries
+                .retain(|e| !(e.op.href() == pushed.op.href() && e.revision == pushed.revision));
             Ok(())
         }
-        fn defer(&mut self, href: &str, error: &str, next: i64) -> Result<()> {
+        fn defer(&mut self, pushed: &PendingPush, error: &str, next: i64) -> Result<()> {
+            let href = pushed.op.href();
             if let Some(e) = self.entries.iter_mut().find(|e| e.op.href() == href) {
                 e.attempts += 1;
                 e.next_attempt_ms = next;
@@ -348,7 +393,8 @@ mod tests {
             }
             Ok(())
         }
-        fn park(&mut self, href: &str, error: &str) -> Result<()> {
+        fn park(&mut self, pushed: &PendingPush, error: &str) -> Result<()> {
+            let href = pushed.op.href();
             if let Some(e) = self.entries.iter_mut().find(|e| e.op.href() == href) {
                 e.blocked = true;
                 e.last_error = Some(error.to_owned());
@@ -392,10 +438,11 @@ mod tests {
     fn re_enqueueing_the_same_href_replaces_rather_than_appends() {
         let mut queue = MemoryQueue::default();
         queue.enqueue(put("/a.ics")).unwrap();
-        queue.defer("/a.ics", "boom", 999_999).unwrap();
+        let queued = entry_for_href(&mut queue, "/a.ics");
+        queue.defer(&queued, "boom", 999_999).unwrap();
         queue.enqueue(put("/a.ics")).unwrap();
 
-        let pending = queue.pending();
+        let pending = queue.pending().unwrap();
         assert_eq!(pending.len(), 1, "the queue accumulated duplicate entries");
         assert_eq!(
             pending[0].attempts, 0,
@@ -408,7 +455,8 @@ mod tests {
     fn an_entry_that_is_not_due_yet_is_skipped_not_attempted() {
         let mut queue = MemoryQueue::default();
         queue.enqueue(put("/a.ics")).unwrap();
-        queue.defer("/a.ics", "boom", 10_000).unwrap();
+        let queued = entry_for_href(&mut queue, "/a.ics");
+        queue.defer(&queued, "boom", 10_000).unwrap();
 
         // No client is reachable in a unit test, so a non-skipped entry would
         // be *attempted* and fail. `skipped` proves it was never tried.
@@ -417,7 +465,11 @@ mod tests {
 
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.deferred, 0);
-        assert_eq!(queue.pending()[0].attempts, 1, "an attempt was consumed");
+        assert_eq!(
+            queue.pending().unwrap()[0].attempts,
+            1,
+            "an attempt was consumed"
+        );
     }
 
     #[test]
@@ -435,7 +487,7 @@ mod tests {
         assert_eq!(outcome.deferred, 0, "a doomed push consumed a retry slot");
         assert_eq!(outcome.skipped, 1);
         assert_eq!(
-            queue.pending()[0].attempts,
+            queue.pending().unwrap()[0].attempts,
             0,
             "backoff advanced on a collection that can never accept a write"
         );
@@ -451,7 +503,10 @@ mod tests {
         let outcome = drain(&client, &mut queue, 0);
 
         assert_eq!(outcome.abandoned, 1);
-        assert!(queue.pending().is_empty(), "an unsendable entry was kept");
+        assert!(
+            queue.pending().unwrap().is_empty(),
+            "an unsendable entry was kept"
+        );
     }
 
     #[test]
@@ -468,7 +523,7 @@ mod tests {
         assert_eq!(outcome.deferred, 1);
         assert_eq!(outcome.succeeded, 0);
 
-        let entry = &queue.pending()[0];
+        let entry = &queue.pending().unwrap()[0];
         assert_eq!(entry.attempts, 1);
         assert_eq!(entry.next_attempt_ms, retry_delay_ms(1));
         assert!(
@@ -542,7 +597,7 @@ mod tests {
             "a stale etag was put on the retry schedule"
         );
 
-        let entry = &queue.pending()[0];
+        let entry = &queue.pending().unwrap()[0];
         assert!(entry.blocked, "the doomed retry was left live");
         assert_eq!(entry.attempts, 0, "a parked entry consumed a backoff step");
     }
@@ -559,7 +614,7 @@ mod tests {
         assert_eq!(outcome.needs_reconcile, 0, "the parked entry was retried");
         assert_eq!(outcome.skipped, 1);
         assert_eq!(
-            queue.pending().len(),
+            queue.pending().unwrap().len(),
             1,
             "parking must not discard the edit — only stop retrying it"
         );
@@ -583,7 +638,7 @@ mod tests {
                 "HTTP {status} kept hammering the server"
             );
             assert!(outcome.needs_attention());
-            assert!(queue.pending()[0].blocked);
+            assert!(queue.pending().unwrap()[0].blocked);
         }
     }
 
@@ -601,7 +656,7 @@ mod tests {
             0
         );
 
-        let entry = &queue.pending()[0];
+        let entry = &queue.pending().unwrap()[0];
         assert!(
             !entry.blocked,
             "a transient failure parked a retryable push"
@@ -621,7 +676,7 @@ mod tests {
         let outcome = drain(&client, &mut queue, 0);
 
         assert_eq!(outcome.rejected, 1);
-        assert!(queue.pending().is_empty());
+        assert!(queue.pending().unwrap().is_empty());
         assert_eq!(outcome.settled(), 1);
     }
 
@@ -631,12 +686,15 @@ mod tests {
         let (mut queue, href) = queue_with_payload(&url);
         let client = CaldavClient::new(&url, "u", "p");
         drain(&client, &mut queue, 0);
-        assert!(queue.pending()[0].blocked);
+        assert!(queue.pending().unwrap()[0].blocked);
 
         // Editing the event again is new information: whatever the last attempt
         // was blocked on, the user has just expressed a fresh intention.
         queue.enqueue(put(&href)).unwrap();
 
-        assert!(!queue.pending()[0].blocked, "a new edit stayed parked");
+        assert!(
+            !queue.pending().unwrap()[0].blocked,
+            "a new edit stayed parked"
+        );
     }
 }

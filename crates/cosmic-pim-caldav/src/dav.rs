@@ -1803,7 +1803,8 @@ impl CaldavClient {
 
     /// Create/update an event resource. `If-Match` is derived from the
     /// stored etag via `prepare_if_match_etag` (skipped when the stored
-    /// value isn't RFC 7232-legal there). Returns the new `ETag` when the
+    /// value isn't RFC 7232-legal there); with no stored etag the PUT is a
+    /// create and carries `If-None-Match: *`. Returns the new `ETag` when the
     /// server supplies one.
     pub fn put_event(
         &self,
@@ -1813,8 +1814,15 @@ impl CaldavClient {
     ) -> Result<Option<String>> {
         let if_match = etag.and_then(prepare_if_match_etag);
         let mut headers: Vec<(&str, &str)> = vec![("Content-Type", self.flavor.content_type())];
-        if let Some(im) = if_match.as_deref() {
-            headers.push(("If-Match", im));
+        match (etag, if_match.as_deref()) {
+            (_, Some(im)) => headers.push(("If-Match", im)),
+            // A resource we have never seen from the server is a create, and a
+            // create must not replace whatever the server holds at that href:
+            // RFC 7232's `If-None-Match: *` turns that into a 412 instead.
+            (None, None) => headers.push(("If-None-Match", "*")),
+            // An etag the server gave us but that is not legal in If-Match:
+            // send it unconditioned, as before.
+            (Some(_), None) => {}
         }
         let resp = self.request("PUT", event_url, &headers, ical_data)?;
         if (200..300).contains(&resp.status) {

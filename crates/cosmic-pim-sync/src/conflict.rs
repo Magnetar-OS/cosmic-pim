@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(file(dir.path(), &id), LOCAL_EDIT);
 
         let meta = crate::provision::open_collection(dir.path(), &id).unwrap();
-        let pending = VdirStore::open(meta).unwrap().pending();
+        let pending = VdirStore::open(meta).unwrap().pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert!(!pending[0].blocked, "the resolution left the push parked");
     }

@@ -512,7 +512,7 @@ fn resolving_a_conflict_in_favour_of_the_server_leaves_a_clean_collection() {
     assert_eq!(events[0].summary, "Moved to Thursday");
     assert!(store.conflicts().is_empty());
     assert!(
-        store.pending().is_empty(),
+        store.pending().unwrap().is_empty(),
         "the push carrying the discarded edit is still queued"
     );
 
@@ -567,4 +567,64 @@ fn a_listing_that_reported_a_failed_resource_does_not_commit_the_ctag() {
         third.fetched, 1,
         "the change behind the failure never arrived"
     );
+}
+
+/// Serves exactly one PUT: records its conditional headers and answers 201
+/// with a fresh ETag.
+fn serve_one_put() -> (String, std::sync::mpsc::Receiver<Vec<(String, String)>>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("bind");
+    let port = server.server_addr().to_ip().expect("ip").port();
+    let (sender, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok(request) = server.recv() {
+            let headers = request
+                .headers()
+                .iter()
+                .map(|h| {
+                    (
+                        h.field.as_str().as_str().to_ascii_lowercase(),
+                        h.value.to_string(),
+                    )
+                })
+                .filter(|(name, _)| name.starts_with("if-"))
+                .collect();
+            let _ = sender.send(headers);
+            let _ = request.respond(tiny_http::Response::empty(201).with_header(
+                tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"fresh\""[..]).expect("header"),
+            ));
+        }
+    });
+    (format!("http://127.0.0.1:{port}/cal/"), received)
+}
+
+#[test]
+fn a_new_event_is_created_without_overwriting_and_its_etag_is_kept() {
+    use cosmic_pim_caldav::push::{PushQueue, drain};
+
+    let (url, headers) = serve_one_put();
+    let (_dir, mut store) = collection();
+    store.set_remote("/cal/", false).expect("bind");
+    let href = format!("{url}new.ics");
+    let meta = store.collection().clone();
+    std::fs::write(meta.path.join("new.ics"), EVENT_B).expect("write");
+    store.queue_put(&href).expect("queue");
+
+    let client = CaldavClient::new(&url, "user", "pass");
+    let outcome = drain(&client, &mut store, 0);
+    assert_eq!(outcome.succeeded, 1);
+
+    let sent = headers
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the PUT never arrived");
+    assert!(
+        sent.iter()
+            .any(|(name, value)| name == "if-none-match" && value == "*"),
+        "a create went out unconditioned and could overwrite the server's copy: {sent:?}"
+    );
+    assert_eq!(
+        store.entry_for(&href).map(|(_, etag)| etag).as_deref(),
+        Some("\"fresh\""),
+        "the ETag the server answered with was thrown away"
+    );
+    assert!(store.pending().expect("queue").is_empty());
 }

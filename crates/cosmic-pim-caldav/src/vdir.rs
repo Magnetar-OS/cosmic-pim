@@ -158,6 +158,10 @@ struct SidecarState {
     /// been seen once. See [`crate::store::EmptySighting`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     empty_sighting: Option<EmptySighting>,
+    /// The last revision handed to a queued push. See
+    /// [`PendingPush::revision`].
+    #[serde(default)]
+    next_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +173,11 @@ struct SidecarEntry {
 
 pub struct VdirStore {
     meta: CalendarMeta,
+    /// The sidecar as last read or written by this handle.
+    ///
+    /// A cache, not the authority: every change re-reads the file under the
+    /// collection's lock first (see [`Self::update`]), because the app and
+    /// the sync daemon hold handles on the same collection at the same time.
     state: SidecarState,
     /// Which kind of collection this is. Decides the file extension and what
     /// counts as a plausible payload.
@@ -182,18 +191,7 @@ impl VdirStore {
     /// The cost is one full re-sync; the alternative is an app that cannot open
     /// a calendar because a JSON file got truncated.
     pub fn open(meta: CalendarMeta) -> Result<Self> {
-        let path = meta.path.join(STATE_FILE);
-        let state = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|why| {
-                tracing::warn!(
-                    path = %path.display(), %why,
-                    "unreadable CalDAV sidecar; treating the collection as unsynced"
-                );
-                SidecarState::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => SidecarState::default(),
-            Err(e) => return Err(e.into()),
-        };
+        let state = read_sidecar(&meta.path.join(STATE_FILE))?.unwrap_or_default();
         Ok(Self {
             meta,
             flavor: state.flavor,
@@ -216,14 +214,6 @@ impl VdirStore {
     #[must_use]
     pub fn flavor(&self) -> Flavor {
         self.flavor
-    }
-
-    /// The file extension resources in this collection use.
-    fn extension(&self) -> &'static str {
-        match self.flavor {
-            Flavor::CalDav => "ics",
-            Flavor::CardDav => "vcf",
-        }
     }
 
     #[must_use]
@@ -263,8 +253,10 @@ impl VdirStore {
     /// dismiss it. Reversible only by editing the sidecar — which is the right
     /// weight for "yes, I really do want two sync engines here".
     pub fn acknowledge_sole_ownership(&mut self) -> Result<()> {
-        self.state.sole_owner_acknowledged = true;
-        self.save_sidecar()
+        self.update(|state, _| {
+            state.sole_owner_acknowledged = true;
+            Ok(())
+        })
     }
 
     /// Records what discovery learned about this collection.
@@ -272,10 +264,13 @@ impl VdirStore {
     /// Provisioning calls this, which is where the flavour becomes durable:
     /// from here on, opening the collection is enough to know what it holds.
     pub fn set_remote(&mut self, href: &str, read_only: bool) -> Result<()> {
-        self.state.href = Some(href.to_owned());
-        self.state.read_only = read_only;
-        self.state.flavor = self.flavor;
-        self.save_sidecar()
+        let flavor = self.flavor;
+        self.update(|state, _| {
+            state.href = Some(href.to_owned());
+            state.read_only = read_only;
+            state.flavor = flavor;
+            Ok(())
+        })
     }
 
     /// The href a local `.ics` file belongs to.
@@ -345,40 +340,25 @@ impl VdirStore {
     /// point for a three-way merge if the server turns out to have changed the
     /// same resource meanwhile. Passing `None` never clears a captured base.
     pub fn queue_put_with_base(&mut self, href: &str, base: Option<&str>) -> Result<()> {
-        let file = self.file_name_for(href);
-        let etag = self.state.entries.get(href).map(|e| e.etag.clone());
-        let already_pending = self
-            .state
-            .pending
-            .iter()
-            .any(|entry| entry.op.href() == href);
-        self.enqueue(PushOp::Put {
-            href: href.to_owned(),
-            file,
-            etag,
-        })?;
-        if let Some(base) = base
-            && !already_pending
-            && let Some(entry) = self
-                .state
-                .pending
-                .iter_mut()
-                .find(|entry| entry.op.href() == href)
-            && entry.base.is_none()
-        {
-            entry.base = Some(base.to_owned());
-            self.save_sidecar()?;
-        }
-        Ok(())
+        self.update(|state, flavor| {
+            queue_put_into(state, flavor, href, base);
+            Ok(())
+        })
     }
 
     /// Queues a server-side delete, capturing the coordinates before the local
     /// file disappears.
     pub fn queue_delete(&mut self, href: &str) -> Result<()> {
-        let etag = self.state.entries.get(href).map(|e| e.etag.clone());
-        self.enqueue(PushOp::Delete {
-            href: href.to_owned(),
-            etag,
+        self.update(|state, _| {
+            let etag = state.entries.get(href).map(|e| e.etag.clone());
+            enqueue_into(
+                state,
+                PushOp::Delete {
+                    href: href.to_owned(),
+                    etag,
+                },
+            );
+            Ok(())
         })
     }
 
@@ -404,18 +384,25 @@ impl VdirStore {
     /// its etag is already current, so this completes without touching the
     /// network. The queued push goes with the edit it was carrying.
     pub fn resolve_conflict_take_remote(&mut self, href: &str) -> Result<bool> {
-        let Some(conflict) = self.conflict_for(href).cloned() else {
-            return Ok(false);
-        };
-
-        self.upsert(&RemoteEvent {
-            href: conflict.href.clone(),
-            etag: conflict.remote_etag.clone(),
-            ics: conflict.remote.clone(),
-        })?;
-
-        self.resolve(href)?;
-        self.clear_conflict(href)
+        let dir = self.meta.path.clone();
+        self.update(|state, flavor| {
+            let Some(conflict) = state.conflicts.iter().find(|c| c.href == href).cloned() else {
+                return Ok(false);
+            };
+            upsert_into(
+                state,
+                flavor,
+                &dir,
+                &RemoteEvent {
+                    href: conflict.href.clone(),
+                    etag: conflict.remote_etag.clone(),
+                    ics: conflict.remote.clone(),
+                },
+            )?;
+            state.pending.retain(|e| e.op.href() != href);
+            state.conflicts.retain(|c| c.href != href);
+            Ok(true)
+        })
     }
 
     /// Keep the local version: it is re-queued and will overwrite the server's.
@@ -433,94 +420,248 @@ impl VdirStore {
         href: &str,
         merged: Option<&str>,
     ) -> Result<bool> {
-        let Some(conflict) = self.conflict_for(href).cloned() else {
-            return Ok(false);
-        };
+        let dir = self.meta.path.clone();
+        self.update(|state, flavor| {
+            let Some(conflict) = state.conflicts.iter().find(|c| c.href == href).cloned() else {
+                return Ok(false);
+            };
 
-        if let Some(text) = merged {
-            let file = self.file_name_for(&conflict.href);
-            let target = self.meta.path.join(&file);
-            atomic::write(&target, text, None)
-                .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
-            self.state.entries.insert(
-                conflict.href.clone(),
-                SidecarEntry {
-                    file,
-                    etag: conflict.remote_etag.clone(),
-                },
-            );
-        }
+            if let Some(text) = merged {
+                let file = file_name_for(state, flavor, &conflict.href);
+                let target = dir.join(&file);
+                atomic::write(&target, text, None).map_err(|why| {
+                    Error::internal(format!("writing {}: {why}", target.display()))
+                })?;
+                state.entries.insert(
+                    conflict.href.clone(),
+                    SidecarEntry {
+                        file,
+                        etag: conflict.remote_etag.clone(),
+                    },
+                );
+            }
 
-        // Re-queueing rather than un-parking: `enqueue` reads the etag we now
-        // hold, which is the server's, and clears the block in one step.
-        self.queue_put(href)?;
-        self.clear_conflict(href)
-    }
-
-    fn clear_conflict(&mut self, href: &str) -> Result<bool> {
-        let before = self.state.conflicts.len();
-        self.state.conflicts.retain(|c| c.href != href);
-        if self.state.conflicts.len() == before {
-            return Ok(false);
-        }
-        self.save_sidecar()?;
-        Ok(true)
+            // Re-queueing rather than un-parking: the enqueue reads the etag
+            // we now hold, which is the server's, and clears the block in one
+            // step.
+            queue_put_into(state, flavor, href, None);
+            state.conflicts.retain(|c| c.href != href);
+            Ok(true)
+        })
     }
 
     fn state_path(&self) -> PathBuf {
         self.meta.path.join(STATE_FILE)
     }
 
-    /// Persists the sidecar. Atomic, because a torn sidecar is a full re-sync.
-    fn save_sidecar(&self) -> Result<()> {
+    /// The one way the sidecar changes: under the collection's lock, over a
+    /// fresh read of the file, then written back whole and atomically.
+    ///
+    /// The app queues pushes into the sidecar while a sync pass — in this
+    /// process or in the daemon — holds its own handle on the same collection
+    /// across minutes of network I/O. Saving from memory, as this store once
+    /// did, wrote the pass's stale copy over every push queued meanwhile, and
+    /// the edits never reached the server. Re-reading under the lock makes
+    /// each change apply to what is on disk now, whoever wrote it last.
+    ///
+    /// The lock is held for the read-change-write cycle only, never across a
+    /// request to the server.
+    fn update<T>(
+        &mut self,
+        change: impl FnOnce(&mut SidecarState, Flavor) -> Result<T>,
+    ) -> Result<T> {
+        let path = self.state_path();
+        let _lock = atomic::lock(&path)
+            .map_err(|why| Error::internal(format!("locking {}: {why}", path.display())))?;
+        if let Some(fresh) = read_sidecar(&path)? {
+            self.state = fresh;
+        }
+        let value = change(&mut self.state, self.flavor)?;
         let json = serde_json::to_string_pretty(&self.state)
             .map_err(|why| Error::internal(format!("serialising CalDAV sync state: {why}")))?;
-        atomic::write(&self.state_path(), &json, None)
-            .map(|_| ())
-            .map_err(|why| Error::internal(format!("writing CalDAV sync state: {why}")))
+        atomic::write(&path, &json, None)
+            .map_err(|why| Error::internal(format!("writing CalDAV sync state: {why}")))?;
+        Ok(value)
     }
 
-    /// The file name to store an href under.
-    ///
-    /// Reuses the name already recorded for that href so an update overwrites
-    /// in place rather than accumulating copies. Otherwise it is derived from
-    /// the href's last segment, which is what every other vdir tool does and
-    /// keeps the directory legible.
-    fn file_name_for(&self, href: &str) -> String {
-        if let Some(existing) = self.state.entries.get(href) {
-            return existing.file.clone();
+    /// Re-reads the sidecar so a read reflects what other handles queued.
+    fn refresh(&mut self) -> Result<()> {
+        let path = self.state_path();
+        let _lock = atomic::lock(&path)
+            .map_err(|why| Error::internal(format!("locking {}: {why}", path.display())))?;
+        if let Some(fresh) = read_sidecar(&path)? {
+            self.state = fresh;
         }
+        Ok(())
+    }
+}
 
-        let extension = self.extension();
-        let stem = href
-            .rsplit('/')
-            .find(|segment| !segment.is_empty())
-            .unwrap_or(href)
-            .trim_end_matches(&format!(".{extension}"));
+/// Reads a sidecar. `None` when there is none yet; an unparseable one is
+/// logged and read as none, which costs a full re-sync rather than a
+/// collection that cannot be opened.
+fn read_sidecar(path: &std::path::Path) -> Result<Option<SidecarState>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(serde_json::from_str(&text).unwrap_or_else(|why| {
+            tracing::warn!(
+                path = %path.display(), %why,
+                "unreadable CalDAV sidecar; treating the collection as unsynced"
+            );
+            SidecarState::default()
+        }))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
 
-        let mut name = format!("{}.{extension}", sanitise_stem(stem));
+/// The file extension resources in a collection of `flavor` use.
+fn extension(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::CalDav => "ics",
+        Flavor::CardDav => "vcf",
+    }
+}
 
-        // Two distinct hrefs can sanitise to the same name (different
-        // collections on the same server, percent-encoding collapsing). Storing
-        // both under one file would make each sync overwrite the other, forever.
-        if self.state.entries.values().any(|entry| entry.file == name) {
-            let mut n = 2;
-            loop {
-                let candidate = format!("{}-{n}.{extension}", sanitise_stem(stem));
-                if !self
-                    .state
-                    .entries
-                    .values()
-                    .any(|entry| entry.file == candidate)
-                {
-                    name = candidate;
-                    break;
-                }
-                n += 1;
+/// The file name to store an href under.
+///
+/// Reuses the name already recorded for that href so an update overwrites in
+/// place rather than accumulating copies. Otherwise it is derived from the
+/// href's last segment, which is what every other vdir tool does and keeps
+/// the directory legible.
+fn file_name_for(state: &SidecarState, flavor: Flavor, href: &str) -> String {
+    if let Some(existing) = state.entries.get(href) {
+        return existing.file.clone();
+    }
+
+    let extension = extension(flavor);
+    let stem = href
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(href)
+        .trim_end_matches(&format!(".{extension}"));
+
+    let mut name = format!("{}.{extension}", sanitise_stem(stem));
+
+    // Two distinct hrefs can sanitise to the same name (different collections
+    // on the same server, percent-encoding collapsing). Storing both under one
+    // file would make each sync overwrite the other, forever.
+    if state.entries.values().any(|entry| entry.file == name) {
+        let mut n = 2;
+        loop {
+            let candidate = format!("{}-{n}.{extension}", sanitise_stem(stem));
+            if !state.entries.values().any(|entry| entry.file == candidate) {
+                name = candidate;
+                break;
             }
+            n += 1;
         }
-        name
     }
+    name
+}
+
+/// Adds an operation, or resets an existing one for the same href to "due
+/// now" with a new revision. See [`PushQueue::enqueue`].
+fn enqueue_into(state: &mut SidecarState, op: PushOp) {
+    state.next_revision = state.next_revision.saturating_add(1);
+    let revision = state.next_revision;
+    let href = op.href().to_owned();
+    // Replace rather than append: the newest edit is the one that should
+    // reach the server, and replaying a stale state on top of a fresh one is
+    // worse than not pushing at all.
+    if let Some(existing) = state.pending.iter_mut().find(|e| e.op.href() == href) {
+        existing.op = op;
+        existing.attempts = 0;
+        existing.next_attempt_ms = 0;
+        existing.last_error = None;
+        // A fresh edit supersedes whatever the last one was held up by.
+        existing.blocked = false;
+        existing.revision = revision;
+    } else {
+        state.pending.push(PendingPush {
+            op,
+            attempts: 0,
+            next_attempt_ms: 0,
+            last_error: None,
+            blocked: false,
+            base: None,
+            revision,
+        });
+    }
+}
+
+/// [`VdirStore::queue_put_with_base`] on a sidecar already under the lock.
+fn queue_put_into(state: &mut SidecarState, flavor: Flavor, href: &str, base: Option<&str>) {
+    let file = file_name_for(state, flavor, href);
+    let etag = state.entries.get(href).map(|e| e.etag.clone());
+    let already_pending = state.pending.iter().any(|entry| entry.op.href() == href);
+    enqueue_into(
+        state,
+        PushOp::Put {
+            href: href.to_owned(),
+            file,
+            etag,
+        },
+    );
+    if let Some(base) = base
+        && !already_pending
+        && let Some(entry) = state
+            .pending
+            .iter_mut()
+            .find(|entry| entry.op.href() == href)
+        && entry.base.is_none()
+    {
+        entry.base = Some(base.to_owned());
+    }
+}
+
+/// [`CalDavStore::upsert`] on a sidecar already under the lock.
+fn upsert_into(
+    state: &mut SidecarState,
+    flavor: Flavor,
+    dir: &std::path::Path,
+    event: &RemoteEvent,
+) -> Result<()> {
+    if !looks_plausible(&event.ics, flavor) {
+        return Err(Error::protocol(format!(
+            "refusing to store an implausible payload for {} (expected {:?} data)",
+            event.href, flavor
+        )));
+    }
+
+    let file = file_name_for(state, flavor, &event.href);
+    let target = dir.join(&file);
+
+    // Read before writing: what the file held a moment ago is what a queued
+    // push for this href would have sent, and the two being equal is the one
+    // case where that push has nothing left to do.
+    let previous = std::fs::read_to_string(&target).ok();
+
+    // Unguarded: the server's copy is authoritative for a resource we are
+    // pulling. The caller is responsible for having established that there is
+    // no unsent local edit here — see `CalDavStore::unpushed_local` and the
+    // conflict path in `crate::sync`, which is what keeps this write from
+    // being the one that eats somebody's change.
+    atomic::write(&target, &event.ics, None)
+        .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
+
+    state.entries.insert(
+        event.href.clone(),
+        SidecarEntry {
+            file,
+            etag: event.etag.clone(),
+        },
+    );
+
+    // A queued push whose payload is what the server just sent us has nothing
+    // left to send. Without this, a push parked on a 412 whose change reached
+    // the server by another route (a second client, the same edit made twice)
+    // would stay parked forever and the UI would claim unsaved changes that
+    // no longer exist.
+    if previous.as_deref() == Some(event.ics.as_str()) {
+        state
+            .pending
+            .retain(|entry| !matches!(&entry.op, PushOp::Put { href, .. } if href == &event.href));
+    }
+    Ok(())
 }
 
 /// Makes an href segment safe as a file name.
@@ -598,70 +739,37 @@ impl CalDavStore for VdirStore {
     }
 
     fn upsert(&mut self, event: &RemoteEvent) -> Result<()> {
-        if !looks_plausible(&event.ics, self.flavor) {
-            return Err(Error::protocol(format!(
-                "refusing to store an implausible payload for {} (expected {:?} data)",
-                event.href, self.flavor
-            )));
-        }
-
-        let file = self.file_name_for(&event.href);
-        let target = self.meta.path.join(&file);
-
-        // Read before writing: what the file held a moment ago is what a queued
-        // push for this href would have sent, and the two being equal is the
-        // one case where that push has nothing left to do.
-        let previous = std::fs::read_to_string(&target).ok();
-
-        // Unguarded: the server's copy is authoritative for a resource we are
-        // pulling. The caller is responsible for having established that there
-        // is no unsent local edit here — see `CalDavStore::unpushed_local` and
-        // the conflict path in `crate::sync`, which is what keeps this write
-        // from being the one that eats somebody's change.
-        atomic::write(&target, &event.ics, None)
-            .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
-
-        self.state.entries.insert(
-            event.href.clone(),
-            SidecarEntry {
-                file,
-                etag: event.etag.clone(),
-            },
-        );
-
-        // A queued push whose payload is what the server just sent us has
-        // nothing left to send. Without this, a push parked on a 412 whose
-        // change reached the server by another route (a second client, the
-        // same edit made twice) would stay parked forever and the UI would
-        // claim unsaved changes that no longer exist.
-        if previous.as_deref() == Some(event.ics.as_str()) {
-            self.state.pending.retain(
-                |entry| !matches!(&entry.op, PushOp::Put { href, .. } if href == &event.href),
-            );
-        }
-
-        self.save_sidecar()
+        let dir = self.meta.path.clone();
+        self.update(|state, flavor| upsert_into(state, flavor, &dir, event))
     }
 
     fn remove(&mut self, href: &str) -> Result<()> {
-        if let Some(entry) = self.state.entries.remove(href) {
-            let path = self.meta.path.join(&entry.file);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+        let dir = self.meta.path.clone();
+        self.update(|state, _| {
+            if let Some(entry) = state.entries.remove(href) {
+                let path = dir.join(&entry.file);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
-            self.save_sidecar()?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn commit_ctag(&mut self, ctag: Option<&str>) -> Result<()> {
-        self.state.ctag = ctag.map(ToOwned::to_owned);
-        self.save_sidecar()
+        self.update(|state, _| {
+            state.ctag = ctag.map(ToOwned::to_owned);
+            Ok(())
+        })
     }
 
     /// The file's current bytes, when a PUT for this href is still queued.
+    ///
+    /// Read against the sidecar as it is on disk *now*: the edit this exists
+    /// to protect is usually one the app queued while this pass was talking
+    /// to the server.
     ///
     /// A queued **delete** answers `None` on purpose. Its conflict — we removed
     /// the resource, the server edited it — resolves itself in practice, and
@@ -671,7 +779,8 @@ impl CalDavStore for VdirStore {
     /// still goes out when the network returns. A resurrected event that
     /// disappears again on the next sync is a visible annoyance; it is not the
     /// silent loss this method exists to prevent.
-    fn unpushed_local(&self, href: &str) -> Result<Option<String>> {
+    fn unpushed_local(&mut self, href: &str) -> Result<Option<String>> {
+        self.refresh()?;
         let queued_put = self
             .state
             .pending
@@ -689,29 +798,34 @@ impl CalDavStore for VdirStore {
     }
 
     fn record_conflict(&mut self, conflict: &Conflict) -> Result<()> {
-        // The etag moves to the server's current value; the payload does not.
-        // Recording the etag is what stops the next cycle re-fetching the same
-        // divergence, and it is exactly the If-Match a resolution will need.
-        if let Some(entry) = self.state.entries.get_mut(&conflict.href) {
-            entry.etag = conflict.remote_etag.clone();
-        }
-
-        // The queued push must stop trying. Its bytes would overwrite the
-        // server's change, and with the etag now current it would *succeed* at
-        // doing so — silently losing the remote side instead of the local one.
-        for entry in &mut self.state.pending {
-            if entry.op.href() == conflict.href {
-                entry.blocked = true;
-                entry.last_error = Some("waiting on a conflict to be resolved".to_owned());
+        self.update(|state, _| {
+            // The etag moves to the server's current value; the payload does
+            // not. Recording the etag is what stops the next cycle re-fetching
+            // the same divergence, and it is exactly the If-Match a resolution
+            // will need.
+            if let Some(entry) = state.entries.get_mut(&conflict.href) {
+                entry.etag = conflict.remote_etag.clone();
             }
-        }
 
-        self.state.conflicts.retain(|c| c.href != conflict.href);
-        self.state.conflicts.push(conflict.clone());
-        self.save_sidecar()
+            // The queued push must stop trying. Its bytes would overwrite the
+            // server's change, and with the etag now current it would
+            // *succeed* at doing so — silently losing the remote side instead
+            // of the local one.
+            for entry in &mut state.pending {
+                if entry.op.href() == conflict.href {
+                    entry.blocked = true;
+                    entry.last_error = Some("waiting on a conflict to be resolved".to_owned());
+                }
+            }
+
+            state.conflicts.retain(|c| c.href != conflict.href);
+            state.conflicts.push(conflict.clone());
+            Ok(())
+        })
     }
 
-    fn unpushed_base(&self, href: &str) -> Result<Option<String>> {
+    fn unpushed_base(&mut self, href: &str) -> Result<Option<String>> {
+        self.refresh()?;
         Ok(self
             .state
             .pending
@@ -729,21 +843,23 @@ impl CalDavStore for VdirStore {
     /// predates both edits) is dropped rather than extended: first-enqueue-wins
     /// must not preserve a base from before a merge that already consumed it.
     fn apply_merged(&mut self, merged: &str, remote: &RemoteEvent) -> Result<()> {
-        let file = self.file_name_for(&remote.href);
-        let target = self.meta.path.join(&file);
-        atomic::write(&target, merged, None)
-            .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
-        self.state.entries.insert(
-            remote.href.clone(),
-            SidecarEntry {
-                file,
-                etag: remote.etag.clone(),
-            },
-        );
-        self.state
-            .pending
-            .retain(|entry| entry.op.href() != remote.href);
-        self.queue_put_with_base(&remote.href, Some(&remote.ics))
+        let dir = self.meta.path.clone();
+        self.update(|state, flavor| {
+            let file = file_name_for(state, flavor, &remote.href);
+            let target = dir.join(&file);
+            atomic::write(&target, merged, None)
+                .map_err(|why| Error::internal(format!("writing {}: {why}", target.display())))?;
+            state.entries.insert(
+                remote.href.clone(),
+                SidecarEntry {
+                    file,
+                    etag: remote.etag.clone(),
+                },
+            );
+            state.pending.retain(|entry| entry.op.href() != remote.href);
+            queue_put_into(state, flavor, &remote.href, Some(&remote.ics));
+            Ok(())
+        })
     }
 
     fn empty_sighting(&self) -> Result<Option<EmptySighting>> {
@@ -751,17 +867,22 @@ impl CalDavStore for VdirStore {
     }
 
     fn record_empty_sighting(&mut self, ctag: Option<&str>) -> Result<()> {
-        self.state.empty_sighting = Some(EmptySighting {
-            ctag: ctag.map(ToOwned::to_owned),
-        });
-        self.save_sidecar()
+        self.update(|state, _| {
+            state.empty_sighting = Some(EmptySighting {
+                ctag: ctag.map(ToOwned::to_owned),
+            });
+            Ok(())
+        })
     }
 
     fn clear_empty_sighting(&mut self) -> Result<()> {
-        if self.state.empty_sighting.take().is_some() {
-            self.save_sidecar()?;
+        if self.state.empty_sighting.is_none() {
+            return Ok(());
         }
-        Ok(())
+        self.update(|state, _| {
+            state.empty_sighting = None;
+            Ok(())
+        })
     }
 }
 
@@ -963,61 +1084,74 @@ mod tests {
 }
 
 impl PushQueue for VdirStore {
-    fn pending(&self) -> Vec<PendingPush> {
-        self.state.pending.clone()
+    /// What is queued, as it is on disk now — including what another handle
+    /// queued since this one was opened.
+    fn pending(&mut self) -> Result<Vec<PendingPush>> {
+        self.refresh()?;
+        Ok(self.state.pending.clone())
     }
 
     fn enqueue(&mut self, op: PushOp) -> Result<()> {
-        let href = op.href().to_owned();
-        // Replace rather than append: the newest edit is the one that should
-        // reach the server, and replaying a stale state on top of a fresh one
-        // is worse than not pushing at all.
-        if let Some(existing) = self.state.pending.iter_mut().find(|e| e.op.href() == href) {
-            existing.op = op;
-            existing.attempts = 0;
-            existing.next_attempt_ms = 0;
-            existing.last_error = None;
-            // A fresh edit supersedes whatever the last one was held up by.
-            existing.blocked = false;
-        } else {
-            self.state.pending.push(PendingPush {
-                op,
-                attempts: 0,
-                next_attempt_ms: 0,
-                last_error: None,
-                blocked: false,
-                base: None,
-            });
-        }
-        self.save_sidecar()
+        self.update(|state, _| {
+            enqueue_into(state, op);
+            Ok(())
+        })
     }
 
-    fn resolve(&mut self, href: &str) -> Result<()> {
-        let before = self.state.pending.len();
-        self.state.pending.retain(|e| e.op.href() != href);
-        if self.state.pending.len() != before {
-            self.save_sidecar()?;
-        }
-        Ok(())
+    fn resolve(&mut self, pushed: &PendingPush, etag: Option<&str>) -> Result<()> {
+        self.update(|state, _| {
+            let href = pushed.op.href();
+            // What the server now holds, whatever the queue says: the etag
+            // it returned is the If-Match any later push of this resource
+            // needs — including a newer edit queued while this one was in
+            // flight, which would otherwise go out with the old etag and be
+            // refused as a conflict with ourselves.
+            if let (PushOp::Put { file, .. }, Some(etag)) = (&pushed.op, etag) {
+                state.entries.insert(
+                    href.to_owned(),
+                    SidecarEntry {
+                        file: file.clone(),
+                        etag: etag.to_owned(),
+                    },
+                );
+                for entry in &mut state.pending {
+                    if let PushOp::Put {
+                        href: h,
+                        etag: queued,
+                        ..
+                    } = &mut entry.op
+                        && h == href
+                    {
+                        *queued = Some(etag.to_owned());
+                    }
+                }
+            }
+            state
+                .pending
+                .retain(|e| !(e.op.href() == href && e.revision == pushed.revision));
+            Ok(())
+        })
     }
 
-    fn defer(&mut self, href: &str, error: &str, next_attempt_ms: i64) -> Result<()> {
-        if let Some(entry) = self.state.pending.iter_mut().find(|e| e.op.href() == href) {
-            entry.attempts = entry.attempts.saturating_add(1);
-            entry.next_attempt_ms = next_attempt_ms;
-            entry.last_error = Some(error.to_owned());
-            self.save_sidecar()?;
-        }
-        Ok(())
+    fn defer(&mut self, pushed: &PendingPush, error: &str, next_attempt_ms: i64) -> Result<()> {
+        self.update(|state, _| {
+            if let Some(entry) = same_entry(state, pushed) {
+                entry.attempts = entry.attempts.saturating_add(1);
+                entry.next_attempt_ms = next_attempt_ms;
+                entry.last_error = Some(error.to_owned());
+            }
+            Ok(())
+        })
     }
 
-    fn park(&mut self, href: &str, error: &str) -> Result<()> {
-        if let Some(entry) = self.state.pending.iter_mut().find(|e| e.op.href() == href) {
-            entry.blocked = true;
-            entry.last_error = Some(error.to_owned());
-            self.save_sidecar()?;
-        }
-        Ok(())
+    fn park(&mut self, pushed: &PendingPush, error: &str) -> Result<()> {
+        self.update(|state, _| {
+            if let Some(entry) = same_entry(state, pushed) {
+                entry.blocked = true;
+                entry.last_error = Some(error.to_owned());
+            }
+            Ok(())
+        })
     }
 
     fn payload(&self, file: &str) -> Option<String> {
@@ -1027,6 +1161,19 @@ impl PushQueue for VdirStore {
     fn read_only(&self) -> bool {
         self.state.read_only
     }
+}
+
+/// The queued entry `pushed` was taken from, if nothing has replaced it
+/// since. A newer edit re-queued meanwhile has a new revision, and the
+/// outcome of pushing the older one says nothing about it.
+fn same_entry<'a>(
+    state: &'a mut SidecarState,
+    pushed: &PendingPush,
+) -> Option<&'a mut PendingPush> {
+    state
+        .pending
+        .iter_mut()
+        .find(|e| e.op.href() == pushed.op.href() && e.revision == pushed.revision)
 }
 
 #[cfg(test)]
@@ -1042,6 +1189,59 @@ mod push_queue_tests {
     }
 
     #[test]
+    fn a_push_queued_by_another_handle_survives_this_handles_next_save() {
+        // The app and the sync daemon each hold a handle on one collection.
+        // The daemon's pass opened its handle first and saves at the end of a
+        // network-bound pass; an edit the app queued in between used to be
+        // written over by the pass's stale copy, and never reached the server.
+        let (dir, mut pass) = store();
+        let meta = vdir::collections(dir.path()).remove(0);
+        let mut app = VdirStore::open(meta.clone()).unwrap();
+
+        app.queue_put("/cal/edited.ics").unwrap();
+        pass.commit_ctag(Some("ctag-2")).unwrap();
+
+        let mut reopened = VdirStore::open(meta).unwrap();
+        let hrefs: Vec<String> = reopened
+            .pending()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.op.href().to_owned())
+            .collect();
+        assert_eq!(hrefs, ["/cal/edited.ics"], "the app's queued edit was lost");
+        assert_eq!(reopened.state().unwrap().ctag.as_deref(), Some("ctag-2"));
+    }
+
+    #[test]
+    fn settling_a_push_leaves_a_newer_edit_of_the_same_resource_queued() {
+        // A drain snapshots the queue, then spends seconds on the network;
+        // the user edits the same event again meanwhile. The first push's
+        // success must not settle the second edit.
+        let (dir, mut drain) = store();
+        drain.queue_put("/cal/a.ics").unwrap();
+        let pushed = crate::push::entry_for_href(&mut drain, "/cal/a.ics");
+
+        let meta = vdir::collections(dir.path()).remove(0);
+        VdirStore::open(meta)
+            .unwrap()
+            .queue_put("/cal/a.ics")
+            .unwrap();
+
+        drain.resolve(&pushed, Some("\"etag-2\"")).unwrap();
+        let pending = drain.pending().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the newer edit was dropped as if it had been pushed"
+        );
+        assert!(
+            matches!(&pending[0].op, PushOp::Put { etag: Some(etag), .. } if etag == "\"etag-2\""),
+            "the newer edit would go out with the etag the server has replaced: {:?}",
+            pending[0].op
+        );
+    }
+
+    #[test]
     fn a_queued_edit_survives_a_reopen() {
         let (dir, mut store) = store();
         store.queue_put("/cal/a.ics").unwrap();
@@ -1049,9 +1249,9 @@ mod push_queue_tests {
         // This is the whole point of the queue: a process restart between the
         // edit and the network coming back must not lose the edit.
         let meta = vdir::collections(dir.path()).remove(0);
-        let reopened = VdirStore::open(meta).unwrap();
+        let mut reopened = VdirStore::open(meta).unwrap();
 
-        let pending = reopened.pending();
+        let pending = reopened.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].op.href(), "/cal/a.ics");
     }
@@ -1061,7 +1261,7 @@ mod push_queue_tests {
         let (_dir, mut store) = store();
         store.queue_put("/cal/abc.ics").unwrap();
 
-        let PushOp::Put { file, .. } = &store.pending()[0].op else {
+        let PushOp::Put { file, .. } = &store.pending().unwrap()[0].op else {
             panic!("expected a Put");
         };
         assert_eq!(file, "abc.ics");
@@ -1081,7 +1281,7 @@ mod push_queue_tests {
         store.queue_delete("/cal/a.ics").unwrap();
         store.remove("/cal/a.ics").unwrap();
 
-        let PushOp::Delete { etag, .. } = &store.pending()[0].op else {
+        let PushOp::Delete { etag, .. } = &store.pending().unwrap()[0].op else {
             panic!("expected a Delete");
         };
         assert_eq!(
@@ -1095,22 +1295,22 @@ mod push_queue_tests {
     fn resolving_removes_the_entry_durably() {
         let (dir, mut store) = store();
         store.queue_put("/cal/a.ics").unwrap();
-        store.resolve("/cal/a.ics").unwrap();
+        let queued = crate::push::entry_for_href(&mut store, "/cal/a.ics");
+        store.resolve(&queued, None).unwrap();
 
         let meta = vdir::collections(dir.path()).remove(0);
-        assert!(VdirStore::open(meta).unwrap().pending().is_empty());
+        assert!(VdirStore::open(meta).unwrap().pending().unwrap().is_empty());
     }
 
     #[test]
     fn deferring_records_the_error_durably() {
         let (dir, mut store) = store();
         store.queue_put("/cal/a.ics").unwrap();
-        store
-            .defer("/cal/a.ics", "connection refused", 12_345)
-            .unwrap();
+        let queued = crate::push::entry_for_href(&mut store, "/cal/a.ics");
+        store.defer(&queued, "connection refused", 12_345).unwrap();
 
         let meta = vdir::collections(dir.path()).remove(0);
-        let pending = VdirStore::open(meta).unwrap().pending();
+        let pending = VdirStore::open(meta).unwrap().pending().unwrap();
         assert_eq!(pending[0].attempts, 1);
         assert_eq!(pending[0].next_attempt_ms, 12_345);
         assert_eq!(pending[0].last_error.as_deref(), Some("connection refused"));
@@ -1259,7 +1459,7 @@ mod conflict_tests {
         // Proving the push exists here makes every emptiness assertion
         // downstream mean what it says.
         assert!(
-            !store.pending().is_empty(),
+            !store.pending().unwrap().is_empty(),
             "the fixture queued no push, so nothing below can prove one was dropped"
         );
         assert_eq!(
@@ -1292,7 +1492,7 @@ mod conflict_tests {
 
     #[test]
     fn an_unsent_edit_is_visible_to_the_pull_path() {
-        let (_dir, store) = diverged();
+        let (_dir, mut store) = diverged();
         assert_eq!(
             store.unpushed_local(HREF).unwrap().as_deref(),
             Some(LOCAL_EDIT)
@@ -1321,7 +1521,8 @@ mod conflict_tests {
         // note on `unpushed_local`. What must not happen is a conflict record
         // holding the bytes of a file the user asked to remove.
         let (_dir, mut store) = diverged();
-        store.resolve(HREF).unwrap();
+        let queued = crate::push::entry_for_href(&mut store, HREF);
+        store.resolve(&queued, None).unwrap();
         store.queue_delete(HREF).unwrap();
 
         assert_eq!(store.unpushed_local(HREF).unwrap(), None);
@@ -1350,7 +1551,7 @@ mod conflict_tests {
             "the server's etag was not adopted, so the next cycle re-fetches the same divergence"
         );
         assert!(
-            store.pending()[0].blocked,
+            store.pending().unwrap()[0].blocked,
             "the queued push was left live; with the etag now current it would \
              have succeeded at overwriting the server's change"
         );
@@ -1381,7 +1582,7 @@ mod conflict_tests {
         assert_eq!(file(&store), SERVER_V2);
         assert_eq!(store.entry_for(HREF).unwrap().1, "\"v2\"");
         assert!(
-            store.pending().is_empty(),
+            store.pending().unwrap().is_empty(),
             "a push survived the edit it carried"
         );
         assert!(store.conflicts().is_empty());
@@ -1397,7 +1598,7 @@ mod conflict_tests {
         assert_eq!(file(&store), LOCAL_EDIT, "the local copy was not kept");
         assert!(store.conflicts().is_empty());
 
-        let entry = &store.pending()[0];
+        let entry = &store.pending().unwrap()[0];
         assert!(!entry.blocked, "the resolved push stayed parked");
         let PushOp::Put { etag, .. } = &entry.op else {
             panic!("expected a Put");
@@ -1446,7 +1647,7 @@ mod conflict_tests {
             })
             .unwrap();
 
-        assert!(store.pending().is_empty());
+        assert!(store.pending().unwrap().is_empty());
     }
 }
 
@@ -1485,7 +1686,7 @@ mod base_capture_tests {
 
         // Durable: the base has to survive the process, exactly like the edit.
         let meta = vdir::collections(dir.path()).remove(0);
-        let reopened = VdirStore::open(meta).unwrap();
+        let mut reopened = VdirStore::open(meta).unwrap();
         assert_eq!(reopened.unpushed_base(HREF).unwrap().as_deref(), Some(V1));
     }
 
@@ -1520,7 +1721,8 @@ mod base_capture_tests {
     fn the_base_goes_with_the_entry_when_the_push_succeeds() {
         let (_dir, mut store) = synced();
         store.queue_put_with_base(HREF, Some(V1)).unwrap();
-        store.resolve(HREF).unwrap();
+        let queued = crate::push::entry_for_href(&mut store, HREF);
+        store.resolve(&queued, None).unwrap();
 
         assert_eq!(store.unpushed_base(HREF).unwrap(), None);
     }
@@ -1535,8 +1737,8 @@ mod base_capture_tests {
         )
         .unwrap();
 
-        let store = VdirStore::open(meta).expect("an old sidecar must not be fatal");
-        assert_eq!(store.pending().len(), 1);
+        let mut store = VdirStore::open(meta).expect("an old sidecar must not be fatal");
+        assert_eq!(store.pending().unwrap().len(), 1);
         assert_eq!(store.unpushed_base("/cal/a.ics").unwrap(), None);
     }
 
@@ -1563,7 +1765,7 @@ mod base_capture_tests {
         assert_eq!(file, MERGED, "the merged text did not reach the file");
         assert_eq!(store.entry_for(HREF).unwrap().1, "\"v2\"");
 
-        let pending = store.pending();
+        let pending = store.pending().unwrap();
         assert_eq!(pending.len(), 1, "the merge was not re-queued for upload");
         let PushOp::Put { etag, .. } = &pending[0].op else {
             panic!("expected a Put");

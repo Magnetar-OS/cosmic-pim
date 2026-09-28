@@ -153,7 +153,7 @@ pub trait CalDavStore {
     ///
     /// A store with no writeback queue has no unsent changes by definition and
     /// answers `None`.
-    fn unpushed_local(&self, href: &str) -> Result<Option<String>>;
+    fn unpushed_local(&mut self, href: &str) -> Result<Option<String>>;
 
     /// Parks the server's version of a resource that diverged from ours.
     ///
@@ -168,7 +168,7 @@ pub trait CalDavStore {
     /// The last-synced bytes behind an unsent local change, if the queue
     /// captured them at save time. `None` disables the automatic merge for
     /// that resource and nothing else.
-    fn unpushed_base(&self, _href: &str) -> Result<Option<String>> {
+    fn unpushed_base(&mut self, _href: &str) -> Result<Option<String>> {
         Ok(None)
     }
 
@@ -245,7 +245,7 @@ impl CalDavStore for MemoryStore {
         Ok(())
     }
 
-    fn unpushed_local(&self, href: &str) -> Result<Option<String>> {
+    fn unpushed_local(&mut self, href: &str) -> Result<Option<String>> {
         Ok(self.unpushed.get(href).cloned())
     }
 
@@ -259,7 +259,7 @@ impl CalDavStore for MemoryStore {
         Ok(())
     }
 
-    fn unpushed_base(&self, href: &str) -> Result<Option<String>> {
+    fn unpushed_base(&mut self, href: &str) -> Result<Option<String>> {
         Ok(self.bases.get(href).cloned())
     }
 

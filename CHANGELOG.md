@@ -46,6 +46,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   already carries, and their id maps are saved after a failed pass too, so a
   failed or lost sidecar no longer shows one message's bytes under another's
   id or overwrites POP3's only copies (audit F-24).
+- The CalDAV/CardDAV sync sidecar is changed only under the collection's lock
+  and over a fresh read, so a push the app queues while a sync pass (in-
+  process or the daemon) holds the collection is no longer erased by the
+  pass's stale save; a push's success no longer settles a newer edit of the
+  same resource queued during it (audit F-09, Slate F-06).
+- A CalDAV create is sent with `If-None-Match: *`, and the ETag a PUT returns
+  is recorded, so the next edit carries the right `If-Match` (audit F-18).
 
 ### Changed
 
@@ -57,6 +64,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `outbox::Queued` gains `sending: bool` (read from disk, never stored).
   `Outbox::list` includes messages a drain is sending; `Outbox::cancel`
   returns `None` for them; `Outbox::remove` refuses them with an error.
+- `caldav::push::PushQueue`: `pending(&mut self) -> Result<Vec<PendingPush>>`;
+  `resolve(&mut self, pushed: &PendingPush, etag: Option<&str>)`, `defer(&mut
+  self, pushed: &PendingPush, error, next_attempt_ms)` and `park(&mut self,
+  pushed: &PendingPush, error)` act only on the entry they were handed.
+  `PendingPush` gains `revision: u64`. `CalDavStore::unpushed_local` and
+  `unpushed_base` take `&mut self` (they re-read the sidecar).
 
 ### Added
 
