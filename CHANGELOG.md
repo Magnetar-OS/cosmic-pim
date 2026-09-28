@@ -22,8 +22,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - A DAV listing that reported a failed resource no longer commits the
   collection's ctag, so that resource's change is not left waiting for an
   unrelated edit (audit F-05).
+- A JMAP full read no longer deletes every message beyond a server-clamped
+  query limit (audit F-06).
 
 ### Changed
+
+- `jmap::Session::query` returns `(ids, applied_limit)`: the limit the server
+  actually applied, which RFC 8620 lets it clamp (audit F-06).
 
 ### Added
 

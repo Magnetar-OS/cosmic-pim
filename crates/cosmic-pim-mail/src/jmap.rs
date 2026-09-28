@@ -379,12 +379,15 @@ impl Session {
             .collect())
     }
 
-    /// The ids of the emails in one mailbox, newest first.
+    /// The ids of the emails in one mailbox, newest first, and the limit the
+    /// server actually applied.
     ///
     /// `limit` bounds the backfill: a twenty-year archive should not be
     /// downloaded in one pass, and the sort makes the bound mean "the most
-    /// recent N" rather than an arbitrary N.
-    pub fn query(&self, mailbox_id: &str, limit: usize) -> Result<Vec<String>> {
+    /// recent N" rather than an arbitrary N. A server may clamp it to a
+    /// maximum of its own and report that one back (RFC 8620 §5.5); the
+    /// returned limit is the one the window was really cut at.
+    pub fn query(&self, mailbox_id: &str, limit: usize) -> Result<(Vec<String>, usize)> {
         let responses = self.request(json!([[
             "Email/query",
             {
@@ -397,17 +400,23 @@ impl Session {
             "0"
         ]]))?;
 
-        let ids = responses
-            .first()
-            .and_then(|entry| entry.get(1))
+        let args = responses.first().and_then(|entry| entry.get(1));
+        let ids = args
             .and_then(|args| args.get("ids"))
             .and_then(Value::as_array)
             .ok_or_else(|| Error::Jmap("Email/query returned no ids".to_owned()))?;
+        let applied = args
+            .and_then(|args| args.get("limit"))
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .map_or(limit, |n| n.min(limit));
 
-        Ok(ids
-            .iter()
-            .filter_map(|id| id.as_str().map(ToOwned::to_owned))
-            .collect())
+        Ok((
+            ids.iter()
+                .filter_map(|id| id.as_str().map(ToOwned::to_owned))
+                .collect(),
+            applied,
+        ))
     }
 
     /// The account's current `Email` state string, without fetching anything.
@@ -1158,7 +1167,7 @@ fn sync_full(
     // data it was recorded with.
     let opened_at = session.email_state()?;
 
-    let ids = session.query(mailbox_id, limit)?;
+    let (ids, limit) = session.query(mailbox_id, limit)?;
     let known = store.state()?;
 
     let mut present: BTreeSet<u32> = BTreeSet::new();

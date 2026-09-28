@@ -97,6 +97,9 @@ struct ServerState {
     /// anything older gets `cannotCalculateChanges`, exactly as a real server
     /// does once its log has rolled over.
     floor: u64,
+    /// A server-side maximum for `Email/query`'s `limit`. RFC 8620 §5.5 lets
+    /// a server clamp the client's limit, returning the one it used.
+    query_cap: Option<usize>,
 }
 
 impl ServerState {
@@ -183,6 +186,7 @@ fn serve(emails: Vec<Email>) -> Server {
         state: 1,
         history: Vec::new(),
         floor: 0,
+        query_cap: None,
     }));
     let held = Arc::clone(&inner);
 
@@ -342,14 +346,24 @@ fn respond(name: &str, args: &Value, state: &mut ServerState) -> (String, Value)
                 .and_then(|f| f.get("inMailbox"))
                 .and_then(Value::as_str)
                 .unwrap_or("mbox-1");
-            json!({
+            let asked = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+            let limit = state.query_cap.map_or(asked, |cap| asked.min(cap));
+            let mut reply = json!({
                 "accountId": "acct-1",
                 "queryState": state.state.to_string(),
                 "ids": state.emails.iter()
                     .filter(|e| in_mailbox(e, mailbox))
+                    .take(limit)
                     .map(|e| e.id.clone())
                     .collect::<Vec<_>>()
-            })
+            });
+            if limit < asked {
+                reply["limit"] = json!(limit);
+            }
+            reply
         }
         "Email/get" => {
             let wanted: Vec<String> = args
@@ -1021,4 +1035,30 @@ fn a_quiet_watch_times_out_rather_than_failing() {
         .expect("a timeout is the turn of the loop, not an error");
 
     assert_eq!(outcome, cosmic_pim_mail::imap::Watched::TimedOut);
+}
+
+#[test]
+fn a_server_that_clamps_the_query_limit_does_not_cost_the_unlisted_messages() {
+    // RFC 8620 §5.5: a server may enforce its own maximum `limit` and report
+    // the one it used. A window the server shortened is still a window, and
+    // the messages beyond it have not left the mailbox.
+    let server = serve(vec![
+        Email::new("M1", RAW_ONE, json!({})),
+        Email::new("M2", RAW_TWO, json!({})),
+        Email::new("M3", RAW_THREE, json!({})),
+    ]);
+    let (dir, mut store) = maildir();
+    let mut state = jmap::state(dir.path());
+    sync(&server, &mut store, &mut state);
+    assert_eq!(store.state().expect("state").entries.len(), 3);
+
+    server.inner.lock().expect("state").query_cap = Some(2);
+    state.reset_cursor();
+    let outcome = sync(&server, &mut store, &mut state);
+
+    assert_eq!(
+        outcome.removed, 0,
+        "messages outside the server's shortened window were deleted"
+    );
+    assert_eq!(store.state().expect("state").entries.len(), 3);
 }
