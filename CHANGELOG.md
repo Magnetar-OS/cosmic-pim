@@ -94,6 +94,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - The secret envelope and its backend record are read-modify-written under a
   cross-process lock, not an in-process mutex, so two apps saving secrets no
   longer overwrite each other's.
+- The IMAP sync pass files an outbox message's Sent copy into the folder the
+  server declares `\Sent` (or names as such), not a mailbox literally called
+  "Sent", which failed or created a stray folder on Gmail, Exchange, Courier
+  and localised servers (audit F-31, Envelope F-04).
 
 ### Changed
 
@@ -127,6 +131,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `AccountStore::remove` reports a secret it could not delete.
   `accounts::Error::Poisoned` and `Error::poisoned()` are removed (no lock can
   be poisoned any more).
+- `sync::MailReport::sent` is `Vec<String>`: the outbox ids that left this
+  pass (was a count), so an app can settle per-message follow-ups such as
+  marking the answered message.
 
 ### Added
 

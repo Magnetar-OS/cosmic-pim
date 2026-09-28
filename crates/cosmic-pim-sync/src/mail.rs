@@ -53,8 +53,10 @@ impl MailboxReport {
 #[derive(Debug, Default)]
 pub struct MailReport {
     pub mailboxes: Vec<MailboxReport>,
-    /// Messages that left the outbox this pass.
-    pub sent: usize,
+    /// The outbox ids of the messages that left this pass, in the order they
+    /// went — what an app keyed a queued message's follow-up on (marking the
+    /// message it answers, for one) can settle by.
+    pub sent: Vec<String>,
     /// Sends the outbox has given up on. These need a person.
     pub given_up: usize,
 }
@@ -62,7 +64,7 @@ pub struct MailReport {
 impl MailReport {
     #[must_use]
     pub fn changed(&self) -> bool {
-        self.sent > 0 || self.mailboxes.iter().any(MailboxReport::changed)
+        !self.sent.is_empty() || self.mailboxes.iter().any(MailboxReport::changed)
     }
 
     /// Mailboxes that failed this pass.
@@ -161,9 +163,21 @@ fn sync_over_imap(
     let mut session =
         Session::connect(&imap_endpoint(account, mail), credentials).map_err(Error::Mail)?;
 
+    // The folder list first: the Sent copy of anything the outbox sends is
+    // filed into the folder the server calls Sent, whatever its name.
+    let folders = session.folders().map_err(Error::Mail)?;
+
     // The outbox before the pull. Sends are the user's own words waiting to
     // leave; a pass that fetches first leaves them queued for another cycle.
-    match drain_outbox(account, mail, credentials, mail_root, now_ms, &mut session) {
+    match drain_outbox(
+        account,
+        mail,
+        credentials,
+        mail_root,
+        now_ms,
+        &mut session,
+        sent_mailbox(&folders),
+    ) {
         Ok((sent, given_up)) => {
             report.sent = sent;
             report.given_up = given_up;
@@ -174,8 +188,6 @@ fn sync_over_imap(
             tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
         }
     }
-
-    let folders = session.folders().map_err(Error::Mail)?;
 
     for folder in folders {
         if folder.no_select {
@@ -208,7 +220,6 @@ fn sync_over_imap(
 /// SMTP path there is nothing to append afterwards. The accepted copies come
 /// back for the one caller (JMAP) whose server does not file for it.
 struct Drained {
-    sent: usize,
     given_up: usize,
     /// `(queue id, accepted bytes)`, in the order they went.
     accepted: Vec<(String, Vec<u8>)>,
@@ -223,7 +234,6 @@ fn drain_outbox_with(
     let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id)).map_err(Error::Mail)?;
     let outcome = outbox.drain_with(submit, now_ms).map_err(Error::Mail)?;
     Ok(Drained {
-        sent: outcome.sent.len(),
         given_up: outcome.given_up,
         accepted: outcome.sent,
     })
@@ -257,7 +267,7 @@ fn sync_over_gmail(
     // Sent copy, so the accepted bytes are dropped rather than appended.
     match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
         Ok(drained) => {
-            report.sent = drained.sent;
+            report.sent = drained.accepted.into_iter().map(|(id, _)| id).collect();
             report.given_up = drained.given_up;
         }
         Err(why) => {
@@ -322,7 +332,7 @@ fn sync_over_graph(
     // Sent copy (`saveToSentItems` defaults true).
     match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
         Ok(drained) => {
-            report.sent = drained.sent;
+            report.sent = drained.accepted.into_iter().map(|(id, _)| id).collect();
             report.given_up = drained.given_up;
         }
         Err(why) => {
@@ -396,7 +406,7 @@ fn sync_over_jmap(
         cosmic_pim_mail::smtp::send(&smtp_endpoint(account, mail), credentials, draft)
     }) {
         Ok(drained) => {
-            report.sent = drained.sent;
+            report.sent = drained.accepted.iter().map(|(id, _)| id.clone()).collect();
             report.given_up = drained.given_up;
 
             let sent_mailbox = mailboxes
@@ -597,11 +607,26 @@ fn sync_one(
         .map_err(Error::Mail)
 }
 
-/// Sends what is queued, and files each accepted message to Sent.
+/// The mailbox the Sent copies go to: the one the server declares `\Sent`
+/// (RFC 6154), or failing that the one whose name says so.
+///
+/// Never a literal `"Sent"`: on Gmail that is `[Gmail]/Sent Mail`, on
+/// Exchange `Sent Items`, on Courier `INBOX.Sent`, and on a localised server
+/// something else again. An APPEND to `"Sent"` there fails, or creates a
+/// stray folder beside the real one (audit F-31).
+fn sent_mailbox(folders: &[Folder]) -> Option<&str> {
+    folders
+        .iter()
+        .find(|folder| folder.special_use == Some(cosmic_pim_mail::SpecialUse::Sent))
+        .map(|folder| folder.wire_name.as_str())
+}
+
+/// Sends what is queued, and files each accepted message to `sent`.
 ///
 /// Filing is what makes a sent message visible on the user's phone. It is
 /// deliberately *not* fatal: the message has already been delivered, and
 /// failing the pass over the copy would invite a retry that sends it twice.
+/// Returns the ids that went and how many were given up.
 fn drain_outbox(
     account: &Account,
     mail: &MailEndpoint,
@@ -609,14 +634,15 @@ fn drain_outbox(
     mail_root: &Path,
     now_ms: i64,
     session: &mut Session,
-) -> Result<(usize, usize)> {
+    sent: Option<&str>,
+) -> Result<(Vec<String>, usize)> {
     let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id)).map_err(Error::Mail)?;
 
     let outcome = outbox
         .drain(&smtp_endpoint(account, mail), credentials, now_ms)
         .map_err(Error::Mail)?;
 
-    let sent = outcome.sent.len();
+    let mut ids = Vec::with_capacity(outcome.sent.len());
     for (id, filed) in outcome.sent {
         // Filed as read: the sender wrote it, so presenting it as unread mail
         // on their phone would be noise.
@@ -624,15 +650,25 @@ fn drain_outbox(
             seen: true,
             ..Default::default()
         };
-        if let Err(why) = session.append("Sent", &filed, flags) {
-            tracing::warn!(
-                account = account.display_name, message = id, %why,
-                "a message was sent but could not be filed to Sent"
-            );
+        match sent {
+            Some(mailbox) => {
+                if let Err(why) = session.append(mailbox, &filed, flags) {
+                    tracing::warn!(
+                        account = account.display_name, message = id, %why,
+                        "a message was sent but could not be filed to Sent"
+                    );
+                }
+            }
+            None => tracing::warn!(
+                account = account.display_name,
+                message = id,
+                "a message was sent, but the server has no Sent folder to file it in"
+            ),
         }
+        ids.push(id);
     }
 
-    Ok((sent, outcome.given_up))
+    Ok((ids, outcome.given_up))
 }
 
 #[cfg(test)]
@@ -722,7 +758,8 @@ mod tests {
         .expect("drain");
 
         assert_eq!(
-            drained.sent, 1,
+            drained.accepted.len(),
+            1,
             "the drain did not see the message the app queued"
         );
         assert_eq!(outbox.count(), 0, "the sent message stayed queued");
@@ -770,5 +807,15 @@ mod tests {
         assert_eq!(security(Transport::Tls), Security::Tls);
         assert_eq!(security(Transport::StartTls), Security::StartTls);
         assert_eq!(security(Transport::Plaintext), Security::Plaintext);
+    }
+
+    #[test]
+    fn the_sent_copy_goes_to_the_folder_the_server_calls_sent() {
+        let folders = [
+            cosmic_pim_mail::folder::from_list_entry("INBOX", Some('/'), &[]),
+            cosmic_pim_mail::folder::from_list_entry("INBOX.Sent Items", Some('.'), &[]),
+        ];
+        assert_eq!(sent_mailbox(&folders), Some("INBOX.Sent Items"));
+        assert_eq!(sent_mailbox(&folders[..1]), None);
     }
 }
