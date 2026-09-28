@@ -38,7 +38,6 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chacha20poly1305::aead::Aead as _;
@@ -86,9 +85,6 @@ pub struct SecretStore {
     /// Why the keychain was skipped, when it was. Surfaced in the UI.
     fallback_reason: Option<String>,
     dir: PathBuf,
-    /// Serialises envelope read-modify-write cycles, which are not atomic
-    /// across separate load/store calls.
-    envelope_lock: Mutex<()>,
 }
 
 impl SecretStore {
@@ -122,7 +118,6 @@ impl SecretStore {
             backend,
             fallback_reason,
             dir: dir.to_path_buf(),
-            envelope_lock: Mutex::new(()),
         }
     }
 
@@ -138,7 +133,6 @@ impl SecretStore {
             backend: Backend::LocalEnvelope,
             fallback_reason: Some("explicitly requested".to_owned()),
             dir: dir.to_path_buf(),
-            envelope_lock: Mutex::new(()),
         }
     }
 
@@ -205,7 +199,7 @@ impl SecretStore {
     /// keychain is unreachable is an **error naming the problem**, never a
     /// silent `None`.
     pub fn load(&self, slot: &str) -> Result<Option<String>> {
-        match self.recorded_backend(slot) {
+        match self.recorded_backend(slot)? {
             Some(Backend::LocalEnvelope) => self.envelope_load(slot),
             Some(Backend::OsKeychain) => match self.backend {
                 Backend::OsKeychain => self.keychain_load(slot),
@@ -221,13 +215,13 @@ impl SecretStore {
             None => match self.backend {
                 Backend::OsKeychain => match self.keychain_load(slot)? {
                     Some(value) => {
-                        self.record_backend(slot, Backend::OsKeychain);
+                        self.record_found(slot, Backend::OsKeychain);
                         Ok(Some(value))
                     }
                     None => {
                         let fallback = self.envelope_load(slot)?;
                         if fallback.is_some() {
-                            self.record_backend(slot, Backend::LocalEnvelope);
+                            self.record_found(slot, Backend::LocalEnvelope);
                         }
                         Ok(fallback)
                     }
@@ -235,7 +229,7 @@ impl SecretStore {
                 Backend::LocalEnvelope => {
                     let value = self.envelope_load(slot)?;
                     if value.is_some() {
-                        self.record_backend(slot, Backend::LocalEnvelope);
+                        self.record_found(slot, Backend::LocalEnvelope);
                     }
                     Ok(value)
                 }
@@ -243,8 +237,13 @@ impl SecretStore {
         }
     }
 
+    ///
+    /// The record of where the secret went is written before any superseded
+    /// copy is removed, and a record that cannot be written is an error:
+    /// without it a later read follows the old record to the old copy — a
+    /// silent `None`, or yesterday's password once the keychain unlocks.
     pub fn store(&self, slot: &str, value: &str) -> Result<()> {
-        let previous = self.recorded_backend(slot);
+        let previous = self.recorded_backend(slot)?;
         match self.backend {
             Backend::OsKeychain => keyring::Entry::new(&self.service, slot)
                 .map_err(Error::keychain)?
@@ -252,7 +251,7 @@ impl SecretStore {
                 .map_err(Error::keychain)?,
             Backend::LocalEnvelope => self.envelope_store(slot, value)?,
         }
-        self.record_backend(slot, self.backend);
+        self.record_backend(slot, self.backend)?;
 
         // A rewrite that moved backends leaves a stale copy behind. The
         // envelope copy is cheap and safe to remove; a stale *keychain* copy
@@ -273,29 +272,37 @@ impl SecretStore {
         Ok(())
     }
 
-    /// Best-effort delete. A missing entry is success and anything else is
-    /// logged rather than returned: removing an account must not fail because
-    /// its password was already gone.
+    /// Deletes every copy of a secret, then its record.
     ///
-    /// Removes every copy it can reach — the recorded backend, and the
-    /// envelope regardless (cheap, and the one place a stray copy hides). A
-    /// keychain copy is only touched while the keychain answers.
-    pub fn forget(&self, slot: &str) {
-        if self.backend == Backend::OsKeychain {
-            let outcome = keyring::Entry::new(&self.service, slot)
-                .map_err(Error::keychain)
-                .and_then(|entry| match entry.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                    Err(e) => Err(Error::keychain(e)),
-                });
-            if let Err(why) = outcome {
-                tracing::warn!(slot, %why, "could not delete the keychain copy");
+    /// A missing entry is success. Anything else is an error, and the record
+    /// survives it: erasing the record while a keychain copy remains (the
+    /// keychain locked, or this store opened envelope-only) left a secret no
+    /// read would ever look for again, with nothing saying it was there
+    /// (audit F-42).
+    ///
+    /// Removes the envelope copy regardless (cheap, and the one place a
+    /// stray copy hides), and the keychain copy whenever one may exist.
+    pub fn forget(&self, slot: &str) -> Result<()> {
+        let recorded = self.recorded_backend(slot)?;
+        match self.backend {
+            Backend::OsKeychain => {
+                let entry = keyring::Entry::new(&self.service, slot).map_err(Error::keychain)?;
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => {}
+                    Err(e) => return Err(Error::keychain(e)),
+                }
             }
+            Backend::LocalEnvelope if recorded == Some(Backend::OsKeychain) => {
+                return Err(Error::keychain(format!(
+                    "this secret lives in the OS keychain, which is unavailable ({}); \
+                     it was not deleted",
+                    self.fallback_reason.as_deref().unwrap_or("unknown reason")
+                )));
+            }
+            Backend::LocalEnvelope => {}
         }
-        if let Err(why) = self.envelope_forget(slot) {
-            tracing::warn!(slot, %why, "could not delete the envelope copy");
-        }
-        self.erase_record(slot);
+        self.envelope_forget(slot)?;
+        self.erase_record(slot)
     }
 
     fn keychain_load(&self, slot: &str) -> Result<Option<String>> {
@@ -311,55 +318,82 @@ impl SecretStore {
 
     /* ---------------- the per-slot backend record ---------------- */
 
-    fn read_records(&self) -> HashMap<String, Backend> {
-        std::fs::read(self.dir.join(RECORD_FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// The lock over this store's files, shared by every process and
+    /// thread using the same directory.
+    ///
+    /// Both files are read-modify-write of the whole map, and three apps and
+    /// the sync daemon write them. An in-process mutex left processes
+    /// overwriting each other's secrets and records.
+    fn lock(&self) -> Result<cosmic_pim_core::atomic::Lock> {
+        std::fs::create_dir_all(&self.dir)?;
+        cosmic_pim_core::atomic::lock(&self.dir.join(STORE_FILE))
+            .map_err(|why| Error::keychain(format!("cannot lock the secret store: {why}")))
     }
 
-    fn recorded_backend(&self, slot: &str) -> Option<Backend> {
-        self.read_records().get(slot).copied()
+    /// The record, or none when there is no file yet.
+    ///
+    /// A file that does not parse reads as empty, unlike the envelope: the
+    /// record holds no secret, only where each one went, and every slot
+    /// without an entry takes the legacy lookup and is recorded again when
+    /// found. Refusing instead would make every save fail until someone
+    /// repaired a JSON file by hand. A file that cannot be *read* is an error.
+    fn read_records(&self) -> Result<HashMap<String, Backend>> {
+        let path = self.dir.join(RECORD_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|why| {
+                tracing::warn!(
+                    path = %path.display(), %why,
+                    "unreadable secret backend record; every slot will be looked up afresh"
+                );
+                HashMap::new()
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(Error::keychain(format!(
+                "cannot read {}: {e}",
+                path.display()
+            ))),
+        }
     }
 
-    /// Durable, best-effort: a record that fails to write costs one legacy
-    /// lookup later, not a secret.
-    fn record_backend(&self, slot: &str, backend: Backend) {
-        // The same lock the envelope uses: the record's read-modify-write is
-        // just as unatomic across threads as the envelope's is.
-        let Ok(_guard) = self.envelope_lock.lock() else {
-            return;
-        };
-        let mut records = self.read_records();
+    fn recorded_backend(&self, slot: &str) -> Result<Option<Backend>> {
+        Ok(self.read_records()?.get(slot).copied())
+    }
+
+    fn record_backend(&self, slot: &str, backend: Backend) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut records = self.read_records()?;
         if records.get(slot) == Some(&backend) {
-            return;
+            return Ok(());
         }
         records.insert(slot.to_owned(), backend);
-        self.write_records(&records);
+        self.write_records(&records)
     }
 
-    fn erase_record(&self, slot: &str) {
-        let Ok(_guard) = self.envelope_lock.lock() else {
-            return;
-        };
-        let mut records = self.read_records();
+    /// Records where a secret written before records existed was found.
+    ///
+    /// The one record write allowed to fail quietly: the secret was read, and
+    /// a missing record costs one more legacy lookup next time, not a secret.
+    fn record_found(&self, slot: &str, backend: Backend) {
+        if let Err(why) = self.record_backend(slot, backend) {
+            tracing::warn!(slot, %why, "could not record where a legacy secret was found");
+        }
+    }
+
+    fn erase_record(&self, slot: &str) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut records = self.read_records()?;
         if records.remove(slot).is_some() {
-            self.write_records(&records);
+            self.write_records(&records)?;
         }
+        Ok(())
     }
 
-    fn write_records(&self, records: &HashMap<String, Backend>) {
-        std::fs::create_dir_all(&self.dir).ok();
-        match serde_json::to_string_pretty(records) {
-            Ok(json) => {
-                if let Err(why) =
-                    cosmic_pim_core::atomic::write(&self.dir.join(RECORD_FILE), &json, None)
-                {
-                    tracing::warn!(%why, "could not write the secret backend record");
-                }
-            }
-            Err(why) => tracing::warn!(%why, "could not serialise the secret backend record"),
-        }
+    fn write_records(&self, records: &HashMap<String, Backend>) -> Result<()> {
+        let json = serde_json::to_string_pretty(records)
+            .map_err(|e| Error::keychain(format!("cannot serialise the backend record: {e}")))?;
+        cosmic_pim_core::atomic::write(&self.dir.join(RECORD_FILE), &json, None)
+            .map(|_| ())
+            .map_err(|e| Error::keychain(format!("cannot write the backend record: {e}")))
     }
 
     /* ---------------- envelope fallback ---------------- */
@@ -436,7 +470,7 @@ impl SecretStore {
     }
 
     fn envelope_load(&self, slot: &str) -> Result<Option<String>> {
-        let _guard = self.envelope_lock.lock().map_err(|_| Error::poisoned())?;
+        let _lock = self.lock()?;
 
         let envelope = self.read_envelope()?;
         let Some(entry) = envelope.entries.get(slot) else {
@@ -463,7 +497,7 @@ impl SecretStore {
     }
 
     fn envelope_store(&self, slot: &str, value: &str) -> Result<()> {
-        let _guard = self.envelope_lock.lock().map_err(|_| Error::poisoned())?;
+        let _lock = self.lock()?;
 
         let nonce_bytes: [u8; 24] = rand::random();
         let ciphertext = self
@@ -483,7 +517,7 @@ impl SecretStore {
     }
 
     fn envelope_forget(&self, slot: &str) -> Result<()> {
-        let _guard = self.envelope_lock.lock().map_err(|_| Error::poisoned())?;
+        let _lock = self.lock()?;
 
         let mut envelope = self.read_envelope()?;
         if envelope.entries.remove(slot).is_some() {
@@ -533,14 +567,14 @@ mod tests {
     fn forgetting_removes_it() {
         let (_dir, store) = store();
         store.store("slot", "hunter2").unwrap();
-        store.forget("slot");
+        store.forget("slot").unwrap();
         assert_eq!(store.load("slot").unwrap(), None);
     }
 
     #[test]
     fn forgetting_something_absent_is_silent() {
         let (_dir, store) = store();
-        store.forget("never-set"); // must not panic
+        store.forget("never-set").unwrap(); // must not panic
     }
 
     #[test]
@@ -695,7 +729,7 @@ mod tests {
         // Reopen and read through the record path explicitly.
         let reopened = SecretStore::open_envelope_only("cosmic-pim-test", dir.path());
         assert_eq!(
-            reopened.recorded_backend("slot"),
+            reopened.recorded_backend("slot").unwrap(),
             Some(Backend::LocalEnvelope)
         );
         assert_eq!(reopened.load("slot").unwrap().as_deref(), Some("hunter2"));
@@ -710,7 +744,7 @@ mod tests {
 
         assert_eq!(store.load("slot").unwrap().as_deref(), Some("hunter2"));
         assert_eq!(
-            store.recorded_backend("slot"),
+            store.recorded_backend("slot").unwrap(),
             Some(Backend::LocalEnvelope),
             "the legacy lookup did not record what it found"
         );
@@ -720,9 +754,9 @@ mod tests {
     fn forgetting_erases_the_record_with_the_secret() {
         let (_dir, store) = store();
         store.store("slot", "hunter2").unwrap();
-        store.forget("slot");
+        store.forget("slot").unwrap();
 
-        assert_eq!(store.recorded_backend("slot"), None);
+        assert_eq!(store.recorded_backend("slot").unwrap(), None);
         assert_eq!(store.load("slot").unwrap(), None);
     }
 
@@ -754,6 +788,35 @@ mod tests {
                 .unwrap_or("")
                 .contains(NO_KEYRING_ENV),
             "the UI cannot say why the keychain was skipped"
+        );
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_written_fails_the_store() {
+        // The record is what a later read follows. A store that "succeeded"
+        // without it left the read looking in the old place.
+        let (dir, store) = store();
+        std::fs::create_dir_all(dir.path().join(RECORD_FILE)).unwrap();
+        assert!(
+            store.store("slot", "hunter2").is_err(),
+            "the secret was stored with no record of where"
+        );
+    }
+
+    #[test]
+    fn a_keychain_secret_that_could_not_be_deleted_keeps_its_record() {
+        // Recorded in the keychain, forgotten from a store that cannot reach
+        // it: erasing the record anyway orphaned the keychain copy forever.
+        let (dir, store) = store();
+        std::fs::write(
+            dir.path().join(RECORD_FILE),
+            serde_json::to_vec(&HashMap::from([("slot".to_owned(), Backend::OsKeychain)])).unwrap(),
+        )
+        .unwrap();
+        assert!(store.forget("slot").is_err());
+        assert_eq!(
+            store.recorded_backend("slot").unwrap(),
+            Some(Backend::OsKeychain)
         );
     }
 }

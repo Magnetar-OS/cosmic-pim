@@ -85,6 +85,15 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   another app removed, nor reverts another app's edit to an account it holds
   (audit F-10). An account is removed from the file before its secrets are
   forgotten.
+- The secret store's backend record is written before a superseded copy is
+  removed, and a record that cannot be written fails the save instead of
+  leaving later reads to find nothing or yesterday's password (audit F-41).
+- `SecretStore::forget` returns an error and keeps the record when a copy
+  could not be deleted (keychain locked, envelope-only mode), instead of
+  orphaning the keychain copy (audit F-42).
+- The secret envelope and its backend record are read-modify-written under a
+  cross-process lock, not an in-process mutex, so two apps saving secrets no
+  longer overwrite each other's.
 
 ### Changed
 
@@ -114,6 +123,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `resolve(&mut self, pushed: &PendingPush)` and `defer(&mut self, pushed:
   &PendingPush, failure, error, next_attempt_ms)` settle only that exact
   queued operation.
+- `SecretStore::forget(&self, slot) -> Result<()>` (was `()`);
+  `AccountStore::remove` reports a secret it could not delete.
+  `accounts::Error::Poisoned` and `Error::poisoned()` are removed (no lock can
+  be poisoned any more).
 
 ### Added
 

@@ -457,7 +457,9 @@ impl AccountStore {
     ///
     /// The account leaves `accounts.toml` first and its secrets second: a
     /// removal that fails to save leaves an account with its credentials,
-    /// not one that is still listed and can no longer sign in.
+    /// not one that is still listed and can no longer sign in. A secret that
+    /// cannot be deleted (the keychain is locked) is an error after the
+    /// account is gone, and its record is kept so it can still be found.
     pub fn remove(&mut self, id: &str) -> Result<()> {
         let account = self.change(|accounts| {
             let index = accounts
@@ -469,9 +471,8 @@ impl AccountStore {
         // Both slots: an account that was migrated between mechanisms has a
         // value in each, and leaving either behind means a removed account's
         // credentials outlive it in the keychain.
-        self.secrets.forget(&account.secret_slot());
-        self.secrets.forget(&account.credential_slot());
-        Ok(())
+        self.secrets.forget(&account.secret_slot())?;
+        self.secrets.forget(&account.credential_slot())
     }
 
     pub fn set_password(&mut self, id: &str, password: &str) -> Result<()> {

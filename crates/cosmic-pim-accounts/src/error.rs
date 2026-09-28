@@ -30,11 +30,6 @@ pub enum Error {
     /// password that was never the problem.
     #[error("no credential is stored for account “{0}”")]
     MissingSecret(String),
-
-    /// A lock was poisoned, meaning a previous holder panicked. Fail closed
-    /// rather than proceeding over state of unknown validity.
-    #[error("credential store lock was poisoned by an earlier panic")]
-    Poisoned,
 }
 
 impl Error {
@@ -44,10 +39,5 @@ impl Error {
 
     pub fn config(e: impl Display) -> Self {
         Self::Config(e.to_string())
-    }
-
-    #[must_use]
-    pub fn poisoned() -> Self {
-        Self::Poisoned
     }
 }
