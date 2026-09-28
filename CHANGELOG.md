@@ -16,6 +16,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - A corrupt or unreadable secret envelope is an error instead of an empty
   store, so the next write no longer wipes every envelope-held secret (audit
   F-03).
+- CalDAV/CardDAV responses keep their XML entity and character references:
+  escaped calendar data such as `R&amp;D` is stored as `R&D`, not `RD` (audit
+  F-04).
 
 ### Changed
 

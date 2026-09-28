@@ -448,6 +448,25 @@ pub struct PropfindEventsResult {
     pub failed_uris: Vec<String>,
 }
 
+/// Appends what an entity or character reference (`&amp;`, `&#13;`) stands
+/// for.
+///
+/// quick-xml reports each reference as its own event between the text
+/// around it, so a parser that only collects `Text` silently drops every
+/// `&`, `<` and CR in escaped calendar-data. A reference that names nothing
+/// XML predefines is kept as written rather than lost.
+fn push_reference(buf: &mut String, reference: &quick_xml::events::BytesRef<'_>) {
+    if let Ok(Some(ch)) = reference.resolve_char_ref() {
+        buf.push(ch);
+    } else if let Some(text) = quick_xml::escape::resolve_predefined_entity(reference) {
+        buf.push_str(text);
+    } else {
+        buf.push('&');
+        buf.push_str(reference);
+        buf.push(';');
+    }
+}
+
 /// Collect `<href>` values that are DIRECT children of the named property.
 /// RFC 4791 §6.2.1 places them there; any-ancestor matching picked up
 /// Davical's nested `<owner><href>` descriptor first and mis-routed
@@ -469,6 +488,7 @@ fn collect_hrefs(xml: &str, property_name: &str, limit: usize) -> Vec<String> {
                     buf.push_str(&text);
                 }
             }
+            Ok(Event::GeneralRef(ref e)) => push_reference(&mut buf, e),
             Ok(Event::CData(ref e)) => {
                 buf.push_str(e.as_ref());
             }
@@ -549,6 +569,7 @@ fn parse_propfind_calendars(xml: &str, flavor: Flavor) -> Vec<DiscoveredCalendar
                     buf.push_str(&text);
                 }
             }
+            Ok(Event::GeneralRef(ref e)) => push_reference(&mut buf, e),
             Ok(Event::CData(ref e)) => buf.push_str(e.as_ref()),
             Ok(Event::End(ref e)) => {
                 let name = local_name(e.name().as_ref());
@@ -733,6 +754,7 @@ fn parse_propfind_events(xml: &str, flavor: Flavor) -> PropfindEventsResult {
                     buf.push_str(&text);
                 }
             }
+            Ok(Event::GeneralRef(ref e)) => push_reference(&mut buf, e),
             Ok(Event::CData(ref e)) => buf.push_str(e.as_ref()),
             Ok(Event::End(ref e)) => {
                 let name = local_name(e.name().as_ref());
@@ -883,6 +905,7 @@ fn parse_ctag(xml: &str) -> Option<String> {
                     buf.push_str(&text);
                 }
             }
+            Ok(Event::GeneralRef(ref e)) => push_reference(&mut buf, e),
             Ok(Event::CData(ref e)) => {
                 buf.push_str(e.as_ref());
             }
@@ -944,6 +967,7 @@ fn parse_multiget_report(xml: &str, flavor: Flavor) -> Vec<(String, String)> {
                     buf.push_str(&text);
                 }
             }
+            Ok(Event::GeneralRef(ref e)) => push_reference(&mut buf, e),
             Ok(Event::CData(ref e)) => buf.push_str(e.as_ref()),
             Ok(Event::End(ref e)) => {
                 let name = local_name(e.name().as_ref());
@@ -1955,6 +1979,7 @@ fn parse_schedule_response(xml: &str) -> Vec<ScheduleResponse> {
                     buf.push_str(&text);
                 }
             }
+            Ok(Event::GeneralRef(ref e)) => push_reference(&mut buf, e),
             Ok(Event::CData(ref e)) => buf.push_str(e.as_ref()),
             Ok(Event::End(_)) => {
                 let name = stack.last().cloned().unwrap_or_default();
@@ -2530,6 +2555,32 @@ END:VCALENDAR]]></C:calendar-data></D:prop>
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "/cal/a/good.ics");
         assert!(results[0].1.starts_with("BEGIN:VCALENDAR"));
+    }
+
+    #[test]
+    fn escaped_calendar_data_keeps_its_entities() {
+        // Most servers escape calendar-data rather than wrap it in CDATA, and
+        // quick-xml reports each `&…;` as its own event. Dropping those
+        // events stored `R&D` as `RD`, and the next local edit pushed the
+        // damage back to the server.
+        let xml = r#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/a/r%26d.ics</D:href>
+    <D:propstat>
+      <D:prop><C:calendar-data>BEGIN:VCALENDAR&#13;
+SUMMARY:R&amp;D &lt;review&gt; &#x2014; &quot;Q3&quot;&#13;
+END:VCALENDAR</C:calendar-data></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+        let results = parse_multiget_report(xml, Flavor::CalDav);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].1,
+            "BEGIN:VCALENDAR\r\nSUMMARY:R&D <review> \u{2014} \"Q3\"\r\nEND:VCALENDAR"
+        );
     }
 
     #[test]
