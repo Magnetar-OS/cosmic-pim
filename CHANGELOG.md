@@ -42,6 +42,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   of handing back a draft that is delivered anyway, and a failed attempt no
   longer recreates a cancelled message. A send interrupted by a crash is given
   up, never retried (audit F-29, Envelope F-14).
+- JMAP, Gmail, Graph and POP3 never hand out a local UID a message file
+  already carries, and their id maps are saved after a failed pass too, so a
+  failed or lost sidecar no longer shows one message's bytes under another's
+  id or overwrites POP3's only copies (audit F-24).
 
 ### Changed
 

@@ -244,6 +244,9 @@ impl RemoteIds {
             Err(_) => Self::default(),
         };
         state.file = file;
+        state.next_uid = state
+            .next_uid
+            .max(crate::maildir::highest_uid_on_disk(maildir).saturating_add(1));
         state
     }
 
@@ -396,5 +399,37 @@ impl MailStore for MemoryStore {
 
     fn intern_keyword(&mut self, name: &str) -> Result<u8> {
         intern_into(&mut self.keyword_table, name)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A maildir holding UIDs 3 and 7, with no sync sidecar beside it — the
+    /// state a pass that failed before saving its sidecar leaves behind.
+    fn maildir_without_a_sidecar() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["cur", "new", "tmp"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(dir.path().join("cur/1700000000.a,U=3:2,S"), b"three").unwrap();
+        std::fs::write(dir.path().join("new/1700000001.b,U=7"), b"seven").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_lost_sidecar_never_hands_out_a_uid_a_held_message_already_has() {
+        // Handing out 1, 2, 3… again maps the next server id onto another
+        // message's file, and a store that treats an existing file as held
+        // then shows the wrong message under the right name.
+        let dir = maildir_without_a_sidecar();
+        let mut ids = RemoteIds::load(dir.path(), ".jmap-state.json");
+        let uid = ids.uid_for("server-id-1");
+        assert!(
+            uid > 7,
+            "assigned UID {uid}, which a held message already has"
+        );
     }
 }

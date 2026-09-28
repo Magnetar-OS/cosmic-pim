@@ -436,14 +436,23 @@ impl Pop3State {
     ///
     /// An unreadable sidecar is treated as absent, and the cost of that is
     /// re-downloading the mailbox rather than being unable to open it.
+    ///
+    /// The UID counter is never below the highest UID already in the
+    /// maildir, whatever the sidecar says — see
+    /// `maildir::highest_uid_on_disk`. Under `DeleteWhenFetched` those files
+    /// are the only copies, and reusing a UID would overwrite one.
     pub fn load(maildir: &Path) -> Self {
-        match std::fs::read_to_string(maildir.join(STATE_FILE)) {
+        let mut state: Self = match std::fs::read_to_string(maildir.join(STATE_FILE)) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|why| {
                 tracing::warn!(path = %maildir.display(), %why, "unreadable POP3 sidecar; treating the mailbox as new");
                 Self::default()
             }),
             Err(_) => Self::default(),
-        }
+        };
+        state.next_uid = state
+            .next_uid
+            .max(crate::maildir::highest_uid_on_disk(maildir).saturating_add(1));
+        state
     }
 
     /// Writes the sidecar atomically — a torn one costs a full re-download.
@@ -762,5 +771,22 @@ mod tests {
             }
             Ok(out)
         }
+    }
+
+    #[test]
+    fn a_lost_sidecar_never_reuses_the_uid_of_a_message_already_downloaded() {
+        // With DeleteWhenFetched the maildir holds the only copy: reusing a
+        // UID overwrites it with a different message.
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["cur", "new", "tmp"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(dir.path().join("cur/1700000000.a,U=5:2,S"), b"five").unwrap();
+        let mut state = Pop3State::load(dir.path());
+        let uid = state.uid_for("uidl-1", 0);
+        assert!(
+            uid > 5,
+            "assigned UID {uid}, which a held message already has"
+        );
     }
 }

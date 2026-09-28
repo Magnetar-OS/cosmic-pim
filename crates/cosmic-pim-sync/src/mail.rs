@@ -273,16 +273,15 @@ fn sync_over_gmail(
             let path = mailbox_path(mail_root, &account.id, &folder);
             let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
             let mut state = gmail::state(&path);
-            let outcome = gmail::sync_folder(
+            let result = gmail::sync_folder(
                 &session,
                 &slug,
                 &mut store,
                 &mut state,
                 GMAIL_WINDOW,
                 now_ms,
-            )
-            .map_err(Error::Mail)?;
-            state.save(&path).map_err(Error::Mail)?;
+            );
+            let outcome = save_after(result, || state.save(&path))?;
             Ok(SyncOutcome {
                 fetched: outcome.fetched,
                 reflagged: outcome.reflagged,
@@ -337,9 +336,8 @@ fn sync_over_graph(
             let path = mailbox_path(mail_root, &account.id, &folder);
             let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
             let mut state = graph::state(&path);
-            let outcome = graph::sync_folder(&session, &remote.id, &mut store, &mut state, now_ms)
-                .map_err(Error::Mail)?;
-            state.save(&path).map_err(Error::Mail)?;
+            let result = graph::sync_folder(&session, &remote.id, &mut store, &mut state, now_ms);
+            let outcome = save_after(result, || state.save(&path))?;
             Ok(SyncOutcome {
                 fetched: outcome.fetched,
                 reflagged: outcome.reflagged,
@@ -445,16 +443,15 @@ fn sync_over_jmap(
             let path = mailbox_path(mail_root, &account.id, &folder);
             let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
             let mut state = jmap::state(&path);
-            let outcome = jmap::sync_mailbox(
+            let result = jmap::sync_mailbox(
                 &session,
                 &mailbox.id,
                 &mut store,
                 &mut state,
                 JMAP_WINDOW,
                 now_ms,
-            )
-            .map_err(Error::Mail)?;
-            state.save(&path).map_err(Error::Mail)?;
+            );
+            let outcome = save_after(result, || state.save(&path))?;
             Ok(SyncOutcome {
                 fetched: outcome.fetched,
                 reflagged: outcome.reflagged,
@@ -529,15 +526,14 @@ fn sync_over_pop3(
         // Leave everything on the server. Deleting is a decision only the user
         // can make — the same mailbox is very often also read on a phone — and
         // a default that removes mail is not one to arrive at by omission.
-        let outcome = pop3::sync_inbox(
+        let result = pop3::sync_inbox(
             &mut session,
             &mut store,
             &mut state,
             pop3::Retention::LeaveOnServer,
             now_ms,
-        )
-        .map_err(Error::Mail)?;
-        state.save(&path).map_err(Error::Mail)?;
+        );
+        let outcome = save_after(result, || state.save(&path))?;
         Ok(SyncOutcome {
             fetched: outcome.fetched,
             ..Default::default()
@@ -560,6 +556,31 @@ fn sync_over_pop3(
         }],
         ..Default::default()
     })
+}
+
+/// Saves an id-keyed engine's sidecar after a pass, whether or not the pass
+/// succeeded.
+///
+/// The sidecar maps server ids to the UIDs of files already written, and the
+/// engines advance its change-feed cursor only over windows applied in full,
+/// so what it holds after a failure is still true. Not saving it is what
+/// failed: the next pass handed the same UIDs to other messages and read their
+/// files as already held (audit F-24). A save failure after a failed pass is
+/// logged and the pass's own error is the one reported.
+fn save_after<T>(
+    result: cosmic_pim_mail::Result<T>,
+    save: impl FnOnce() -> cosmic_pim_mail::Result<()>,
+) -> Result<T> {
+    let saved = save();
+    match (result, saved) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(why)) => Err(Error::Mail(why)),
+        (Err(why), Ok(())) => Err(Error::Mail(why)),
+        (Err(why), Err(save_error)) => {
+            tracing::warn!(%save_error, "the sync state of a failed pass could not be saved either");
+            Err(Error::Mail(why))
+        }
+    }
 }
 
 fn sync_one(

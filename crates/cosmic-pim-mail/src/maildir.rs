@@ -448,6 +448,22 @@ fn file_name_for(uid: u32, internal_date_ms: i64, flags: Flags) -> String {
 }
 
 /// The UID a filename records, if it records one.
+/// The highest UID any message file in the maildir at `root` carries, or 0.
+///
+/// What an id-keyed engine's UID counter must stay above whatever its own
+/// sidecar says: the sidecar is saved after the messages are written, so a
+/// pass that fails in between — or a sidecar that is lost — leaves files
+/// holding UIDs the counter has not counted.
+pub(crate) fn highest_uid_on_disk(root: &Path) -> u32 {
+    ["cur", "new"]
+        .iter()
+        .filter_map(|sub| fs::read_dir(root.join(sub)).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| uid_from_name(entry.file_name().to_str()?))
+        .max()
+        .unwrap_or(0)
+}
+
 fn uid_from_name(name: &str) -> Option<u32> {
     let after = name.split(UID_MARKER).nth(1)?;
     let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
