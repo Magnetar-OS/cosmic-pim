@@ -428,7 +428,7 @@ impl Store {
         if !master.exdates.contains(&naive) {
             master.exdates.push(naive);
         }
-        master.sequence = master.sequence.saturating_add(1);
+        bump_own_sequence(&mut master);
         master.last_modified = Some(Utc::now());
         self.save(&master)?;
 
@@ -478,7 +478,7 @@ impl Store {
 
         let cut = crate::model::naive_in_series_zone(master.start, instant, self.local);
         master.exdates.retain(|exdate| *exdate < cut);
-        master.sequence = master.sequence.saturating_add(1);
+        bump_own_sequence(&mut master);
         master.last_modified = Some(Utc::now());
         self.save(&master)?;
 
@@ -580,7 +580,12 @@ impl Store {
             .copied()
             .filter(|e| *e >= cut)
             .collect();
-        successor.sequence = 0;
+        // A fresh series of our own starts its revisions at 0. A copy of
+        // somebody else's invitation keeps the organizer's counter: it is
+        // theirs to advance, not ours to reset.
+        if successor.organizer.is_none() {
+            successor.sequence = 0;
+        }
         successor.created = Some(now);
         successor.last_modified = Some(now);
 
@@ -812,6 +817,20 @@ impl Store {
     }
 }
 
+/// Raises an event's `SEQUENCE` for a change made here — unless the event has
+/// an organizer.
+///
+/// `SEQUENCE` is the organizer's revision counter (RFC 5546 section 2.1.4).
+/// On a copy of an invitation it belongs to the organizer's client: raising it
+/// here made the organizer's next update compare as older than the copy, and
+/// that update was dropped as stale (Slate audit F-25). The same rule Slate's
+/// editor applies to saves.
+fn bump_own_sequence(event: &mut Event) {
+    if event.organizer.is_none() {
+        event.sequence = event.sequence.saturating_add(1);
+    }
+}
+
 /// The instant a local calendar day begins in `local`.
 ///
 /// Where midnight does not exist — zones that start daylight saving at 00:00,
@@ -974,6 +993,56 @@ mod tests {
             .expect("an instance on that date")
             .recurrence_id
             .expect("a series member carries its identity")
+    }
+
+    #[test]
+    fn deleting_instances_of_an_accepted_invitation_leaves_the_organizers_sequence_alone() {
+        // SEQUENCE is the organizer's revision counter (RFC 5546). Raising it
+        // on the attendee's copy made the organizer's next update compare as
+        // stale, and the update was dropped.
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        let mut master = Event::draft(
+            &cal.id,
+            day(2026, 8, 4).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        );
+        master.rrule = Some("FREQ=WEEKLY".into());
+        master.sequence = 3;
+        master.organizer = Some(crate::model::Attendee::new("boss@org.example", None));
+        store.save(&master).unwrap();
+
+        let cut = instance_on(&store, day(2026, 8, 11));
+        store.exclude_occurrence(&cal.id, &master.uid, cut).unwrap();
+        assert_eq!(
+            store.event(&cal.id, &master.uid).unwrap().unwrap().sequence,
+            3
+        );
+
+        let cut = instance_on(&store, day(2026, 8, 25));
+        store.truncate_series(&cal.id, &master.uid, cut).unwrap();
+        assert_eq!(
+            store.event(&cal.id, &master.uid).unwrap().unwrap().sequence,
+            3
+        );
+    }
+
+    #[test]
+    fn deleting_an_instance_of_ones_own_series_raises_its_sequence() {
+        let (_dir, mut store) = store();
+        let (_cal, master) = weekly_series(&mut store);
+        let cut = instance_on(&store, day(2026, 8, 11));
+        store
+            .exclude_occurrence(&master.calendar_id, &master.uid, cut)
+            .unwrap();
+        assert_eq!(
+            store
+                .event(&master.calendar_id, &master.uid)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
     }
 
     #[test]

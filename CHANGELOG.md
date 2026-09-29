@@ -113,6 +113,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   starting at 00:00) start at the day's first real hour instead of midnight
   read as UTC, and a DATE or floating `UNTIL` no longer drops a series' last
   instances from the index (audit F-23).
+- Deleting one instance or "this and following" of an invitation no longer
+  raises its `SEQUENCE`, and splitting one no longer resets it, so the
+  organizer's later updates are not dropped as stale; the counter still
+  advances on the user's own series (Slate audit F-25).
 
 ### Changed
 
