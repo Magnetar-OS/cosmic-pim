@@ -3389,7 +3389,12 @@ EXDATE:20260804T060000Z\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let event = parse_ics(text, "c", "f.ics").remove(0);
         assert_eq!(
             event.exdates,
-            vec![NaiveDate::from_ymd_opt(2026, 8, 4).unwrap().and_hms_opt(9, 0, 0).unwrap()],
+            vec![
+                NaiveDate::from_ymd_opt(2026, 8, 4)
+                    .unwrap()
+                    .and_hms_opt(9, 0, 0)
+                    .unwrap()
+            ],
             "the exclusion was read as a local time and the instance came back"
         );
     }
