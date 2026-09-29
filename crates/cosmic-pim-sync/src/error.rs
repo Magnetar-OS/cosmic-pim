@@ -14,6 +14,7 @@ pub enum Error {
     Account(#[from] cosmic_pim_accounts::Error),
 
     #[error(transparent)]
+    #[cfg(feature = "mail")]
     Mail(#[from] cosmic_pim_mail::Error),
 
     /// Signing in, or renewing a sign-in, did not produce a usable token.

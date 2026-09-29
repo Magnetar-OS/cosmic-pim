@@ -189,6 +189,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   Result<(), StoreError>`: saves a whole-series edit and moves every
   override's `RECURRENCE-ID` (and, for an override that kept its instance's
   time, its start and end) by the same shift (audit F-13, Slate F-03).
+- `cosmic-pim-sync` feature `mail` (default on): the mail sync pass and its
+  re-exports. A contacts or calendar consumer that sets `default-features =
+  false` no longer links the mail and OpenPGP stack (pgp, rsa, lettre, imap,
+  scraper) (audit O-02, Circle C-09).
+
 
 
 

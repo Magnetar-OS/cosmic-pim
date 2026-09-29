@@ -22,11 +22,15 @@
 //! - [`writeback`] — turns a local save or delete into a queued push.
 //! - [`conflict`] — what a pass could not decide on its own: both sides
 //!   changed the same resource, and a person has to choose.
+//! - `mail` — the mail pass, behind the default `mail` feature. A contacts
+//!   or calendar app turns it off (`default-features = false`) and keeps the
+//!   mail and OpenPGP stack out of its build.
 
 pub mod conflict;
 pub mod engine;
 pub mod error;
 pub mod freebusy;
+#[cfg(feature = "mail")]
 pub mod mail;
 pub mod provision;
 pub mod writeback;
@@ -35,6 +39,7 @@ pub use conflict::all as conflicts;
 pub use engine::{AccountReport, CollectionReport, SyncTally, sync_account, sync_all};
 pub use error::{Error, Result};
 pub use freebusy::{Answer, account_for_collection, availability};
+#[cfg(feature = "mail")]
 pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};
 pub use provision::{Provisioned, provision_account};
 pub use writeback::{queue_delete, queue_save, queue_save_with_base};

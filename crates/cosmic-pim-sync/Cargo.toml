@@ -15,10 +15,18 @@ cosmic-pim-core = { path = "../cosmic-pim-core", version = "1.1.0" }
 cosmic-pim-caldav = { path = "../cosmic-pim-caldav", version = "1.1.0" }
 cosmic-pim-accounts = { path = "../cosmic-pim-accounts", version = "1.1.0" }
 cosmic-pim-auth = { path = "../cosmic-pim-auth", version = "1.1.0" }
-cosmic-pim-mail = { path = "../cosmic-pim-mail", version = "1.1.0" }
+# Optional: a contacts or calendar app has no use for IMAP, SMTP, OpenPGP or
+# HTML parsing, and linking them drags pgp, rsa (RUSTSEC-2023-0071), lettre,
+# imap and scraper into its graph. On by default; Circle turns it off.
+cosmic-pim-mail = { path = "../cosmic-pim-mail", version = "1.1.0", optional = true }
 
 thiserror = "2"
 tracing = "0.1"
+
+[features]
+default = ["mail"]
+# The mail sync pass (`mail`, `sync_account_mail`) and its outbox drain.
+mail = ["dep:cosmic-pim-mail"]
 
 [dev-dependencies]
 tempfile = "3"
