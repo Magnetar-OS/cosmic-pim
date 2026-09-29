@@ -147,6 +147,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   leaves DTSTART, DTEND, EXDATE and RECURRENCE-ID as written unless the edit
   changed them (an unresolvable TZID is no longer rewritten as UTC) (audit
   F-14).
+- Saving a contact patches its file as it is now, under an optimistic
+  concurrency guard, instead of the snapshot it was loaded with, so a newer
+  change to another card in the same `.vcf` is no longer reverted and pushed
+  (audit F-15).
 
 ### Changed
 

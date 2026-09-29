@@ -94,9 +94,24 @@ pub fn write_contact_versioned(
         return Err(StoreError::ReadOnly(meta.name.clone()));
     }
 
-    let text = match crate::vcard::patch_vcard(&contact.raw, contact) {
+    // Patch the file as it is *now*, not the snapshot the contact was loaded
+    // with. A `.vcf` can hold several cards, and a pull or another app may
+    // have changed one of the others since; patching the snapshot wrote
+    // their old versions back, and the next push sent that to the server
+    // (audit F-15). The write is guarded against the file changing again
+    // between this read and the rename.
+    let target = meta.path.join(&contact.file_name);
+    let expected = crate::atomic::state_of(&target)?;
+    let current = match std::fs::read_to_string(&target) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let source = current.as_deref().unwrap_or(&contact.raw);
+
+    let text = match crate::vcard::patch_vcard(source, contact) {
         Some(patched) => patched,
-        None if contact.raw.matches("BEGIN:VCARD").count() > 1 => {
+        None if source.matches("BEGIN:VCARD").count() > 1 => {
             // Several cards in the file and none of them is this one. Falling
             // back to the model here would serialise one card over a document
             // holding many, deleting everybody else in it — so this refuses
@@ -111,7 +126,7 @@ pub fn write_contact_versioned(
             // No source to patch: a new contact, or a `raw` that holds no
             // VCARD. Building from the model is correct here and lossless by
             // definition — there is nothing to lose.
-            if !contact.raw.trim().is_empty() {
+            if !source.trim().is_empty() {
                 tracing::warn!(
                     uid = contact.uid,
                     "stored vCard could not be patched; rebuilding from the model"
@@ -121,7 +136,7 @@ pub fn write_contact_versioned(
         }
     };
 
-    crate::atomic::write(&meta.path.join(&contact.file_name), &text, None)
+    crate::atomic::write(&target, &text, expected)
         .map(|_| ())
         .map_err(Into::into)
 }
@@ -920,5 +935,37 @@ mod group_store_tests {
             store.set_group_members(&meta.id, "nope", &[]),
             Err(StoreError::UnknownContact(_))
         ));
+    }
+
+    #[test]
+    fn saving_one_card_keeps_a_change_made_to_another_card_in_the_same_file() {
+        // Two cards in one .vcf. Somebody else (a pull, another app) edits
+        // Bob after we loaded; saving our edit to Ada from the load-time
+        // snapshot used to write Bob's old version back.
+        let (_dir, mut store, book) = store();
+        let file = book.path.join("pair.vcf");
+        let pair = |bob: &str| {
+            format!(
+                "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ada\r\nFN:Ada\r\nN:;Ada;;;\r\nEND:VCARD\r\n\
+                 BEGIN:VCARD\r\nVERSION:3.0\r\nUID:bob\r\nFN:{bob}\r\nN:;{bob};;;\r\nEND:VCARD\r\n"
+            )
+        };
+        std::fs::write(&file, pair("Bob")).unwrap();
+        let mut ada = store
+            .contacts()
+            .into_iter()
+            .find(|c| c.uid == "ada")
+            .unwrap();
+
+        std::fs::write(&file, pair("Robert")).unwrap();
+        ada.display_name = "Ada Lovelace".into();
+        store.save(&ada).unwrap();
+
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("FN:Ada Lovelace"));
+        assert!(
+            text.contains("FN:Robert"),
+            "another card's newer edit was reverted:\n{text}"
+        );
     }
 }
