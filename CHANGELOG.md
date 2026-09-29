@@ -102,6 +102,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   timeouts, resets, 408, 429 and 5xx are retried with backoff, and 404/410 go
   to a sync pass, instead of every failure blocking as "needs the user" and
   read marks reverting (audit F-25, O-03).
+- An all-day event on a daylight-saving fall-back day no longer spans two
+  days, and a timed event across a transition ends at its own end time on the
+  grid (Slate audit F-18).
 
 ### Changed
 

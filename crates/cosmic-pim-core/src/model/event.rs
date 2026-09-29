@@ -386,9 +386,22 @@ impl Event {
     }
 
     /// Duration between start and end, used to place expanded occurrences.
+    ///
+    /// Measured the way each kind of time is kept: an all-day event in
+    /// calendar days and a floating one on the wall clock, because both are
+    /// wall-clock values and a day that is 23 or 25 hours long must not make
+    /// them longer or shorter; a zoned one as elapsed time. Measuring all
+    /// three in UTC made an all-day event on a daylight-saving fall-back day
+    /// last 25 hours and spill into the next day (Slate audit F-18).
     #[must_use]
     pub fn duration(&self, local: Tz) -> chrono::Duration {
-        let d = self.end.to_utc(local) - self.start.to_utc(local);
+        let d = match (self.start, self.end) {
+            (EventTime::Date(start), EventTime::Date(end)) => {
+                chrono::Duration::days((end - start).num_days())
+            }
+            (EventTime::Floating(start), EventTime::Floating(end)) => end - start,
+            _ => self.end.to_utc(local) - self.start.to_utc(local),
+        };
         if d <= chrono::Duration::zero() {
             // Guard against malformed files where DTEND <= DTSTART.
             if self.is_all_day() {

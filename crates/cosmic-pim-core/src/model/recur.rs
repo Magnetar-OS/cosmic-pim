@@ -57,7 +57,9 @@ pub fn expand_merged(
                     out.push(occurrence_at(
                         event,
                         event.start.naive_local(local),
+                        start_utc,
                         duration,
+                        local,
                         instant_of(rid, local),
                     ));
                 }
@@ -220,7 +222,9 @@ pub fn expand(event: &Event, from: DateTime<Utc>, to: DateTime<Utc>, local: Tz) 
             return vec![occurrence_at(
                 event,
                 event.start.naive_local(local),
+                start_utc,
                 duration,
+                local,
                 None,
             )];
         }
@@ -238,7 +242,9 @@ pub fn expand(event: &Event, from: DateTime<Utc>, to: DateTime<Utc>, local: Tz) 
                 vec![occurrence_at(
                     event,
                     event.start.naive_local(local),
+                    start_utc,
                     duration,
+                    local,
                     None,
                 )]
             } else {
@@ -312,18 +318,37 @@ fn expand_rule(
             EventTime::Zoned(..) => utc.with_timezone(&local).naive_local(),
         };
 
-        out.push(occurrence_at(event, local_start, duration, Some(utc)));
+        out.push(occurrence_at(
+            event,
+            local_start,
+            utc,
+            duration,
+            local,
+            Some(utc),
+        ));
     }
 
     Ok(out)
 }
 
+/// One occurrence starting at wall-clock `start` (the instant `start_utc`).
+///
+/// A zoned event's end is its elapsed duration after the start instant,
+/// shown on the viewer's clock — across a daylight-saving change that is not
+/// `start + duration` on the wall. All-day and floating events are wall-clock
+/// through and through, so theirs is.
 fn occurrence_at(
     event: &Event,
     start: NaiveDateTime,
+    start_utc: DateTime<Utc>,
     duration: Duration,
+    local: Tz,
     recurrence_id: Option<DateTime<Utc>>,
 ) -> Occurrence {
+    let end = match event.start {
+        EventTime::Zoned(..) => (start_utc + duration).with_timezone(&local).naive_local(),
+        EventTime::Date(_) | EventTime::Floating(_) => start + duration,
+    };
     Occurrence {
         uid: event.uid.clone(),
         calendar_id: event.calendar_id.clone(),
@@ -331,7 +356,7 @@ fn occurrence_at(
         location: event.location.clone(),
         all_day: event.is_all_day(),
         start,
-        end: start + duration,
+        end,
         recurrence_id,
     }
 }
@@ -590,5 +615,44 @@ mod tests {
             moved.recurrence_id,
             Some(utc(2026, 8, 11) + Duration::hours(9))
         );
+    }
+
+    #[test]
+    fn an_all_day_event_on_a_fall_back_day_stays_on_its_day() {
+        // 25 October 2026 is 25 hours long in Athens. Measured in UTC the
+        // event lasted 25 h and ran into 01:00 the next day.
+        let athens = chrono_tz::Europe::Athens;
+        let day = NaiveDate::from_ymd_opt(2026, 10, 25).unwrap();
+        let event = event_with(
+            EventTime::Date(day),
+            EventTime::Date(day.succ_opt().unwrap()),
+            None,
+        );
+        let occurrences = expand(&event, utc(2026, 10, 20), utc(2026, 10, 30), athens);
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(
+            occurrences[0].end,
+            day.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap(),
+            "the all-day event spilled into the next day"
+        );
+    }
+
+    #[test]
+    fn a_timed_event_across_a_transition_ends_at_its_own_end_time() {
+        // 02:30–04:30 Athens on the fall-back night is three real hours; the
+        // grid must still show it ending at 04:30.
+        let athens = chrono_tz::Europe::Athens;
+        let start = NaiveDate::from_ymd_opt(2026, 10, 25)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        let end = start + chrono::Duration::hours(2);
+        let event = event_with(
+            EventTime::Zoned(start, athens),
+            EventTime::Zoned(end, athens),
+            None,
+        );
+        let occurrences = expand(&event, utc(2026, 10, 24), utc(2026, 10, 26), athens);
+        assert_eq!(occurrences[0].end, end);
     }
 }
