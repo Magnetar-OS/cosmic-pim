@@ -96,6 +96,7 @@ impl Drafts {
         if !is_valid_id(id) {
             return Err(Error::Draft(format!("{id} is not a draft id")));
         }
+        let _lock = self.lock(id)?;
         let mut mirror = self
             .record(id)
             .ok()
@@ -180,6 +181,10 @@ impl Drafts {
     /// when this delete happens offline. Without it, discarding a draft on a
     /// train resurrects it on every other device.
     pub fn delete(&self, id: &str) -> Result<()> {
+        if !is_valid_id(id) {
+            return Ok(());
+        }
+        let _lock = self.lock(id)?;
         if let Ok(Some(record)) = self.record(id)
             && let Some(message_id) = record.mirror.message_id
         {
@@ -333,24 +338,55 @@ impl Drafts {
             .collect())
     }
 
-    /// Records a successful upload: the id it is filed under, and the UID the
-    /// server assigned when it said (`None` on servers without UIDPLUS).
+    /// Records a successful upload of `uploaded`: the id it is filed under,
+    /// and the UID the server assigned when it said (`None` on servers without
+    /// UIDPLUS).
+    ///
+    /// The record is clean afterwards only if it still holds what was
+    /// uploaded. A save that landed while the upload was in flight keeps the
+    /// record dirty, so the next sweep sends it; clearing the flag anyway lost
+    /// that edit from the server for good. A draft deleted while its upload
+    /// was in flight gets a tombstone for the copy just filed — it had none,
+    /// having never been mirrored when it was deleted (audit F-34, Envelope
+    /// F-15).
     pub fn mark_mirrored(
         &self,
         id: &str,
         message_id: &str,
         landed: Option<(u32, u32)>,
+        uploaded: &Draft,
     ) -> Result<()> {
+        if !is_valid_id(id) {
+            return Ok(());
+        }
+        let _lock = self.lock(id)?;
         let Some(mut record) = self.record(id)? else {
-            // The draft was deleted while its upload was in flight. Nothing to
-            // record — the retraction path handles the server copy.
+            atomic::write(
+                &self.root.join(format!("{id}{RETRACT_EXTENSION}")),
+                message_id,
+                None,
+            )?;
             return Ok(());
         };
         record.mirror.message_id = Some(message_id.to_owned());
         record.mirror.uid_validity = landed.map(|(validity, _)| validity);
         record.mirror.uid = landed.map(|(_, uid)| uid);
-        record.mirror.dirty = false;
+        record.mirror.dirty = record.draft != *uploaded;
         self.write(id, &record)
+    }
+
+    /// The lock one draft's record changes under — shared by saves from the
+    /// composer, deletes, and the mirror's receipts.
+    fn lock(&self, id: &str) -> Result<atomic::Lock> {
+        Ok(atomic::lock(&self.path(id))?)
+    }
+
+    /// The lock a mirror sweep holds for its whole run, so two sweeps of one
+    /// account (after a save and after a sync, say) take turns instead of
+    /// both uploading the same dirty draft and leaving a duplicate on the
+    /// server (Envelope audit F-15).
+    pub(crate) fn sweep_lock(&self) -> Result<atomic::Lock> {
+        Ok(atomic::lock(&self.root.join(".sweep"))?)
     }
 
     /// Creates a local record for a draft that already lives on the server —
@@ -633,7 +669,7 @@ mod tests {
         assert_eq!(drafts.dirty().unwrap(), vec![id.clone()]);
 
         drafts
-            .mark_mirrored(&id, "abc@example.com", Some((41, 9)))
+            .mark_mirrored(&id, "abc@example.com", Some((41, 9)), &draft())
             .unwrap();
         assert!(drafts.dirty().unwrap().is_empty());
         let mirror = drafts.mirror(&id).unwrap().unwrap();
@@ -652,7 +688,7 @@ mod tests {
         let id = new_id(8);
         drafts.save(&id, &draft(), 8).unwrap();
         drafts
-            .mark_mirrored(&id, "abc@example.com", Some((41, 9)))
+            .mark_mirrored(&id, "abc@example.com", Some((41, 9)), &draft())
             .unwrap();
 
         let mut edited = draft();
@@ -710,9 +746,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let drafts = Drafts::open(dir.path()).unwrap();
         drafts
-            .mark_mirrored(&new_id(11), "gone@example.com", None)
+            .mark_mirrored(&new_id(11), "gone@example.com", None, &draft())
             .unwrap();
         assert_eq!(drafts.count(), 0, "a ghost record was created");
+        // The copy that upload filed has nothing pointing at it but this.
+        assert_eq!(
+            drafts.pending_retractions(),
+            vec![(new_id(11), "gone@example.com".to_owned())],
+            "the server copy of a draft discarded mid-upload was orphaned"
+        );
+    }
+
+    #[test]
+    fn an_edit_saved_during_an_upload_stays_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(14);
+        drafts.save(&id, &draft(), 14).unwrap();
+        let uploading = drafts.peek(&id).unwrap().unwrap();
+
+        let mut edited = draft();
+        edited.body = "typed while it uploaded".into();
+        drafts.save(&id, &edited, 15).unwrap();
+        drafts
+            .mark_mirrored(&id, "m14@example.com", Some((41, 4)), &uploading)
+            .unwrap();
+
+        assert_eq!(
+            drafts.dirty().unwrap(),
+            vec![id.clone()],
+            "an edit the server never received was marked as mirrored"
+        );
     }
 
     #[test]
@@ -725,7 +789,7 @@ mod tests {
         let id = new_id(12);
         drafts.save(&id, &draft(), 12).unwrap();
         drafts
-            .mark_mirrored(&id, "m12@example.com", Some((41, 3)))
+            .mark_mirrored(&id, "m12@example.com", Some((41, 3)), &draft())
             .unwrap();
 
         drafts.delete(&id).unwrap();

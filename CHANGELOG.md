@@ -123,6 +123,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - An account whose CardDAV server refused the sync is no longer reported as up
   to date: the report's tally carries `contacts_unavailable` (audit F-47,
   Circle S-01).
+- Drafts mirror: an edit saved while its previous version was uploading stays
+  marked for upload; a draft discarded during its first upload gets a
+  tombstone so the server copy is retired; two sweeps of one account take
+  turns instead of both uploading the same draft (audit F-34, Envelope F-15).
 
 ### Changed
 
@@ -167,6 +171,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   conflicts, held, `account_error`, `contacts_unavailable`, plus
   `has_problems()` and `is_quiet()`), so apps word the status line in their
   own language (audit F-48, O-05, Circle S-02).
+- `drafts::Drafts::mark_mirrored(id, message_id, landed, uploaded: &Draft)`
+  takes the draft that was uploaded.
 
 ### Added
 

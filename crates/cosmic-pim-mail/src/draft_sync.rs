@@ -72,6 +72,16 @@ pub fn sweep(
 ) -> SweepReport {
     let mut report = SweepReport::default();
 
+    // One sweep per account at a time; a second waits and then finds the
+    // first one's work done.
+    let _sweeping = match drafts.sweep_lock() {
+        Ok(lock) => lock,
+        Err(why) => {
+            report.failed.push((String::new(), why.to_string()));
+            return report;
+        }
+    };
+
     let mailbox = match session.select_mailbox(wire_name) {
         Ok(mailbox) => mailbox,
         Err(why) => {
@@ -182,7 +192,7 @@ fn mirror_one(
     });
 
     let retired = retire(session, &message_id, Retire::Exactly(&old))?;
-    drafts.mark_mirrored(id, &message_id, landed)?;
+    drafts.mark_mirrored(id, &message_id, landed, &draft)?;
     Ok(retired)
 }
 
