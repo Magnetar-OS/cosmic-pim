@@ -84,22 +84,23 @@ client_id = "…apps.googleusercontent.com"
 
 ## Using these
 
-Not yet on crates.io — the licence gate is open (see [Licensing](#licensing));
-what is left is pushing this repository and tagging it. Until then, depend by
-git:
+On crates.io. Depend on the crates you need:
 
 ```toml
 [dependencies]
-cosmic-pim-core = { git = "https://github.com/Magnetar-OS/cosmic-pim", tag = "v0.1.0" }
+cosmic-pim-core = "2"
+cosmic-pim-sync = "2"
 
-# Uncomment to develop against a sibling checkout without retagging.
-# [patch.'https://github.com/Magnetar-OS/cosmic-pim']
+# A contacts or calendar app with no mail: keep the mail and OpenPGP stack
+# out of the build.
+# cosmic-pim-sync = { version = "2", default-features = false }
+
+# Uncomment to develop against a sibling checkout.
+# [patch.crates-io]
 # cosmic-pim-core = { path = "../cosmic-pim/crates/cosmic-pim-core" }
 ```
 
-A `[patch]` alone does not let you skip the git source: cargo still resolves it.
-Until this repository is pushed, the applications use sibling **path**
-dependencies, with the git form written in a comment ready to swap.
+`CHANGELOG.md` lists every public API change, with what to call instead.
 
 ## What you get for free
 
