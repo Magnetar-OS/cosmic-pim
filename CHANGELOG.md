@@ -109,6 +109,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   series' own zone (DATE for all-day series, floating for floating ones)
   instead of the end of the UTC day, and a UTC `UNTIL` is read back as a date
   in the series' zone (Slate audit F-05).
+- Range queries on a day whose midnight does not exist (daylight saving
+  starting at 00:00) start at the day's first real hour instead of midnight
+  read as UTC, and a DATE or floating `UNTIL` no longer drops a series' last
+  instances from the index (audit F-23).
 
 ### Changed
 

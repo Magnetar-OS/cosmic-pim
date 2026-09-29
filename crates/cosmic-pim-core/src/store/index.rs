@@ -587,17 +587,30 @@ fn series_until(event: &Event, local: Tz) -> Option<DateTime<Utc>> {
     for part in rule.split(';') {
         let (key, value) = part.split_once('=')?;
         if key.trim().eq_ignore_ascii_case("UNTIL") {
-            let v = value.trim().trim_end_matches('Z');
-            let parsed = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S")
-                .ok()
-                .or_else(|| {
-                    chrono::NaiveDate::parse_from_str(v, "%Y%m%d")
-                        .ok()
-                        .map(|d| d.and_time(chrono::NaiveTime::MIN))
-                })?;
+            let value = value.trim();
+            // Only a `Z` value is UTC. A DATE runs to the end of that day, and
+            // a floating value is on the series' own clock: reading either as
+            // UTC cut the series off hours early east of Greenwich, and the
+            // index then left its last instances out of range queries
+            // (audit F-23).
+            let last_start = if let Some(utc) = value.strip_suffix(['Z', 'z']) {
+                Utc.from_utc_datetime(&NaiveDateTime::parse_from_str(utc, "%Y%m%dT%H%M%S").ok()?)
+            } else if let Ok(time) = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S") {
+                match event.start {
+                    EventTime::Zoned(_, tz) => EventTime::Zoned(time, tz).to_utc(local),
+                    _ => EventTime::Floating(time).to_utc(local),
+                }
+            } else {
+                let day = chrono::NaiveDate::parse_from_str(value, "%Y%m%d").ok()?;
+                let zone = match event.start {
+                    EventTime::Zoned(_, tz) => tz,
+                    _ => local,
+                };
+                EventTime::Date(day.succ_opt()?).to_utc(zone)
+            };
             // Add the event's own length: the last instance starts at UNTIL but
             // may run past it.
-            return Some(Utc.from_utc_datetime(&parsed) + event.duration(local));
+            return Some(last_start + event.duration(local));
         }
     }
     None
@@ -1099,5 +1112,27 @@ mod tests {
 
         index.prune_missing_calendars(&[]).unwrap();
         assert_eq!(index.event_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_date_until_keeps_the_series_through_the_whole_last_day() {
+        // UNTIL=20260930 on an all-day series in Athens: the series is live
+        // until 1 Oct 00:00 Athens, not 30 Sep 00:00 UTC.
+        let athens = chrono_tz::Europe::Athens;
+        let mut event = Event::draft(
+            "c",
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            athens,
+        );
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        event.start = EventTime::Date(day);
+        event.end = EventTime::Date(day.succ_opt().unwrap());
+        event.rrule = Some("FREQ=DAILY;UNTIL=20260930".into());
+        let until = series_until(&event, athens).unwrap();
+        // 1 Oct 00:00 Athens (UTC+3) plus the one-day length.
+        assert_eq!(until, Utc.with_ymd_and_hms(2026, 10, 1, 21, 0, 0).unwrap());
     }
 }

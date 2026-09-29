@@ -13,8 +13,10 @@ pub mod index;
 pub mod vdir;
 pub mod watcher;
 
-use crate::model::{CalendarMeta, Event, Occurrence, Rgb, Todo, expand_merged, local_timezone};
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use crate::model::{
+    CalendarMeta, Event, EventTime, Occurrence, Rgb, Todo, expand_merged, local_timezone,
+};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -297,8 +299,8 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let from_utc = self.day_start_utc(from);
-        let to_utc = self.day_start_utc(to);
+        let from_utc = day_start_utc(from, self.local);
+        let to_utc = day_start_utc(to, self.local);
 
         // Expanded as one set rather than event-by-event: a RECURRENCE-ID
         // override and its master are separate components, and suppressing the
@@ -340,16 +342,6 @@ impl Store {
 
         Ok(map)
     }
-
-    fn day_start_utc(&self, date: NaiveDate) -> DateTime<Utc> {
-        use chrono::offset::LocalResult;
-        let naive = date.and_time(NaiveTime::MIN);
-        match self.local.from_local_datetime(&naive) {
-            LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => t.with_timezone(&Utc),
-            LocalResult::None => Utc.from_utc_datetime(&naive),
-        }
-    }
-
     /// Looks up one event for editing.
     pub fn event(&self, calendar_id: &str, uid: &str) -> Result<Option<Event>, StoreError> {
         self.index.event(calendar_id, uid)
@@ -817,6 +809,34 @@ impl Store {
         meta.save_meta()?;
         self.refresh()?;
         Ok(())
+    }
+}
+
+/// The instant a local calendar day begins in `local`.
+///
+/// Where midnight does not exist — zones that start daylight saving at 00:00,
+/// such as Chile and Paraguay — the day begins at the first wall time that
+/// does, as everywhere else in the model. Reading the missing midnight as UTC
+/// instead shifted the whole query window by the zone's offset (audit F-23).
+fn day_start_utc(date: NaiveDate, local: Tz) -> DateTime<Utc> {
+    EventTime::Date(date).to_utc(local)
+}
+
+#[cfg(test)]
+mod day_start_tests {
+    use super::*;
+    use chrono::TimeZone as _;
+
+    #[test]
+    fn a_day_without_a_midnight_starts_at_its_first_real_hour() {
+        // Santiago springs forward at 00:00 on 6 September 2026: the day
+        // starts at 01:00 local, which is 04:00 UTC.
+        let santiago = chrono_tz::America::Santiago;
+        let day = NaiveDate::from_ymd_opt(2026, 9, 6).unwrap();
+        assert_eq!(
+            day_start_utc(day, santiago),
+            Utc.with_ymd_and_hms(2026, 9, 6, 4, 0, 0).unwrap()
+        );
     }
 }
 
