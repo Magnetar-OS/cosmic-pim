@@ -120,6 +120,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - Moving a whole series no longer orphans its overrides: they are re-targeted
   to the moved instances instead of showing beside them (audit F-13, Slate
   F-03).
+- An account whose CardDAV server refused the sync is no longer reported as up
+  to date: the report's tally carries `contacts_unavailable` (audit F-47,
+  Circle S-01).
 
 ### Changed
 
@@ -159,6 +162,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `model::Recurrence::to_rrule(self, start: EventTime)` and
   `Recurrence::parse(rule, start: EventTime)` take the series' DTSTART.
   `Event::recurrence()` is unchanged.
+- `sync::AccountReport::summary() -> String` is replaced by
+  `AccountReport::tally() -> SyncTally` (fetched, deleted, pushed, failed,
+  conflicts, held, `account_error`, `contacts_unavailable`, plus
+  `has_problems()` and `is_quiet()`), so apps word the status line in their
+  own language (audit F-48, O-05, Circle S-02).
 
 ### Added
 

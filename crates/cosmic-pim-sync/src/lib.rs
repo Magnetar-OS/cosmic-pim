@@ -32,7 +32,7 @@ pub mod provision;
 pub mod writeback;
 
 pub use conflict::all as conflicts;
-pub use engine::{AccountReport, CollectionReport, sync_account, sync_all};
+pub use engine::{AccountReport, CollectionReport, SyncTally, sync_account, sync_all};
 pub use error::{Error, Result};
 pub use freebusy::{Answer, account_for_collection, availability};
 pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};

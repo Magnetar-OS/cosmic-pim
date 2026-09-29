@@ -96,57 +96,78 @@ impl AccountReport {
         matches!(&self.collections, Ok(reports) if reports.iter().any(CollectionReport::changed))
     }
 
-    /// A one-line summary for the log and the UI's status area.
+    /// What this pass did, as numbers an application words in its own
+    /// language.
+    ///
+    /// Data rather than a sentence: the English one-liner this replaced was
+    /// shown verbatim by every app, untranslatable, and it left out the
+    /// contacts half of the account — a CardDAV server that refused us read
+    /// as "up to date" (audit F-47, F-48; Circle S-01, S-02).
     #[must_use]
-    pub fn summary(&self) -> String {
+    pub fn tally(&self) -> SyncTally {
+        let mut tally = SyncTally {
+            contacts_unavailable: self.contacts_unavailable.clone(),
+            ..SyncTally::default()
+        };
         match &self.collections {
-            Err(why) => format!("{}: {why}", self.display_name),
+            Err(why) => tally.account_error = Some(why.to_string()),
             Ok(reports) => {
-                let fetched: usize = reports
-                    .iter()
-                    .filter_map(|r| r.outcome.as_ref().ok())
-                    .map(|o| o.fetched)
-                    .sum();
-                let deleted: usize = reports
-                    .iter()
-                    .filter_map(|r| r.outcome.as_ref().ok())
-                    .map(|o| o.deleted)
-                    .sum();
-                let pushed: usize = reports.iter().map(|r| r.pushed.succeeded).sum();
-                let failed = reports.iter().filter(|r| r.outcome.is_err()).count();
-                let conflicts: usize = reports.iter().map(CollectionReport::conflicts).sum();
-                let blocked: usize = reports
-                    .iter()
-                    .map(|r| r.pushed.needs_user + r.pushed.needs_reconcile)
-                    .sum();
-
-                let mut parts = Vec::new();
-                if fetched > 0 {
-                    parts.push(format!("{fetched} in"));
+                for report in reports {
+                    match &report.outcome {
+                        Ok(outcome) => {
+                            tally.fetched += outcome.fetched;
+                            tally.deleted += outcome.deleted;
+                        }
+                        Err(_) => tally.failed += 1,
+                    }
+                    tally.pushed += report.pushed.succeeded;
+                    tally.conflicts += report.conflicts();
+                    tally.held += report.pushed.needs_user + report.pushed.needs_reconcile;
                 }
-                if deleted > 0 {
-                    parts.push(format!("{deleted} removed"));
-                }
-                if pushed > 0 {
-                    parts.push(format!("{pushed} out"));
-                }
-                if failed > 0 {
-                    parts.push(format!("{failed} failed"));
-                }
-                // These are the two the user can act on, so they say so rather
-                // than hiding inside a count of things that "did not sync".
-                if conflicts > 0 {
-                    parts.push(format!("{conflicts} to resolve"));
-                }
-                if blocked > 0 {
-                    parts.push(format!("{blocked} held"));
-                }
-                if parts.is_empty() {
-                    parts.push("up to date".to_owned());
-                }
-                format!("{}: {}", self.display_name, parts.join(", "))
             }
         }
+        tally
+    }
+}
+
+/// The counts behind one account's sync pass. See [`AccountReport::tally`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncTally {
+    /// Resources brought down from the server.
+    pub fetched: usize,
+    /// Resources removed because the server removed them.
+    pub deleted: usize,
+    /// Local changes the server accepted.
+    pub pushed: usize,
+    /// Collections whose pass failed.
+    pub failed: usize,
+    /// Resources both sides changed, waiting for the user.
+    pub conflicts: usize,
+    /// Local changes held for the user or for a reconcile: a password to
+    /// re-enter, no write access, a stale edit.
+    pub held: usize,
+    /// Why the account failed before any collection was reached.
+    pub account_error: Option<String>,
+    /// Why address books were not reached, when a CardDAV server that exists
+    /// refused or failed. `None` also for an account that offers no CardDAV.
+    pub contacts_unavailable: Option<String>,
+}
+
+impl SyncTally {
+    /// Whether anything went wrong that the user should see.
+    #[must_use]
+    pub fn has_problems(&self) -> bool {
+        self.failed > 0
+            || self.conflicts > 0
+            || self.held > 0
+            || self.account_error.is_some()
+            || self.contacts_unavailable.is_some()
+    }
+
+    /// Whether the pass moved nothing and found nothing wrong.
+    #[must_use]
+    pub fn is_quiet(&self) -> bool {
+        self.fetched == 0 && self.deleted == 0 && self.pushed == 0 && !self.has_problems()
     }
 }
 
@@ -553,6 +574,23 @@ mod tests {
         assert_eq!(
             store.credential(&id).unwrap().unwrap().access_token,
             "still-valid"
+        );
+    }
+
+    #[test]
+    fn a_contacts_server_that_refused_us_is_not_up_to_date() {
+        let report = AccountReport {
+            account_id: "a".into(),
+            display_name: "Work".into(),
+            collections: Ok(Vec::new()),
+            contacts_unavailable: Some("HTTP 401".into()),
+        };
+        let tally = report.tally();
+        assert_eq!(tally.contacts_unavailable.as_deref(), Some("HTTP 401"));
+        assert!(tally.has_problems());
+        assert!(
+            !tally.is_quiet(),
+            "a refused address book read as up to date"
         );
     }
 }
