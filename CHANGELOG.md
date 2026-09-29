@@ -197,6 +197,7 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `Itip::supersedes(stored_sequence, stored_dtstamp: Option<&str>)`. New
   `itip::scheduling_message(ics, method) -> String` builds what the organizer
   sends.
+- `cosmic-pim-mail` depends on `cosmic-ext-nib-text` 1.2.0 (was 1.1.0).
 
 ### Added
 
