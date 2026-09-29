@@ -139,6 +139,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   details (audit F-39).
 - iTIP: `send_invitation` and `send_cancellation` stamp every VEVENT with the
   current DTSTAMP, and a CANCEL carries `STATUS:CANCELLED` (audit F-40).
+- Automatic three-way merge now works on real data: DTSTAMP, LAST-MODIFIED,
+  REV and SEQUENCE changed on both sides take the later value instead of
+  counting as an overlap, so edits to different properties merge (audit F-19).
 
 ### Changed
 

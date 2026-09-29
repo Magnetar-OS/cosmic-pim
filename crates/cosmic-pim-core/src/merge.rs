@@ -338,6 +338,27 @@ fn label(path: &str, key: &Key) -> String {
 type Decide<'a> =
     dyn FnMut(&str, Option<&[String]>, Option<&[String]>, Option<&[String]>) -> Option<Side> + 'a;
 
+/// For a revision stamp both sides changed, whether the local one is the
+/// later; `None` for any other property.
+///
+/// `DTSTAMP`, `LAST-MODIFIED` (iCalendar) and `REV` (vCard) are UTC stamps
+/// in one fixed format, so the later is the greater text; `SEQUENCE` is a
+/// number.
+fn later_stamp(name: &str, local: &[String], remote: &[String]) -> Option<bool> {
+    let value = |lines: &[String]| {
+        lines
+            .first()
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_owned())
+    };
+    let (l, r) = (value(local)?, value(remote)?);
+    match name {
+        "DTSTAMP" | "LAST-MODIFIED" | "REV" => Some(l > r),
+        "SEQUENCE" => Some(l.parse::<i64>().ok()? > r.parse::<i64>().ok()?),
+        _ => None,
+    }
+}
+
 fn merge_component(base: &str, local: &str, remote: &str) -> Option<String> {
     // The strict form: any overlap is fatal. `merge3`'s behaviour.
     merge_with(base, local, remote, "", &mut |_, _, _, _| None)
@@ -400,13 +421,27 @@ fn merge_with(
                 substitutions.insert(key.clone(), Some(merged));
                 continue;
             }
-            // A genuine overlap: someone decides, or nobody does and the
-            // merge honestly fails.
-            match decide(&label(path, key), b.as_deref(), l.as_deref(), r.as_deref())? {
-                Side::Local => true,
-                // Remote's version (or its deletion) flows through the
-                // reconstruction untouched.
-                Side::Remote => continue,
+            // A revision stamp both sides moved is not a disagreement: every
+            // writer restamps, so treating it as one made every two-sided
+            // edit a conflict on real data (audit F-19). The later stamp —
+            // the higher revision — is what the merged document is.
+            if let (Key::Prop(_, name), Some(l), Some(r)) = (key, &l, &r)
+                && let Some(later_is_local) = later_stamp(name, l, r)
+            {
+                if later_is_local {
+                    true
+                } else {
+                    continue;
+                }
+            } else {
+                // A genuine overlap: someone decides, or nobody does and the
+                // merge honestly fails.
+                match decide(&label(path, key), b.as_deref(), l.as_deref(), r.as_deref())? {
+                    Side::Local => true,
+                    // Remote's version (or its deletion) flows through the
+                    // reconstruction untouched.
+                    Side::Remote => continue,
+                }
             }
         } else {
             true // changed locally only: local is authoritative for this unit
@@ -910,5 +945,30 @@ TEL:+1\r\nTEL:+2\r\nEND:VCARD\r\n";
         let merged = merge3(&base, &local, &remote).unwrap();
         // Merging the result against itself changes nothing.
         assert_eq!(merge3(&merged, &merged, &merged).unwrap(), merged);
+    }
+
+    #[test]
+    fn edits_to_different_properties_merge_even_though_both_sides_restamped() {
+        // Every writer (ours included) bumps DTSTAMP and LAST-MODIFIED, so on
+        // real data they always "overlap" — and the documented moved-here,
+        // renamed-there case never merged.
+        let doc = |summary: &str, location: &str, stamp: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u\r\n\
+                 DTSTAMP:{stamp}\r\nLAST-MODIFIED:{stamp}\r\nSUMMARY:{summary}\r\n\
+                 LOCATION:{location}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            )
+        };
+        let base = doc("Standup", "Room 1", "20260101T000000Z");
+        let local = doc("Daily standup", "Room 1", "20260102T000000Z");
+        let remote = doc("Standup", "Room 2", "20260103T000000Z");
+
+        let merged = merge3(&base, &local, &remote).expect("disjoint edits did not merge");
+        assert!(merged.contains("SUMMARY:Daily standup"));
+        assert!(merged.contains("LOCATION:Room 2"));
+        assert!(
+            merged.contains("DTSTAMP:20260103T000000Z"),
+            "the later stamp was not kept"
+        );
     }
 }
