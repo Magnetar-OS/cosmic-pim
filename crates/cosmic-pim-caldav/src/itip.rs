@@ -11,11 +11,10 @@
 //! An invitation is a `text/calendar` MIME part carrying a `METHOD`. Envelope
 //! finds the part; this module says what it *means* and applies it to a vdir
 //! collection — which is how an invite accepted in the mail client appears in
-//! the calendar without either app knowing the other exists. The scheduling
-//! half of RFC 6638 (server inboxes and outboxes) is deliberately absent: that
-//! is suite step 7, and it will *use* this module rather than replace it,
-//! because the semantics of a REQUEST are the same whether it arrived over
-//! SMTP or over a CalDAV inbox.
+//! the calendar without either app knowing the other exists. The RFC 6638
+//! half (server outboxes: [`send_invitation`], [`send_cancellation`],
+//! free/busy) uses the same semantics, because a REQUEST means the same
+//! whether it arrived over SMTP or over a CalDAV inbox.
 //!
 //! # The three decisions that prevent real damage
 //!
@@ -106,6 +105,8 @@ pub struct Itip {
     pub organizer: Option<Participant>,
     pub attendees: Vec<Participant>,
     pub has_dtstart: bool,
+    /// The first VEVENT's DTSTAMP, as written (`YYYYMMDDTHHMMSSZ`).
+    pub dtstamp: Option<String>,
 }
 
 impl Itip {
@@ -140,11 +141,20 @@ impl Itip {
     /// Whether this payload may overwrite an event stored with
     /// `stored_sequence`.
     ///
-    /// Lower is stale; **equal still applies** (RFC 5546 §3.2.2 — a
-    /// same-sequence re-send refreshes non-versioned detail).
+    /// Lower is stale. **Equal still applies** (RFC 5546 §3.2.2 — a
+    /// same-sequence re-send refreshes non-versioned detail) unless its
+    /// DTSTAMP is older than the stored one's: RFC 5546 section 2.1.5 breaks
+    /// the tie by DTSTAMP, and without it an old invitation reopened from
+    /// mail rolled back newer text and the user's own alarms (audit F-39).
     #[must_use]
-    pub fn supersedes(&self, stored_sequence: i64) -> bool {
-        self.sequence >= stored_sequence
+    pub fn supersedes(&self, stored_sequence: i64, stored_dtstamp: Option<&str>) -> bool {
+        if self.sequence != stored_sequence {
+            return self.sequence > stored_sequence;
+        }
+        match (self.dtstamp.as_deref(), stored_dtstamp) {
+            (Some(incoming), Some(stored)) => incoming >= stored,
+            _ => true,
+        }
     }
 }
 
@@ -165,6 +175,7 @@ pub fn parse(ics: &str) -> Option<Itip> {
     let mut organizer = None;
     let mut attendees = Vec::new();
     let mut has_dtstart = false;
+    let mut dtstamp = None;
     let mut saw_event = false;
 
     for line in &lines {
@@ -210,6 +221,7 @@ pub fn parse(ics: &str) -> Option<Itip> {
             "SEQUENCE" => sequence = line.value().trim().parse().unwrap_or(0),
             "SUMMARY" => summary = Some(line.value().trim().to_owned()),
             "DTSTART" => has_dtstart = true,
+            "DTSTAMP" => dtstamp = Some(line.value().trim().to_ascii_uppercase()),
             "ORGANIZER" => organizer = Some(participant(line.params(), line.value())),
             "ATTENDEE" => attendees.push(participant(line.params(), line.value())),
             _ => {}
@@ -225,6 +237,7 @@ pub fn parse(ics: &str) -> Option<Itip> {
         organizer,
         attendees,
         has_dtstart,
+        dtstamp,
     })
 }
 
@@ -444,7 +457,7 @@ pub fn send_invitation(
     outbox_url: &str,
     ics: &str,
 ) -> Result<Vec<crate::dav::ScheduleResponse>> {
-    client.post_scheduling(outbox_url, &with_method(ics, "REQUEST"))
+    client.post_scheduling(outbox_url, &scheduling_message(ics, "REQUEST"))
 }
 
 /// Withdraws a stored event from its attendees (RFC 5546 §3.2.5).
@@ -459,7 +472,61 @@ pub fn send_cancellation(
     outbox_url: &str,
     ics: &str,
 ) -> Result<Vec<crate::dav::ScheduleResponse>> {
-    client.post_scheduling(outbox_url, &with_method(ics, "CANCEL"))
+    client.post_scheduling(outbox_url, &scheduling_message(ics, "CANCEL"))
+}
+
+/// A stored event as the organizer sends it: `METHOD` added, every VEVENT's
+/// DTSTAMP set to now (RFC 5545 section 3.8.7.2: when the message was
+/// created), and for a CANCEL `STATUS:CANCELLED` (RFC 5546 section 3.2.5).
+///
+/// The stored file's DTSTAMP is when it was last written, often long ago;
+/// sent unchanged, a receiver breaking a SEQUENCE tie by DTSTAMP could
+/// discard this message as older than one it already holds (audit F-40).
+#[must_use]
+pub fn scheduling_message(ics: &str, method: &str) -> String {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let mut out = set_on_every_vevent(ics, "DTSTAMP", &stamp);
+    if method.eq_ignore_ascii_case("CANCEL") {
+        out = set_on_every_vevent(&out, "STATUS", "CANCELLED");
+    }
+    with_method(&out, method)
+}
+
+/// Sets `property` to `value` on every VEVENT's own level — replacing the
+/// line where there is one, adding it before END:VEVENT where there is not —
+/// and touches nothing else.
+fn set_on_every_vevent(ics: &str, property: &str, value: &str) -> String {
+    let terminator = terminator_of(ics);
+    let line_text = format!("{property}:{value}");
+    let mut out = String::with_capacity(ics.len() + 64);
+    let mut depth = 0usize;
+    let mut in_event_at: Option<usize> = None;
+    let mut had = false;
+    for line in logical_lines(ics) {
+        if let Some(name) = line.begins() {
+            depth += 1;
+            if name == "VEVENT" && in_event_at.is_none() {
+                in_event_at = Some(depth);
+                had = false;
+            }
+        } else if line.ends().is_some() {
+            if in_event_at == Some(depth) {
+                if !had {
+                    fold(&line_text, terminator, &mut out);
+                }
+                in_event_at = None;
+            }
+            depth = depth.saturating_sub(1);
+        } else if in_event_at == Some(depth) && line.name() == property {
+            if !had {
+                fold(&line_text, terminator, &mut out);
+            }
+            had = true;
+            continue;
+        }
+        out.push_str(line.raw());
+    }
+    out
 }
 
 /// What applying one payload did.
@@ -589,6 +656,26 @@ fn stored_uid(ics: &str) -> Option<String> {
     None
 }
 
+/// The latest DTSTAMP any VEVENT in the stored file carries. UTC stamps in
+/// one fixed format compare correctly as text.
+fn stored_dtstamp(ics: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut latest: Option<String> = None;
+    for line in logical_lines(ics) {
+        if line.begins().is_some() {
+            depth += 1;
+        } else if line.ends().is_some() {
+            depth = depth.saturating_sub(1);
+        } else if depth == 2 && line.name() == "DTSTAMP" {
+            let stamp = line.value().trim().to_ascii_uppercase();
+            if latest.as_ref().is_none_or(|l| stamp > *l) {
+                latest = Some(stamp);
+            }
+        }
+    }
+    latest
+}
+
 /// The highest SEQUENCE any component in the stored file carries.
 fn stored_sequence(ics: &str) -> i64 {
     let mut highest = 0i64;
@@ -676,7 +763,7 @@ fn apply_request(collection: &Path, ics: &str, itip: &Itip, me: &str) -> Result<
             if !stored_organizer_matches(&stored, itip, me) {
                 return Ok(Outcome::NotFromOrganizer);
             }
-            if !itip.supersedes(stored_sequence(&stored)) {
+            if !itip.supersedes(stored_sequence(&stored), stored_dtstamp(&stored).as_deref()) {
                 return Ok(Outcome::Stale);
             }
 
@@ -868,7 +955,7 @@ fn apply_cancel(collection: &Path, itip: &Itip, me: &str) -> Result<Outcome> {
     if !stored_organizer_matches(&stored, itip, me) {
         return Ok(Outcome::NotFromOrganizer);
     }
-    if !itip.supersedes(stored_sequence(&stored)) {
+    if !itip.supersedes(stored_sequence(&stored), stored_dtstamp(&stored).as_deref()) {
         return Ok(Outcome::Stale);
     }
 
@@ -1880,9 +1967,9 @@ mod tests {
         // detail. Off-by-one here either drops legitimate updates or applies
         // stale ones.
         let itip = parse(&request(2)).expect("an invitation");
-        assert!(itip.supersedes(1));
-        assert!(itip.supersedes(2));
-        assert!(!itip.supersedes(3));
+        assert!(itip.supersedes(1, None));
+        assert!(itip.supersedes(2, None));
+        assert!(!itip.supersedes(3, None));
     }
 
     #[test]
@@ -2345,5 +2432,42 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
             apply(dir.path(), &old, "boss@org.example", None).expect("reply"),
             Outcome::Stale
         );
+    }
+
+    #[test]
+    fn an_older_resend_at_the_same_sequence_does_not_roll_back_the_event() {
+        let dir = collection();
+        let newer = request(1).replace(
+            "SEQUENCE:1\r\n",
+            "SEQUENCE:1\r\nDTSTAMP:20270102T120000Z\r\n",
+        );
+        apply(dir.path(), &newer, "ada@example.com", None).expect("request");
+
+        let older = request(1)
+            .replace(
+                "SEQUENCE:1\r\n",
+                "SEQUENCE:1\r\nDTSTAMP:20270101T120000Z\r\n",
+            )
+            .replace("SUMMARY:Planning", "SUMMARY:Old title");
+        assert_eq!(
+            apply(dir.path(), &older, "ada@example.com", None).expect("request"),
+            Outcome::Stale
+        );
+    }
+
+    #[test]
+    fn a_sent_cancel_is_stamped_now_and_says_cancelled() {
+        let stored = weekly(1).replace("METHOD:REQUEST\r\n", "").replace(
+            "SEQUENCE:1\r\n",
+            "SEQUENCE:1\r\nDTSTAMP:20200101T000000Z\r\n",
+        );
+        let message = scheduling_message(&stored, "CANCEL");
+        assert!(message.contains("METHOD:CANCEL"));
+        assert!(message.contains("STATUS:CANCELLED"));
+        assert!(
+            !message.contains("DTSTAMP:20200101T000000Z"),
+            "the stale DTSTAMP went out"
+        );
+        assert_eq!(message.matches("DTSTAMP:").count(), 1);
     }
 }

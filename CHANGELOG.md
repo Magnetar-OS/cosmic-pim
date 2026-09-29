@@ -134,6 +134,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   RECURRENCE-ID names (adding an override when needed), only with a valid
   PARTSTAT, and not when older than the stored event; a one-instance answer no
   longer rewrites the whole series (audit F-37).
+- iTIP: a REQUEST or CANCEL at the stored SEQUENCE but with an older DTSTAMP
+  is stale, so an old invitation reopened from mail no longer rolls back newer
+  details (audit F-39).
+- iTIP: `send_invitation` and `send_cancellation` stamp every VEVENT with the
+  current DTSTAMP, and a CANCEL carries `STATUS:CANCELLED` (audit F-40).
 
 ### Changed
 
@@ -180,6 +185,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   own language (audit F-48, O-05, Circle S-02).
 - `drafts::Drafts::mark_mirrored(id, message_id, landed, uploaded: &Draft)`
   takes the draft that was uploaded.
+- `itip::Itip` gains `dtstamp: Option<String>`;
+  `Itip::supersedes(stored_sequence, stored_dtstamp: Option<&str>)`. New
+  `itip::scheduling_message(ics, method) -> String` builds what the organizer
+  sends.
 
 ### Added
 
