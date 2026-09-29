@@ -7,6 +7,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-29
+
+A major version because the public API changed incompatibly (Cargo reads a
+breaking change after 1.0.0 as a major bump; 1.1.0 was tagged but never
+published). Every changed or removed item is listed under **Changed**, with
+what to call instead. Consumers move from `"1"` to `"2"`.
+
 ### Fixed
 
 - `AccountStore::save` no longer drops an account another app added on the
