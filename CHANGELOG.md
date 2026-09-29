@@ -117,6 +117,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   raises its `SEQUENCE`, and splitting one no longer resets it, so the
   organizer's later updates are not dropped as stale; the counter still
   advances on the user's own series (Slate audit F-25).
+- Moving a whole series no longer orphans its overrides: they are re-targeted
+  to the moved instances instead of showing beside them (audit F-13, Slate
+  F-03).
 
 ### Changed
 
@@ -174,6 +177,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `mail::Error::Transport { service, message }` and `mail::Error::Status {
   service, status, message }` (with `Error::transport` / `Error::status`
   constructors) for the HTTP mail engines.
+- `Store::save_series(&mut self, previous: &Event, series: &Event) ->
+  Result<(), StoreError>`: saves a whole-series edit and moves every
+  override's `RECURRENCE-ID` (and, for an override that kept its instance's
+  time, its start and end) by the same shift (audit F-13, Slate F-03).
+
 
 
 

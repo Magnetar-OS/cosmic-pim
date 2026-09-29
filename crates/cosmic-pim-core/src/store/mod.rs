@@ -405,6 +405,53 @@ impl Store {
         Ok(())
     }
 
+    /// Saves an edit to a whole series and carries its overrides along.
+    ///
+    /// `previous` is the master as it was; `series` is the master as it is
+    /// to be saved, EXDATEs included. When the edit moves the series, every
+    /// override's `RECURRENCE-ID` is moved by the same amount in the series'
+    /// own frame (and into its value type, when an all-day toggle changed
+    /// it), so the override still names an instance the series generates.
+    /// An override that kept its instance's time moves with it; one that the
+    /// user had moved elsewhere keeps its own time.
+    ///
+    /// Saving the master alone left each override naming an instance that no
+    /// longer exists: it showed *beside* the regenerated instance, and could
+    /// no longer be reached as "this instance" (Slate audit F-03).
+    pub fn save_series(&mut self, previous: &Event, series: &Event) -> Result<(), StoreError> {
+        self.save(series)?;
+
+        let shift = own_frame(series.start) - own_frame(previous.start);
+        let kind_changed = previous.start.is_all_day() != series.start.is_all_day();
+        if shift.is_zero() && !kind_changed {
+            return Ok(());
+        }
+
+        let overrides: Vec<Event> = self
+            .index
+            .events_with_uid(&series.calendar_id, &series.uid)?
+            .into_iter()
+            .filter(|event| event.recurrence_id.is_some())
+            .collect();
+        for over in overrides {
+            let Some(old_rid) = over.recurrence_id else {
+                continue;
+            };
+            let mut moved = over.clone();
+            moved.recurrence_id = Some(series.start.with_naive(own_frame(old_rid) + shift));
+            if own_frame(over.start) == own_frame(old_rid) {
+                let length = own_frame(over.end) - own_frame(over.start);
+                moved.start = series.start.with_naive(own_frame(over.start) + shift);
+                moved.end = series.end.with_naive(own_frame(moved.start) + length);
+            }
+            // The component is keyed by its RECURRENCE-ID, so a new one is a
+            // new component: the old goes, the moved one is written.
+            self.delete_override(&over)?;
+            self.save(&moved)?;
+        }
+        Ok(())
+    }
+
     /// Deletes one instance of a series: an `EXDATE` on the master, plus the
     /// removal of any override component that had modified the same instance.
     ///
@@ -817,6 +864,15 @@ impl Store {
     }
 }
 
+/// A time's value in its own frame — the space `EXDATE`s and
+/// `RECURRENCE-ID`s are written in.
+fn own_frame(t: EventTime) -> chrono::NaiveDateTime {
+    match t {
+        EventTime::Date(d) => d.and_time(NaiveTime::MIN),
+        EventTime::Floating(dt) | EventTime::Zoned(dt, _) => dt,
+    }
+}
+
 /// Raises an event's `SEQUENCE` for a change made here — unless the event has
 /// an organizer.
 ///
@@ -1042,6 +1098,50 @@ mod tests {
                 .unwrap()
                 .sequence,
             1
+        );
+    }
+
+    #[test]
+    fn moving_a_whole_series_carries_its_overrides_along() {
+        let (_dir, mut store) = store();
+        let (cal, master) = weekly_series(&mut store);
+        // Rename the 11 August instance only.
+        let cut = instance_on(&store, day(2026, 8, 11));
+        let mut over = master.clone();
+        over.recurrence_id = Some(crate::model::rid_for(master.start, cut, store.local));
+        over.rrule = None;
+        over.start = master
+            .start
+            .with_naive(day(2026, 8, 11).and_hms_opt(9, 0, 0).unwrap());
+        over.end = master
+            .end
+            .with_naive(day(2026, 8, 11).and_hms_opt(10, 0, 0).unwrap());
+        over.summary = "Retro".into();
+        store.save(&over).unwrap();
+
+        // Move every instance an hour later.
+        let mut series = store.event(&cal.id, &master.uid).unwrap().unwrap();
+        let previous = series.clone();
+        series.start = series
+            .start
+            .with_naive(day(2026, 8, 4).and_hms_opt(10, 0, 0).unwrap());
+        series.end = series
+            .end
+            .with_naive(day(2026, 8, 4).and_hms_opt(11, 0, 0).unwrap());
+        store.save_series(&previous, &series).unwrap();
+
+        let on_the_11th: Vec<_> = store
+            .occurrences(day(2026, 8, 11), day(2026, 8, 12), &HashSet::new())
+            .unwrap();
+        assert_eq!(
+            on_the_11th.len(),
+            1,
+            "the override showed beside the regenerated instance: {on_the_11th:?}"
+        );
+        assert_eq!(on_the_11th[0].summary, "Retro");
+        assert_eq!(
+            on_the_11th[0].start.time(),
+            chrono::NaiveTime::from_hms_opt(10, 0, 0).unwrap()
         );
     }
 
