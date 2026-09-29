@@ -142,6 +142,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - Automatic three-way merge now works on real data: DTSTAMP, LAST-MODIFIED,
   REV and SEQUENCE changed on both sides take the later value instead of
   counting as an overlap, so edits to different properties merge (audit F-19).
+- An EXDATE written in UTC (or another zone) under a zoned DTSTART excludes
+  the right instance instead of letting it reappear, and saving an event
+  leaves DTSTART, DTEND, EXDATE and RECURRENCE-ID as written unless the edit
+  changed them (an unresolvable TZID is no longer rewritten as UTC) (audit
+  F-14).
 
 ### Changed
 

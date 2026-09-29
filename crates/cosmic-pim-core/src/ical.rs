@@ -133,7 +133,7 @@ fn convert_event(
         start,
         end,
         rrule: rrule_text(component),
-        exdates: extract_exdates(component),
+        exdates: extract_exdates(component, start, resolver),
         alarms: extract_alarms(component, ical),
         sequence: integer_property(component, &ICalendarProperty::Sequence).unwrap_or(0) as i32,
         created: utc_property(component, &ICalendarProperty::Created),
@@ -437,14 +437,25 @@ fn to_event_time(
     let ICalendarValue::PartialDateTime(dt) = entry.values.first()? else {
         return None;
     };
+    value_to_event_time(dt, entry.tz_id(), is_date_only, resolver)
+}
 
+/// One date-time value of an entry to an [`EventTime`], under the entry's
+/// `TZID` — the rules of [`to_event_time`], for properties such as `EXDATE`
+/// that carry several values.
+fn value_to_event_time(
+    dt: &calcard::common::PartialDateTime,
+    tz_id: Option<&str>,
+    is_date_only: bool,
+    resolver: &TzResolver<&str>,
+) -> Option<EventTime> {
     if is_date_only {
         return partial_to_date(dt).map(EventTime::Date);
     }
 
     let naive = partial_to_naive(dt);
 
-    if let Some(tz_id_raw) = entry.tz_id()
+    if let Some(tz_id_raw) = tz_id
         && dt.tz_hour.is_none()
     {
         let tz_id = tz_id_raw.trim();
@@ -540,7 +551,11 @@ fn rrule_text(component: &ICalendarComponent) -> Option<String> {
 
 /// `EXDATE` may appear several times, and each may carry a comma-separated
 /// list — calcard surfaces that as several values on one entry.
-fn extract_exdates(component: &ICalendarComponent) -> Vec<NaiveDateTime> {
+fn extract_exdates(
+    component: &ICalendarComponent,
+    start: EventTime,
+    resolver: &TzResolver<&str>,
+) -> Vec<NaiveDateTime> {
     let mut out = Vec::new();
 
     for entry in component.properties(&ICalendarProperty::Exdate) {
@@ -549,13 +564,8 @@ fn extract_exdates(component: &ICalendarComponent) -> Vec<NaiveDateTime> {
             let ICalendarValue::PartialDateTime(dt) = value else {
                 continue;
             };
-            let parsed = if date_only {
-                partial_to_date(dt).map(|d| d.and_time(chrono::NaiveTime::MIN))
-            } else {
-                partial_to_naive(dt)
-            };
-            if let Some(naive) = parsed {
-                out.push(naive);
+            if let Some(time) = value_to_event_time(dt, entry.tz_id(), date_only, resolver) {
+                out.push(in_series_frame(time, start));
             }
         }
     }
@@ -563,6 +573,27 @@ fn extract_exdates(component: &ICalendarComponent) -> Vec<NaiveDateTime> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// An `EXDATE` as a wall time in the series' own frame — the space the
+/// expansion matches exclusions in.
+///
+/// The value's own `Z`, offset or `TZID` is applied, not dropped: an
+/// exclusion written in UTC under a `TZID` start (which many servers do)
+/// read as a local time matched no instance, and the excluded one came back
+/// (audit F-14).
+fn in_series_frame(time: EventTime, start: EventTime) -> NaiveDateTime {
+    match (time, start) {
+        (EventTime::Zoned(naive, tz), EventTime::Zoned(_, series)) if tz != series => {
+            chrono::TimeZone::from_local_datetime(&tz, &naive)
+                .earliest()
+                .map_or(naive, |instant| {
+                    instant.with_timezone(&series).naive_local()
+                })
+        }
+        (EventTime::Date(date), _) => date.and_time(chrono::NaiveTime::MIN),
+        (EventTime::Zoned(naive, _) | EventTime::Floating(naive), _) => naive,
+    }
 }
 
 /// Reads `VALARM` triggers as offsets from the event's start.
@@ -1241,6 +1272,26 @@ pub fn upsert_vevent(text: &str, event: &Event) -> String {
     out
 }
 
+/// The `index`-th VEVENT of `text` (in text order) as the model reads it.
+fn vevent_at(text: &str, index: usize) -> Option<Event> {
+    let lines = crate::patch::logical_lines(text);
+    let components = top_level_components(&lines);
+    let target = components
+        .iter()
+        .filter(|c| c.name == "VEVENT")
+        .nth(index)?;
+    let mut alone = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let inside_another_vevent = components
+            .iter()
+            .any(|c| c.name == "VEVENT" && c.start != target.start && i >= c.start && i <= c.end);
+        if !inside_another_vevent {
+            alone.push_str(line.raw());
+        }
+    }
+    parse_ics(&alone, "", "").into_iter().next()
+}
+
 /// Rewrites one VEVENT's modelled properties in place, leaving every other
 /// byte of the document exactly as it was.
 ///
@@ -1306,8 +1357,25 @@ fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
     // comment was right.
     let dtstamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     set(&mut edits, "DTSTAMP", keep("DTSTAMP", 0, &dtstamp));
-    set(&mut edits, "DTSTART", datetime("DTSTART", event.start));
-    set(&mut edits, "DTEND", datetime("DTEND", event.end));
+
+    // What the component holds now, as the model reads it. A time, an
+    // exclusion list or a recurrence-id the edit did not change is left as
+    // the source wrote it: regenerating it from the model re-spelled a
+    // zone the model could not resolve as UTC and rewrote exclusions in a
+    // form other clients match differently (audit F-14).
+    let source = vevent_at(text, index);
+    let unchanged =
+        |same: fn(&Event, &Event) -> bool| source.as_ref().is_some_and(|s| same(s, event));
+
+    if !unchanged(|s, e| s.start == e.start) {
+        set(&mut edits, "DTSTART", datetime("DTSTART", event.start));
+    }
+    if !unchanged(|s, e| s.end == e.end) {
+        set(&mut edits, "DTEND", datetime("DTEND", event.end));
+        // DURATION is read as DTEND on the way in, so a document carrying
+        // one would otherwise end up with two conflicting ends.
+        edits.insert("DURATION".to_owned(), Edit::remove());
+    }
     set(
         &mut edits,
         "SUMMARY",
@@ -1323,10 +1391,6 @@ fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
         "LAST-MODIFIED",
         keep("LAST-MODIFIED", 0, &last_modified),
     );
-
-    // DURATION is read as DTEND on the way in, so a document carrying one
-    // would otherwise end up with two conflicting ends.
-    edits.insert("DURATION".to_owned(), Edit::remove());
 
     for (property, value) in [
         ("DESCRIPTION", event.description.as_deref()),
@@ -1361,20 +1425,24 @@ fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
         set(&mut edits, "CREATED", keep("CREATED", 0, &created));
     }
 
-    if let Some(rid) = event.recurrence_id {
+    if let Some(rid) = event.recurrence_id
+        && !unchanged(|s, e| s.recurrence_id == e.recurrence_id)
+    {
         set(&mut edits, "RECURRENCE-ID", datetime("RECURRENCE-ID", rid));
     }
 
-    edits.insert(
-        "EXDATE".to_owned(),
-        Edit::set(
-            event
-                .exdates
-                .iter()
-                .map(|exdate| exdate_line(event, *exdate))
-                .collect(),
-        ),
-    );
+    if !unchanged(|s, e| s.exdates == e.exdates && s.start == e.start) {
+        edits.insert(
+            "EXDATE".to_owned(),
+            Edit::set(
+                event
+                    .exdates
+                    .iter()
+                    .map(|exdate| exdate_line(event, *exdate))
+                    .collect(),
+            ),
+        );
+    }
 
     // An attendee read from the document re-emits its own source line, so
     // DELEGATED-FROM, ROLE and every other parameter survive; only one this
@@ -3310,5 +3378,38 @@ mod todo_tests {
             assert!(line.len() <= 75, "line exceeds the fold limit: {line:?}");
         }
         assert_eq!(one(&ics).summary, todo.summary);
+    }
+
+    #[test]
+    fn a_utc_exclusion_under_a_zoned_start_excludes_the_right_instance() {
+        // 06:00Z on 4 August is 09:00 in Athens: that instance is excluded.
+        let text = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:s\r\n\
+DTSTART;TZID=Europe/Athens:20260803T090000\r\nRRULE:FREQ=DAILY\r\n\
+EXDATE:20260804T060000Z\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event = parse_ics(text, "c", "f.ics").remove(0);
+        assert_eq!(
+            event.exdates,
+            vec![NaiveDate::from_ymd_opt(2026, 8, 4).unwrap().and_hms_opt(9, 0, 0).unwrap()],
+            "the exclusion was read as a local time and the instance came back"
+        );
+    }
+
+    #[test]
+    fn a_title_edit_leaves_the_times_and_exclusions_as_written() {
+        let text = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:s\r\n\
+DTSTART;TZID=Europe/Athens:20260803T090000\r\nDTEND;TZID=Europe/Athens:20260803T100000\r\n\
+RRULE:FREQ=DAILY\r\nEXDATE:20260804T060000Z\r\nSUMMARY:Standup\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let mut event = parse_ics(text, "c", "f.ics").remove(0);
+        event.summary = "Daily standup".into();
+        let out = upsert_vevent(text, &event);
+        assert!(out.contains("SUMMARY:Daily standup"));
+        for line in [
+            "DTSTART;TZID=Europe/Athens:20260803T090000",
+            "DTEND;TZID=Europe/Athens:20260803T100000",
+            "EXDATE:20260804T060000Z",
+        ] {
+            assert!(out.contains(line), "{line} was rewritten:\n{out}");
+        }
     }
 }
