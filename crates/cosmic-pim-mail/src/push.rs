@@ -110,6 +110,11 @@ impl Failure {
         match error {
             Error::UidValidityChanged { .. } => Self::Reconcile,
             Error::Auth(_) => Self::User,
+            // The message is not where the queue thinks it is any more: a
+            // sync pass finds out where it went, a retry would not.
+            Error::Status {
+                status: 404 | 410, ..
+            } => Self::Reconcile,
             other if other.is_transient() => Self::Retry,
             Error::Imap(message) => classify_response(message),
             _ => Self::User,

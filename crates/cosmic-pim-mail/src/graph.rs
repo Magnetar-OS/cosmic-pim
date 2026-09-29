@@ -255,7 +255,7 @@ impl Session {
         let http = reqwest::blocking::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
 
         Ok(Self {
             http,
@@ -271,7 +271,11 @@ impl Session {
                 "graph {what} was refused (HTTP {status}): {detail}"
             ))
         } else {
-            Error::Graph(format!("graph {what} returned HTTP {status}: {detail}"))
+            Error::status(
+                "graph",
+                status,
+                format!("{what} returned HTTP {status}: {detail}"),
+            )
         }
     }
 
@@ -282,12 +286,12 @@ impl Session {
             .header("Authorization", &self.authorization)
             .header("Accept", "application/json")
             .send()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
 
         let status = response.status().as_u16();
         let body = response
             .text()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
         Ok((status, body))
     }
 
@@ -385,7 +389,7 @@ impl Session {
             .get(&url)
             .header("Authorization", &self.authorization)
             .send()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
 
         let status = response.status().as_u16();
         if status == 404 {
@@ -400,7 +404,7 @@ impl Session {
         response
             .bytes()
             .map(|bytes| Some(bytes.to_vec()))
-            .map_err(|why| Error::Graph(why.to_string()))
+            .map_err(|why| Error::transport("graph", &why))
     }
 
     /// Sets read and flag state on one message.
@@ -419,7 +423,7 @@ impl Session {
             .header("Content-Type", "application/json")
             .body(body.to_string())
             .send()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
@@ -445,12 +449,12 @@ impl Session {
             .header("Content-Type", "application/json")
             .body(body.to_string())
             .send()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
 
         let status = response.status().as_u16();
         let text = response
             .text()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
 
         if !(200..300).contains(&status) {
             return Err(Self::refuse(status, "move", &text));
@@ -530,7 +534,7 @@ impl Session {
             .delete(format!("{}/me/messages/{id}", self.base))
             .header("Authorization", &self.authorization)
             .send()
-            .map_err(|why| Error::Graph(why.to_string()))?;
+            .map_err(|why| Error::transport("graph", &why))?;
 
         let status = response.status().as_u16();
         // 404 means it is already gone, which is the goal state.
@@ -888,5 +892,31 @@ mod tests {
     fn a_password_is_refused_rather_than_sent() {
         let error = Session::connect(&Credentials::Password("hunter2".into())).unwrap_err();
         assert!(matches!(error, Error::Auth(_)), "got {error}");
+    }
+
+    #[test]
+    fn a_busy_server_is_retried_and_a_vanished_message_is_reconciled() {
+        // A writeback refused with 503 or 429 was classed as needing the
+        // user and blocked, so a read mark reverted on the next pull.
+        use crate::push::Failure;
+        for busy in [429, 500, 503] {
+            assert_eq!(
+                Failure::of(&Session::refuse(busy, "messages.modify", "")),
+                Failure::Retry,
+                "HTTP {busy} blocked a writeback instead of retrying it"
+            );
+        }
+        assert_eq!(
+            Failure::of(&Session::refuse(404, "messages.modify", "")),
+            Failure::Reconcile
+        );
+        assert_eq!(
+            Failure::of(&Session::refuse(401, "messages.modify", "")),
+            Failure::User
+        );
+        assert_eq!(
+            Failure::of(&crate::Error::transport("graph", &"operation timed out")),
+            Failure::Retry
+        );
     }
 }

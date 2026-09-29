@@ -98,6 +98,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   server declares `\Sent` (or names as such), not a mailbox literally called
   "Sent", which failed or created a stray folder on Gmail, Exchange, Courier
   and localised servers (audit F-31, Envelope F-04).
+- JMAP, Gmail and Graph writeback failures are classified by HTTP status:
+  timeouts, resets, 408, 429 and 5xx are retried with backoff, and 404/410 go
+  to a sync pass, instead of every failure blocking as "needs the user" and
+  read marks reverting (audit F-25, O-03).
 
 ### Changed
 
@@ -149,6 +153,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   server's deletion, or restore or re-send the local deletion (audit O-08).
 - `AccountStore::reload(&mut self) -> Result<()>`: re-read the accounts for a
   long-lived handle before showing or routing by them (Slate audit F-15).
+- `mail::Error::Transport { service, message }` and `mail::Error::Status {
+  service, status, message }` (with `Error::transport` / `Error::status`
+  constructors) for the HTTP mail engines.
+
 
 
 

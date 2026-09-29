@@ -50,6 +50,25 @@ pub enum Error {
     #[error("JMAP: {0}")]
     Jmap(String),
 
+    /// An HTTP mail API (JMAP, Gmail, Graph) could not be reached, or the
+    /// exchange broke off: no route, a timeout, a reset. Transient.
+    #[error("{service}: {message}")]
+    Transport {
+        service: &'static str,
+        message: String,
+    },
+
+    /// An HTTP mail API answered with a status other than success (401 and
+    /// 403 are [`Error::Auth`]). Kept as a number so a writeback can tell a
+    /// busy server (429, 5xx), which is retried, from a message that is gone
+    /// (404, 410), which a sync pass reconciles.
+    #[error("{service}: {message}")]
+    Status {
+        service: &'static str,
+        status: u16,
+        message: String,
+    },
+
     /// POP3 said no, or said something unusable.
     ///
     /// Its own variant rather than folded into [`Error::Imap`]: the two have
@@ -77,6 +96,23 @@ pub enum Error {
 }
 
 impl Error {
+    /// A failed HTTP exchange with `service`.
+    pub fn transport(service: &'static str, why: &impl std::fmt::Display) -> Self {
+        Self::Transport {
+            service,
+            message: why.to_string(),
+        }
+    }
+
+    /// A non-success HTTP answer from `service`.
+    pub fn status(service: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self::Status {
+            service,
+            status,
+            message: message.into(),
+        }
+    }
+
     /// Distinguishes a network hiccup from a server saying no.
     ///
     /// The writeback queue backs off on the first and stops on the second. Get
@@ -98,6 +134,8 @@ impl Error {
                     | std::io::ErrorKind::Interrupted
             ),
             Self::Imap(message) => is_transient_text(message),
+            Self::Transport { .. } => true,
+            Self::Status { status, .. } => matches!(status, 408 | 429 | 500..=599),
             // A renumbering needs a re-reconcile, not a retry; auth needs the
             // user. Neither is fixed by waiting.
             _ => false,

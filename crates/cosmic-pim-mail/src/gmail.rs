@@ -265,7 +265,7 @@ impl Session {
         let http = reqwest::blocking::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
-            .map_err(|why| Error::Gmail(why.to_string()))?;
+            .map_err(|why| Error::transport("gmail", &why))?;
 
         Ok(Self {
             http,
@@ -281,12 +281,12 @@ impl Session {
             .header("Authorization", &self.authorization)
             .header("Accept", "application/json")
             .send()
-            .map_err(|why| Error::Gmail(why.to_string()))?;
+            .map_err(|why| Error::transport("gmail", &why))?;
 
         let status = response.status().as_u16();
         let body = response
             .text()
-            .map_err(|why| Error::Gmail(why.to_string()))?;
+            .map_err(|why| Error::transport("gmail", &why))?;
         Ok((status, body))
     }
 
@@ -298,12 +298,12 @@ impl Session {
             .header("Content-Type", "application/json")
             .body(body.to_string())
             .send()
-            .map_err(|why| Error::Gmail(why.to_string()))?;
+            .map_err(|why| Error::transport("gmail", &why))?;
 
         let status = response.status().as_u16();
         let text = response
             .text()
-            .map_err(|why| Error::Gmail(why.to_string()))?;
+            .map_err(|why| Error::transport("gmail", &why))?;
         Ok((status, text))
     }
 
@@ -315,7 +315,11 @@ impl Session {
                 "gmail {what} was refused (HTTP {status}): {detail}"
             ))
         } else {
-            Error::Gmail(format!("gmail {what} returned HTTP {status}: {detail}"))
+            Error::status(
+                "gmail",
+                status,
+                format!("{what} returned HTTP {status}: {detail}"),
+            )
         }
     }
 
@@ -1251,5 +1255,31 @@ mod tests {
                 folder.wire_name
             );
         }
+    }
+
+    #[test]
+    fn a_busy_server_is_retried_and_a_vanished_message_is_reconciled() {
+        // A writeback refused with 503 or 429 was classed as needing the
+        // user and blocked, so a read mark reverted on the next pull.
+        use crate::push::Failure;
+        for busy in [429, 500, 503] {
+            assert_eq!(
+                Failure::of(&Session::refuse(busy, "messages.modify", "")),
+                Failure::Retry,
+                "HTTP {busy} blocked a writeback instead of retrying it"
+            );
+        }
+        assert_eq!(
+            Failure::of(&Session::refuse(404, "messages.modify", "")),
+            Failure::Reconcile
+        );
+        assert_eq!(
+            Failure::of(&Session::refuse(401, "messages.modify", "")),
+            Failure::User
+        );
+        assert_eq!(
+            Failure::of(&crate::Error::transport("gmail", &"operation timed out")),
+            Failure::Retry
+        );
     }
 }

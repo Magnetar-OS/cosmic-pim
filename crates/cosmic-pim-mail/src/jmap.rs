@@ -201,7 +201,7 @@ impl Session {
         let http = reqwest::blocking::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
-            .map_err(|why| Error::Jmap(why.to_string()))?;
+            .map_err(|why| Error::transport("jmap", &why))?;
 
         let authorization = match credentials {
             Credentials::OAuth2(token) => format!("Bearer {token}"),
@@ -219,12 +219,12 @@ impl Session {
             .header("Authorization", &authorization)
             .header("Accept", "application/json")
             .send()
-            .map_err(|why| Error::Jmap(format!("fetching the JMAP session: {why}")))?;
+            .map_err(|why| Error::transport("jmap", &format!("fetching the session: {why}")))?;
 
         let status = response.status().as_u16();
         let body = response
             .text()
-            .map_err(|why| Error::Jmap(why.to_string()))?;
+            .map_err(|why| Error::transport("jmap", &why))?;
 
         if status == 401 || status == 403 {
             return Err(Error::Auth(format!(
@@ -232,9 +232,11 @@ impl Session {
             )));
         }
         if !(200..300).contains(&status) {
-            return Err(Error::Jmap(format!(
-                "the JMAP session resource returned HTTP {status}"
-            )));
+            return Err(Error::status(
+                "jmap",
+                status,
+                format!("the session resource returned HTTP {status}"),
+            ));
         }
 
         let session: SessionResource = serde_json::from_str(&body)
@@ -309,12 +311,12 @@ impl Session {
             .header("Accept", "application/json")
             .body(body.to_string())
             .send()
-            .map_err(|why| Error::Jmap(why.to_string()))?;
+            .map_err(|why| Error::transport("jmap", &why))?;
 
         let status = response.status().as_u16();
         let text = response
             .text()
-            .map_err(|why| Error::Jmap(why.to_string()))?;
+            .map_err(|why| Error::transport("jmap", &why))?;
 
         if status == 401 || status == 403 {
             return Err(Error::Auth(format!(
@@ -322,10 +324,14 @@ impl Session {
             )));
         }
         if !(200..300).contains(&status) {
-            return Err(Error::Jmap(format!(
-                "JMAP request returned HTTP {status}: {}",
-                text.chars().take(200).collect::<String>()
-            )));
+            return Err(Error::status(
+                "jmap",
+                status,
+                format!(
+                    "request returned HTTP {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                ),
+            ));
         }
 
         let parsed: Value = serde_json::from_str(&text)
@@ -651,19 +657,21 @@ impl Session {
             .get(&url)
             .header("Authorization", &self.authorization)
             .send()
-            .map_err(|why| Error::Jmap(format!("downloading {blob_id}: {why}")))?;
+            .map_err(|why| Error::transport("jmap", &format!("downloading {blob_id}: {why}")))?;
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(Error::Jmap(format!(
-                "downloading {blob_id} returned HTTP {status}"
-            )));
+            return Err(Error::status(
+                "jmap",
+                status,
+                format!("downloading {blob_id} returned HTTP {status}"),
+            ));
         }
 
         response
             .bytes()
             .map(|bytes| bytes.to_vec())
-            .map_err(|why| Error::Jmap(why.to_string()))
+            .map_err(|why| Error::transport("jmap", &why))
     }
 
     /// Blocks until the account's `Email` state changes, or `timeout` passes.
@@ -703,7 +711,7 @@ impl Session {
         let http = reqwest::blocking::Client::builder()
             .timeout(timeout)
             .build()
-            .map_err(|why| Error::Jmap(why.to_string()))?;
+            .map_err(|why| Error::transport("jmap", &why))?;
 
         let response = http
             .get(&url)
@@ -763,14 +771,18 @@ impl Session {
             .header("Content-Type", "message/rfc822")
             .body(bytes.to_vec())
             .send()
-            .map_err(|why| Error::Jmap(format!("uploading a blob: {why}")))?;
+            .map_err(|why| Error::transport("jmap", &format!("uploading a blob: {why}")))?;
 
         let status = response.status().as_u16();
         let body = response
             .text()
-            .map_err(|why| Error::Jmap(why.to_string()))?;
+            .map_err(|why| Error::transport("jmap", &why))?;
         if !(200..300).contains(&status) {
-            return Err(Error::Jmap(format!("upload returned HTTP {status}")));
+            return Err(Error::status(
+                "jmap",
+                status,
+                format!("upload returned HTTP {status}"),
+            ));
         }
 
         serde_json::from_str::<Value>(&body)
