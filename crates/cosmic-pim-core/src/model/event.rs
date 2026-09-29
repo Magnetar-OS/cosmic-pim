@@ -3,7 +3,7 @@
 
 //! Events and their expanded occurrences.
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 
 /// How a `DTSTART`/`DTEND` was written in the source file.
@@ -151,9 +151,19 @@ impl Default for Recurrence {
 }
 
 impl Recurrence {
-    /// Renders to an `RRULE` value, or `None` when the event does not repeat.
+    /// Renders to an `RRULE` value for a series starting at `start`, or
+    /// `None` when the event does not repeat.
+    ///
+    /// "Ends on" a date means the last occurrence may fall anywhere on that
+    /// day *in the series' own terms*. `UNTIL` is written in DTSTART's value
+    /// type, as RFC 5545 section 3.3.10 requires: a DATE for an all-day
+    /// series, a floating time for a floating one, and for a zoned one the
+    /// last second of that day in the series' zone, in UTC. The end of the
+    /// *UTC* day, written for every series once, ran an Athens 01:00 daily
+    /// series a day long and ended a Los Angeles 18:00 one a day early
+    /// (Slate audit F-05).
     #[must_use]
-    pub fn to_rrule(self) -> Option<String> {
+    pub fn to_rrule(self, start: EventTime) -> Option<String> {
         let freq = self.freq.as_ical()?;
         let mut out = format!("FREQ={freq}");
         if self.interval > 1 {
@@ -162,20 +172,20 @@ impl Recurrence {
         match self.end {
             RepeatEnd::Never => {}
             RepeatEnd::After(n) => out.push_str(&format!(";COUNT={n}")),
-            RepeatEnd::On(d) => out.push_str(&format!(
-                ";UNTIL={:04}{:02}{:02}T235959Z",
-                d.year(),
-                d.month(),
-                d.day()
-            )),
+            RepeatEnd::On(d) => out.push_str(&format!(";UNTIL={}", until_value(d, start))),
         }
         Some(out)
     }
 
-    /// Parses an `RRULE` value, returning `None` if it uses parts the editor
-    /// cannot represent.
+    /// Parses an `RRULE` value of a series starting at `start`, returning
+    /// `None` if it uses parts the editor cannot represent.
+    ///
+    /// A UTC `UNTIL` is read as a date in the series' own zone — the inverse
+    /// of [`Self::to_rrule`] — rather than as its first eight characters,
+    /// which showed a Los Angeles series "ending 1 Oct" for a rule that ends
+    /// on 30 September there.
     #[must_use]
-    pub fn parse(rule: &str) -> Option<Self> {
+    pub fn parse(rule: &str, start: EventTime) -> Option<Self> {
         let mut freq = None;
         let mut interval = 1u16;
         let mut end = RepeatEnd::Never;
@@ -196,11 +206,7 @@ impl Recurrence {
                 }
                 "INTERVAL" => interval = value.trim().parse().ok()?,
                 "COUNT" => end = RepeatEnd::After(value.trim().parse().ok()?),
-                "UNTIL" => {
-                    let v = value.trim();
-                    let date = NaiveDate::parse_from_str(&v[..v.len().min(8)], "%Y%m%d").ok()?;
-                    end = RepeatEnd::On(date);
-                }
+                "UNTIL" => end = RepeatEnd::On(until_date(value.trim(), start)?),
                 // WKST only shifts week boundaries; harmless to drop for the
                 // frequencies we support.
                 "WKST" => {}
@@ -215,6 +221,39 @@ impl Recurrence {
             end,
         })
     }
+}
+
+/// The `UNTIL` value that ends a series starting at `start` on `last_day`.
+fn until_value(last_day: NaiveDate, start: EventTime) -> String {
+    match start {
+        EventTime::Date(_) => last_day.format("%Y%m%d").to_string(),
+        EventTime::Floating(_) => format!("{}T235959", last_day.format("%Y%m%d")),
+        EventTime::Zoned(_, tz) => {
+            let next_midnight = last_day
+                .succ_opt()
+                .unwrap_or(last_day)
+                .and_time(NaiveTime::MIN);
+            let last_second = resolve(next_midnight, tz) - chrono::Duration::seconds(1);
+            last_second.format("%Y%m%dT%H%M%SZ").to_string()
+        }
+    }
+}
+
+/// The day an `UNTIL` value falls on, for a series starting at `start`.
+fn until_date(value: &str, start: EventTime) -> Option<NaiveDate> {
+    let date = NaiveDate::parse_from_str(value.get(..8)?, "%Y%m%d").ok()?;
+    let Some(utc) = value.strip_suffix(['Z', 'z']) else {
+        // A DATE, or a floating time: already on the series' own calendar.
+        return Some(date);
+    };
+    let instant = NaiveDateTime::parse_from_str(utc, "%Y%m%dT%H%M%S").ok()?;
+    Some(match start {
+        EventTime::Zoned(_, tz) => Utc
+            .from_utc_datetime(&instant)
+            .with_timezone(&tz)
+            .date_naive(),
+        EventTime::Date(_) | EventTime::Floating(_) => instant.date(),
+    })
 }
 
 /// One `ATTENDEE` or `ORGANIZER` on an event.
@@ -381,7 +420,7 @@ impl Event {
     pub fn recurrence(&self) -> Option<Recurrence> {
         match self.rrule.as_deref() {
             None => Some(Recurrence::default()),
-            Some(rule) => Recurrence::parse(rule),
+            Some(rule) => Recurrence::parse(rule, self.start),
         }
     }
 
@@ -481,29 +520,45 @@ mod tests {
                 end: RepeatEnd::On(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
             },
         ];
-        for c in cases {
-            let s = c.to_rrule().expect("repeats");
-            assert_eq!(Recurrence::parse(&s), Some(c), "roundtrip failed for {s}");
+        let athens = EventTime::Zoned(dt(2026, 8, 4, 1, 0), chrono_tz::Europe::Athens);
+        let all_day = EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap());
+        for start in [athens, all_day, EventTime::Floating(dt(2026, 8, 4, 9, 0))] {
+            for c in cases {
+                let s = c.to_rrule(start).expect("repeats");
+                assert_eq!(
+                    Recurrence::parse(&s, start),
+                    Some(c),
+                    "roundtrip failed for {s}"
+                );
+            }
         }
     }
 
     #[test]
     fn never_has_no_rrule() {
-        assert_eq!(Recurrence::default().to_rrule(), None);
+        let start = EventTime::Floating(dt(2026, 8, 4, 9, 0));
+        assert_eq!(Recurrence::default().to_rrule(start), None);
     }
 
     #[test]
     fn complex_rules_are_rejected_not_simplified() {
+        let start = EventTime::Floating(dt(2026, 8, 4, 9, 0));
         // The point: we must NOT return Some(Weekly) here and drop BYDAY on save.
-        assert_eq!(Recurrence::parse("FREQ=WEEKLY;BYDAY=MO,WE,FR"), None);
-        assert_eq!(Recurrence::parse("FREQ=MONTHLY;BYSETPOS=-1;BYDAY=FR"), None);
-        assert_eq!(Recurrence::parse("FREQ=HOURLY"), None);
+        assert_eq!(Recurrence::parse("FREQ=WEEKLY;BYDAY=MO,WE,FR", start), None);
+        assert_eq!(
+            Recurrence::parse("FREQ=MONTHLY;BYSETPOS=-1;BYDAY=FR", start),
+            None
+        );
+        assert_eq!(Recurrence::parse("FREQ=HOURLY", start), None);
     }
 
     #[test]
     fn wkst_is_tolerated() {
         assert_eq!(
-            Recurrence::parse("FREQ=WEEKLY;WKST=MO"),
+            Recurrence::parse(
+                "FREQ=WEEKLY;WKST=MO",
+                EventTime::Floating(dt(2026, 8, 4, 9, 0))
+            ),
             Some(Recurrence {
                 freq: Freq::Weekly,
                 interval: 1,
@@ -567,5 +622,51 @@ mod tests {
             ..o
         };
         assert!(!o2.covers(NaiveDate::from_ymd_opt(2026, 8, 5).unwrap()));
+    }
+
+    fn ending(on: NaiveDate) -> Recurrence {
+        Recurrence {
+            freq: Freq::Daily,
+            interval: 1,
+            end: RepeatEnd::On(on),
+        }
+    }
+
+    #[test]
+    fn a_series_ends_at_the_end_of_its_own_day_not_the_utc_one() {
+        let last = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        // Athens is UTC+3 in September: the last second of 30 Sep is 20:59:59Z.
+        let athens = EventTime::Zoned(dt(2026, 8, 4, 1, 0), chrono_tz::Europe::Athens);
+        assert_eq!(
+            ending(last).to_rrule(athens).as_deref(),
+            Some("FREQ=DAILY;UNTIL=20260930T205959Z")
+        );
+        // Los Angeles is UTC-7: 30 Sep ends at 06:59:59Z on 1 Oct.
+        let la = EventTime::Zoned(dt(2026, 8, 4, 18, 0), chrono_tz::America::Los_Angeles);
+        assert_eq!(
+            ending(last).to_rrule(la).as_deref(),
+            Some("FREQ=DAILY;UNTIL=20261001T065959Z")
+        );
+    }
+
+    #[test]
+    fn an_all_day_series_ends_with_a_date() {
+        // RFC 5545: UNTIL has DTSTART's value type.
+        let last = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let start = EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap());
+        assert_eq!(
+            ending(last).to_rrule(start).as_deref(),
+            Some("FREQ=DAILY;UNTIL=20260930")
+        );
+    }
+
+    #[test]
+    fn a_utc_until_is_read_as_a_day_in_the_series_zone() {
+        // What Google and Thunderbird write for "ends 30 Sep" in Los Angeles.
+        let la = EventTime::Zoned(dt(2026, 8, 4, 18, 0), chrono_tz::America::Los_Angeles);
+        assert_eq!(
+            Recurrence::parse("FREQ=DAILY;UNTIL=20261001T065959Z", la),
+            Some(ending(NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()))
+        );
     }
 }

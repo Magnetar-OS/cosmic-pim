@@ -105,6 +105,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - An all-day event on a daylight-saving fall-back day no longer spans two
   days, and a timed event across a transition ends at its own end time on the
   grid (Slate audit F-18).
+- A series that "ends on" a date gets `UNTIL` at the end of that day in the
+  series' own zone (DATE for all-day series, floating for floating ones)
+  instead of the end of the UTC day, and a UTC `UNTIL` is read back as a date
+  in the series' zone (Slate audit F-05).
 
 ### Changed
 
@@ -141,6 +145,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `sync::MailReport::sent` is `Vec<String>`: the outbox ids that left this
   pass (was a count), so an app can settle per-message follow-ups such as
   marking the answered message.
+- `model::Recurrence::to_rrule(self, start: EventTime)` and
+  `Recurrence::parse(rule, start: EventTime)` take the series' DTSTART.
+  `Event::recurrence()` is unchanged.
 
 ### Added
 
