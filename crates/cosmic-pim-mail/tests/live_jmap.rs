@@ -500,6 +500,18 @@ fn respond(name: &str, args: &Value, state: &mut ServerState) -> (String, Value)
                         let property = property.as_str();
                         match property {
                             "keywords" => email.keywords = value.clone(),
+                            // RFC 8620 patch form for one keyword: true to set,
+                            // null to remove, every other keyword untouched.
+                            path if path.starts_with("keywords/") => {
+                                let keyword = path.trim_start_matches("keywords/").to_owned();
+                                if let Some(map) = email.keywords.as_object_mut() {
+                                    if value.is_null() {
+                                        map.remove(&keyword);
+                                    } else {
+                                        map.insert(keyword, value.clone());
+                                    }
+                                }
+                            }
                             // Patch form: `mailboxIds/<id>` = true, or null to
                             // remove. A real server accepts both this and a
                             // whole-set replacement.
@@ -1061,4 +1073,42 @@ fn a_server_that_clamps_the_query_limit_does_not_cost_the_unlisted_messages() {
         "messages outside the server's shortened window were deleted"
     );
     assert_eq!(store.state().expect("state").entries.len(), 3);
+}
+
+#[test]
+fn marking_a_message_read_keeps_the_keywords_this_client_does_not_model() {
+    use cosmic_pim_mail::model::Flags;
+    use cosmic_pim_mail::push::{PushOp, PushQueue};
+
+    let server = serve(vec![Email::new(
+        "M1",
+        RAW_ONE,
+        json!({ "$junk": true, "$MDNSent": true }),
+    )]);
+    let (dir, mut store) = maildir();
+    let mut state = jmap::state(dir.path());
+    sync(&server, &mut store, &mut state);
+
+    let uid = state.uid_of("M1").expect("a local uid");
+    store
+        .enqueue(PushOp::SetFlags {
+            uid,
+            flags: Flags {
+                seen: true,
+                ..Default::default()
+            },
+        })
+        .expect("enqueue");
+    sync(&server, &mut store, &mut state);
+
+    let held = server.inner.lock().expect("state");
+    let email = held.emails.iter().find(|e| e.id == "M1").expect("M1");
+    assert_eq!(email.keywords.get("$seen"), Some(&json!(true)));
+    assert_eq!(
+        email.keywords.get("$junk"),
+        Some(&json!(true)),
+        "marking read stripped a keyword it does not model: {}",
+        email.keywords
+    );
+    assert_eq!(email.keywords.get("$MDNSent"), Some(&json!(true)));
 }

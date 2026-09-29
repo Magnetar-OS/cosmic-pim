@@ -59,6 +59,39 @@ impl Mailbox {
     }
 }
 
+/// Which [`Flags`] bits a protocol reports. See [`Flags::reported_over`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Reported {
+    pub seen: bool,
+    pub answered: bool,
+    pub flagged: bool,
+    pub draft: bool,
+    pub passed: bool,
+    pub keywords: bool,
+}
+
+impl Reported {
+    /// Read, starred and draft: all Gmail labels and Graph properties say.
+    pub const READ_STAR_DRAFT: Self = Self {
+        seen: true,
+        answered: false,
+        flagged: true,
+        draft: true,
+        passed: false,
+        keywords: false,
+    };
+    /// JMAP's system keywords, without custom ones.
+    pub const SYSTEM: Self = Self {
+        seen: true,
+        answered: true,
+        flagged: true,
+        draft: true,
+        passed: true,
+        keywords: false,
+    };
+}
+
 /// The IMAP system flags (RFC 3501 §2.3.2) plus maildir's `P` (passed) —
 /// and the custom keywords, as bits over the mailbox's keyword table.
 ///
@@ -111,6 +144,35 @@ fn keywords_empty(keywords: &u32) -> bool {
 pub const KEYWORD_SLOTS: u8 = 26;
 
 impl Flags {
+    /// `server`'s view of the bits a protocol actually reports, with every
+    /// other bit kept from `held`.
+    ///
+    /// Gmail and Graph report read, starred and draft and nothing else; JMAP
+    /// reports the system keywords but no custom ones this store interns.
+    /// Taking their flags wholesale on every pull zeroed what they do not
+    /// carry — a reply's answered mark, a forwarded mark, the user's own
+    /// keywords — every time anything else about the message changed (audit
+    /// F-26).
+    #[must_use]
+    pub fn reported_over(server: Self, held: Self, reported: Reported) -> Self {
+        let pick = |carried: bool, from_server: bool, from_held: bool| {
+            if carried { from_server } else { from_held }
+        };
+        Self {
+            seen: pick(reported.seen, server.seen, held.seen),
+            answered: pick(reported.answered, server.answered, held.answered),
+            flagged: pick(reported.flagged, server.flagged, held.flagged),
+            draft: pick(reported.draft, server.draft, held.draft),
+            deleted: held.deleted,
+            passed: pick(reported.passed, server.passed, held.passed),
+            keywords: if reported.keywords {
+                server.keywords
+            } else {
+                held.keywords
+            },
+        }
+    }
+
     /// Parses a maildir info suffix — the part after `:2,` — ignoring anything
     /// outside the standard vocabulary.
     ///

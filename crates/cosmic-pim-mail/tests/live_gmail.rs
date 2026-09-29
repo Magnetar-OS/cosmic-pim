@@ -731,3 +731,30 @@ fn a_refused_send_stays_queued_rather_than_vanishing() {
     assert_eq!(outbox.count(), 1, "a refused send vanished from the queue");
     assert!(server.submitted().is_empty());
 }
+
+#[test]
+fn a_label_change_keeps_the_marks_gmail_does_not_carry() {
+    // Gmail has no answered or forwarded label. Taking its flags wholesale
+    // wiped a reply's answered mark whenever the message was read elsewhere.
+    let server = serve(vec![Message::new("M1", &["INBOX", "UNREAD"], RAW_ONE)]);
+    let (dir, mut store) = maildir();
+    let mut state = gmail::state(dir.path());
+    sync(&server, "inbox", &mut store, &mut state);
+    let uid = state.uid_of("M1").expect("uid");
+    store
+        .set_flags(
+            uid,
+            cosmic_pim_mail::Flags {
+                answered: true,
+                ..store.state().expect("state").entries[&uid]
+            },
+        )
+        .expect("mark answered");
+
+    server.relabel("M1", &[], &["UNREAD"]);
+    sync(&server, "inbox", &mut store, &mut state);
+
+    let flags = store.state().expect("state").entries[&uid];
+    assert!(flags.seen);
+    assert!(flags.answered, "the answered mark was wiped by a pull");
+}

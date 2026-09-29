@@ -156,6 +156,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   parameters survive (`BDAY;X-APPLE-OMIT-YEAR` no longer turns a year-less
   birthday into 1604), and an Apple-grouped `itemN.ADR` is edited in place
   instead of duplicated on every save (audit F-16).
+- JMAP flag writes patch only the five system keywords, so marking a message
+  read no longer strips `$junk`, `$MDNSent` or the user's labels; JMAP, Gmail
+  and Graph pulls no longer zero the flag bits their protocol does not carry
+  (answered, forwarded, custom keywords) (audit F-26).
 
 ### Changed
 
@@ -235,6 +239,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   re-exports. A contacts or calendar consumer that sets `default-features =
   false` no longer links the mail and OpenPGP stack (pgp, rsa, lettre, imap,
   scraper) (audit O-02, Circle C-09).
+- `mail::model::Flags::reported_over(server, held, reported: Reported) ->
+  Flags` and `mail::model::Reported` (`READ_STAR_DRAFT`, `SYSTEM`).
+
 
 
 

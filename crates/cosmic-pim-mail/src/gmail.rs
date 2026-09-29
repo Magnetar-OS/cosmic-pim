@@ -821,10 +821,16 @@ fn bootstrap(
         present.push(uid);
 
         match known.entries.get(&uid) {
-            Some(held) if *held == message.flags() => {}
-            Some(_) => {
-                store.set_flags(uid, message.flags())?;
-                outcome.reflagged += 1;
+            Some(held) => {
+                let flags = Flags::reported_over(
+                    message.flags(),
+                    *held,
+                    crate::model::Reported::READ_STAR_DRAFT,
+                );
+                if *held != flags {
+                    store.set_flags(uid, flags)?;
+                    outcome.reflagged += 1;
+                }
             }
             None => {
                 let Some(raw) = session.raw(id)? else {
@@ -929,8 +935,14 @@ fn apply_history(
                 outcome.fetched += 1;
             }
             (true, Some(uid)) => {
-                if known.entries.get(&uid) != Some(&message.flags()) {
-                    store.set_flags(uid, message.flags())?;
+                let held = known.entries.get(&uid).copied();
+                let flags = Flags::reported_over(
+                    message.flags(),
+                    held.unwrap_or_default(),
+                    crate::model::Reported::READ_STAR_DRAFT,
+                );
+                if held != Some(flags) {
+                    store.set_flags(uid, flags)?;
                     outcome.reflagged += 1;
                 }
             }

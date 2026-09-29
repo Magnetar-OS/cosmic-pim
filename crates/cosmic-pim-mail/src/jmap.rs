@@ -844,17 +844,20 @@ impl Session {
             })
     }
 
-    /// Replaces the keywords on one email.
+    /// Sets the system keywords on one email to `flags`.
     ///
-    /// The whole set rather than a patch: JMAP accepts both, and sending the
-    /// set the client believes in makes the operation idempotent — a retry
-    /// after an ambiguous failure converges instead of toggling.
+    /// As a patch of exactly the five keywords this model carries
+    /// (`keywords/$seen: true` or `null`), never the whole `keywords` object:
+    /// replacing the object stripped `$junk`, `$notjunk`, `$MDNSent` and the
+    /// user's own labels whenever a message was marked read (audit F-26).
+    /// Still idempotent — each keyword is set to a value, not toggled — so a
+    /// retry after an ambiguous failure converges.
     pub fn set_keywords(&self, id: &str, flags: Flags) -> Result<()> {
         let responses = self.request(json!([[
             "Email/set",
             {
                 "accountId": self.account_id,
-                "update": { id: { "keywords": keywords_of(flags) } }
+                "update": { id: keyword_patch(flags) }
             },
             "0"
         ]]))?;
@@ -946,7 +949,27 @@ fn flags_of(keywords: &Value) -> Flags {
     }
 }
 
+/// Our flags → a JMAP patch of exactly the system keywords: `true` to set
+/// one, `null` to remove it, and nothing else touched.
+fn keyword_patch(flags: Flags) -> Value {
+    let mut patch = serde_json::Map::new();
+    for (keyword, on) in [
+        ("$seen", flags.seen),
+        ("$answered", flags.answered),
+        ("$flagged", flags.flagged),
+        ("$draft", flags.draft),
+        ("$forwarded", flags.passed),
+    ] {
+        patch.insert(
+            format!("keywords/{keyword}"),
+            if on { json!(true) } else { Value::Null },
+        );
+    }
+    Value::Object(patch)
+}
+
 /// Our flags → JMAP keywords, as a set map.
+#[cfg(test)]
 fn keywords_of(flags: Flags) -> Value {
     let mut map = serde_json::Map::new();
     if flags.seen {
@@ -1114,8 +1137,14 @@ fn sync_incremental(
                     // thing that can have is the flags — the bytes of a message
                     // are immutable — so this must not re-download it.
                     (true, Some(uid)) => {
-                        if known.entries.get(&uid) != Some(&email.keywords) {
-                            store.set_flags(uid, email.keywords)?;
+                        let held = known.entries.get(&uid).copied();
+                        let flags = Flags::reported_over(
+                            email.keywords,
+                            held.unwrap_or_default(),
+                            crate::model::Reported::SYSTEM,
+                        );
+                        if held != Some(flags) {
+                            store.set_flags(uid, flags)?;
                             outcome.reflagged += 1;
                         }
                     }
@@ -1194,8 +1223,10 @@ fn sync_full(
                 // flags, and re-downloading a message to learn that would make
                 // the cheap path the expensive one.
                 Some(held) => {
-                    if *held != email.keywords {
-                        store.set_flags(uid, email.keywords)?;
+                    let flags =
+                        Flags::reported_over(email.keywords, *held, crate::model::Reported::SYSTEM);
+                    if *held != flags {
+                        store.set_flags(uid, flags)?;
                         outcome.reflagged += 1;
                     }
                 }
@@ -1428,5 +1459,22 @@ mod tests {
         held.save(dir.path()).unwrap();
 
         assert_eq!(state(dir.path()).uid_of("M1"), Some(uid));
+    }
+
+    #[test]
+    fn a_flag_write_touches_only_the_system_keywords() {
+        // Marking read must not strip $junk, $MDNSent or the user's labels.
+        let patch = keyword_patch(Flags {
+            seen: true,
+            ..Flags::default()
+        });
+        let object = patch.as_object().unwrap();
+        assert!(
+            !object.contains_key("keywords"),
+            "the whole keyword set was replaced"
+        );
+        assert_eq!(object.get("keywords/$seen"), Some(&json!(true)));
+        assert_eq!(object.get("keywords/$flagged"), Some(&Value::Null));
+        assert!(object.keys().all(|key| key.starts_with("keywords/$")));
     }
 }

@@ -666,8 +666,14 @@ fn walk(
 
             match state.uid_of(id) {
                 Some(uid) => {
-                    if known.entries.get(&uid) != Some(&message.flags) {
-                        store.set_flags(uid, message.flags)?;
+                    let held = known.entries.get(&uid).copied();
+                    let flags = Flags::reported_over(
+                        message.flags,
+                        held.unwrap_or_default(),
+                        crate::model::Reported::READ_STAR_DRAFT,
+                    );
+                    if held != Some(flags) {
+                        store.set_flags(uid, flags)?;
                         outcome.reflagged += 1;
                     }
                 }
