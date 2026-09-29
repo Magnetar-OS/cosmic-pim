@@ -713,31 +713,84 @@ fn apply_request(collection: &Path, ics: &str, itip: &Itip, me: &str) -> Result<
     }
 }
 
+/// The participation states a REPLY may set (RFC 5545 section 3.2.12, for
+/// VEVENT). Anything else is refused rather than written into a parameter,
+/// where `ACCEPTED;ROLE=CHAIR` would have added a parameter of its own.
+const PARTSTATS: [&str; 5] = [
+    "ACCEPTED",
+    "DECLINED",
+    "TENTATIVE",
+    "DELEGATED",
+    "NEEDS-ACTION",
+];
+
+/// Applies an attendee's REPLY to an event this account organizes.
+///
+/// RFC 5546 section 3.2.3: a REPLY carries exactly one ATTENDEE, the person
+/// answering, and a RECURRENCE-ID when the answer is for one instance. So it
+/// patches that one attendee, only in that instance — materialising an
+/// override for it when the file has none — and ignores a REPLY older than
+/// the stored revision. Patching every ATTENDEE it carried, in the master
+/// and every override, let a one-instance "yes" rewrite the whole series
+/// and a REPLY carrying other people speak for them (audit F-37).
 fn apply_reply(collection: &Path, itip: &Itip) -> Result<Outcome> {
-    if itip.attendees.is_empty() {
+    let [attendee] = itip.attendees.as_slice() else {
         return Ok(Outcome::Ignored);
-    }
+    };
+    let Some(partstat) = attendee
+        .partstat
+        .as_deref()
+        .filter(|p| PARTSTATS.contains(p))
+    else {
+        return Ok(Outcome::Ignored);
+    };
     let Some(path) = find_by_uid(collection, &itip.uid) else {
         return Ok(Outcome::NoMatch);
     };
     let stored = std::fs::read_to_string(&path)
         .map_err(|why| Error::internal(format!("reading {}: {why}", path.display())))?;
+    if itip.sequence < stored_sequence(&stored) {
+        return Ok(Outcome::Stale);
+    }
+
+    let stored = match &itip.recurrence_id {
+        Some(rid)
+            if !split_components(&stored)
+                .1
+                .iter()
+                .any(|c| component_has_rid(c, rid)) =>
+        {
+            match with_override_for(&stored, &itip.uid, rid) {
+                Some(text) => text,
+                None => return Ok(Outcome::NoMatch),
+            }
+        }
+        _ => stored,
+    };
 
     // Deliberately NOT gated on attendee-is-me: a REPLY's attendee is the
     // *other* person answering our invitation.
-    let mut text = stored;
+    let (prelude, components, trailer) = split_components(&stored);
+    let mut text = prelude;
     let mut updated = 0usize;
-    for attendee in &itip.attendees {
-        let Some(partstat) = attendee.partstat.as_deref() else {
-            continue;
-        };
-        if let Some(patched) =
-            crate::patch::patch_attendee_partstat(&text, &attendee.email, partstat)
+    for component in components {
+        let in_scope = component.starts_with("BEGIN:VEVENT")
+            && match &itip.recurrence_id {
+                Some(rid) => component_has_rid(&component, rid),
+                None => is_master(&component),
+            };
+        match in_scope
+            .then(|| crate::patch::patch_attendee_partstat(&component, &attendee.email, partstat))
+            .flatten()
         {
-            text = patched;
-            updated += 1;
+            Some(patched) => {
+                text.push_str(&patched);
+                updated += 1;
+            }
+            None => text.push_str(&component),
         }
     }
+    text.push_str(&trailer);
 
     if updated > 0 {
         atomic::write(&path, &text, None)
@@ -745,7 +798,64 @@ fn apply_reply(collection: &Path, itip: &Itip) -> Result<Outcome> {
     }
     Ok(Outcome::ReplyApplied {
         file: file_name_of(&path),
-        updated,
+        updated: usize::from(updated > 0),
+    })
+}
+
+/// `stored` with an override for the instance `rid` added: a copy of the
+/// master at that instance, without the rule. `None` when the file has no
+/// master to copy or `rid` cannot be read.
+fn with_override_for(stored: &str, uid: &str, rid: &str) -> Option<String> {
+    use cosmic_pim_core::model::EventTime;
+
+    let master = cosmic_pim_core::ical::parse_ics(stored, "", "")
+        .into_iter()
+        .find(|event| event.uid == uid && event.recurrence_id.is_none())?;
+    let at = parse_rid(rid, master.start)?;
+    let own = |t: EventTime| match t {
+        EventTime::Date(d) => d.and_time(chrono::NaiveTime::MIN),
+        EventTime::Floating(dt) | EventTime::Zoned(dt, _) => dt,
+    };
+    let length = own(master.end) - own(master.start);
+
+    let mut instance = master.clone();
+    instance.recurrence_id = Some(at);
+    instance.start = at;
+    instance.end = master.end.with_naive(own(at) + length);
+    instance.rrule = None;
+    instance.exdates.clear();
+    instance
+        .other
+        .retain(|line| !line.to_ascii_uppercase().starts_with("RDATE"));
+    Some(cosmic_pim_core::ical::upsert_vevent(stored, &instance))
+}
+
+/// A canonical `value[;TZID=zone]` key as a time, in the master's value type
+/// where the key does not name its own zone.
+fn parse_rid(
+    rid: &str,
+    master_start: cosmic_pim_core::model::EventTime,
+) -> Option<cosmic_pim_core::model::EventTime> {
+    use cosmic_pim_core::model::EventTime;
+    let (value, zone) = match rid.split_once(";TZID=") {
+        Some((value, zone)) => (value, Some(zone)),
+        None => (rid, None),
+    };
+    if value.len() == 8 {
+        return chrono::NaiveDate::parse_from_str(value, "%Y%m%d")
+            .ok()
+            .map(EventTime::Date);
+    }
+    let (naive, utc) = match value.strip_suffix('Z') {
+        Some(stripped) => (stripped, true),
+        None => (value, false),
+    };
+    let time = chrono::NaiveDateTime::parse_from_str(naive, "%Y%m%dT%H%M%S").ok()?;
+    Some(match (utc, zone, master_start) {
+        (true, _, _) => EventTime::Zoned(time, chrono_tz::UTC),
+        (false, Some(zone), _) => EventTime::Zoned(time, zone.parse().ok()?),
+        (false, None, EventTime::Zoned(_, tz)) => EventTime::Zoned(time, tz),
+        (false, None, _) => EventTime::Floating(time),
     })
 }
 
@@ -776,8 +886,15 @@ fn apply_cancel(collection: &Path, itip: &Itip, me: &str) -> Result<Outcome> {
             // only holds the master. Every other occurrence stands — this is
             // the branch that stops "the organizer cancelled one Tuesday"
             // from deleting the weekly series.
-            let cancelled = cancelled_override(itip, rid, terminator_of(&stored));
-            let text = merge_override(&stored, &cancelled, rid);
+            let Some(text) = cancel_instance(&stored, rid) else {
+                // Only that instance's override was stored: nothing is left.
+                std::fs::remove_file(&path).map_err(|why| {
+                    Error::internal(format!("removing {}: {why}", path.display()))
+                })?;
+                return Ok(Outcome::Cancelled {
+                    file: file_name_of(&path),
+                });
+            };
             atomic::write(&path, &text, None)
                 .map_err(|why| Error::internal(format!("writing {}: {why}", path.display())))?;
             Ok(Outcome::InstanceCancelled {
@@ -796,7 +913,24 @@ fn apply_cancel(collection: &Path, itip: &Itip, me: &str) -> Result<Outcome> {
 /// one component is swapped; the rest are reassembled untouched.
 fn merge_override(stored: &str, incoming: &str, rid: &str) -> String {
     let override_block = first_vevent(incoming);
+    let (prelude, components, trailer) = split_components(stored);
 
+    let mut out = String::with_capacity(stored.len() + override_block.len());
+    out.push_str(&prelude);
+    for component in &components {
+        if !component_has_rid(component, rid) {
+            out.push_str(component);
+        }
+    }
+    out.push_str(&override_block);
+    out.push_str(&trailer);
+    out
+}
+
+/// A document taken apart into its prelude (through `BEGIN:VCALENDAR` and
+/// any top-level properties), its components as the source's own bytes, and
+/// its trailer (`END:VCALENDAR` onwards).
+fn split_components(stored: &str) -> (String, Vec<String>, String) {
     let mut prelude = String::new();
     let mut components: Vec<String> = Vec::new();
     let mut trailer = String::new();
@@ -832,20 +966,69 @@ fn merge_override(stored: &str, incoming: &str, rid: &str) -> String {
 
         match &mut current {
             Some(block) => block.push_str(line.raw()),
+            None if depth == 0 => trailer.push_str(line.raw()),
             None => prelude.push_str(line.raw()),
         }
     }
+    (prelude, components, trailer)
+}
 
-    let mut out = String::with_capacity(stored.len() + override_block.len());
+/// Whether a component is a VEVENT with no RECURRENCE-ID — a series master
+/// or a one-off event.
+fn is_master(component: &str) -> bool {
+    component.starts_with("BEGIN:VEVENT") && !has_top_level(component, "RECURRENCE-ID")
+}
+
+/// Whether a component carries `property` at its own top level.
+fn has_top_level(component: &str, property: &str) -> bool {
+    let mut depth = 0usize;
+    logical_lines(component).iter().any(|line| {
+        if line.begins().is_some() {
+            depth += 1;
+            false
+        } else if line.ends().is_some() {
+            depth = depth.saturating_sub(1);
+            false
+        } else {
+            depth == 1 && line.name() == property
+        }
+    })
+}
+
+/// Cancels one instance of a stored series: an EXDATE on the master, and the
+/// instance's override, if it had one, removed.
+///
+/// An override carrying `STATUS:CANCELLED`, which this once wrote instead,
+/// had no DTSTART, so the parser dropped it and the instance stayed on the
+/// grid; one the organizer had moved snapped back to its original time
+/// (audit F-36). An exclusion is what every client reads the same way.
+/// `None` when nothing of the series would remain.
+fn cancel_instance(stored: &str, rid: &str) -> Option<String> {
+    let (prelude, components, trailer) = split_components(stored);
+    let terminator = terminator_of(stored);
+    let exdate = recurrence_id_line(rid).replacen("RECURRENCE-ID", "EXDATE", 1);
+
+    let mut out = String::with_capacity(stored.len() + exdate.len() + 2);
     out.push_str(&prelude);
+    let mut kept = 0usize;
     for component in &components {
-        if !component_has_rid(component, rid) {
+        if component_has_rid(component, rid) {
+            continue;
+        }
+        if is_master(component) {
+            let end = component.rfind("END:VEVENT").unwrap_or(component.len());
+            out.push_str(&component[..end]);
+            fold(&exdate, terminator, &mut out);
+            out.push_str(&component[end..]);
+        } else {
             out.push_str(component);
         }
+        if component.starts_with("BEGIN:VEVENT") {
+            kept += 1;
+        }
     }
-    out.push_str(&override_block);
     out.push_str(&trailer);
-    out
+    (kept > 0).then_some(out)
 }
 
 /// Whether a single component's text carries `rid` at its own top level.
@@ -891,31 +1074,6 @@ fn first_vevent(ics: &str) -> String {
             }
         }
     }
-    out
-}
-
-/// A minimal cancelled override, built from what the CANCEL itself carries.
-///
-/// The one place this module writes lines of its own — and every line of it
-/// is data the CANCEL supplied or a required timestamp.
-fn cancelled_override(itip: &Itip, rid: &str, terminator: &str) -> String {
-    let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let mut out = String::new();
-    fold("BEGIN:VEVENT", terminator, &mut out);
-    fold(
-        &format!("UID:{}", escape_text(&itip.uid)),
-        terminator,
-        &mut out,
-    );
-    fold(&recurrence_id_line(rid), terminator, &mut out);
-    fold(
-        &format!("SEQUENCE:{}", itip.sequence.max(0)),
-        terminator,
-        &mut out,
-    );
-    fold(&format!("DTSTAMP:{dtstamp}"), terminator, &mut out);
-    fold("STATUS:CANCELLED", terminator, &mut out);
-    fold("END:VEVENT", terminator, &mut out);
     out
 }
 
@@ -1868,12 +2026,27 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         assert!(find_by_uid(dir.path(), "meet-1@org.example").is_none());
     }
 
+    /// The invitation as a weekly series.
+    fn weekly(sequence: i64) -> String {
+        request(sequence).replace(
+            "SUMMARY:Planning\r\n",
+            "SUMMARY:Planning\r\nRRULE:FREQ=WEEKLY\r\n",
+        )
+    }
+
+    fn stored_events(dir: &std::path::Path) -> Vec<cosmic_pim_core::model::Event> {
+        let file = find_by_uid(dir, "meet-1@org.example").expect("the series is gone");
+        cosmic_pim_core::ical::parse_ics(&std::fs::read_to_string(file).unwrap(), "c", "f.ics")
+    }
+
     #[test]
-    fn an_instance_cancel_keeps_the_series() {
+    fn an_instance_cancel_keeps_the_series_and_hides_that_instance() {
         // THE bug this module exists to not have: the organizer cancels one
-        // Tuesday and the whole weekly series vanishes.
+        // Tuesday and the whole weekly series vanishes. And its twin: the
+        // instance must actually disappear, which a stub override without a
+        // DTSTART never made it do.
         let dir = collection();
-        apply(dir.path(), &request(1), "ada@example.com", None).expect("request");
+        apply(dir.path(), &weekly(1), "ada@example.com", None).expect("request");
 
         let outcome = apply(
             dir.path(),
@@ -1884,13 +2057,48 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         .expect("cancel");
 
         assert!(matches!(outcome, Outcome::InstanceCancelled { .. }));
-        let file = find_by_uid(dir.path(), "meet-1@org.example")
-            .expect("the series was deleted by a single-instance cancel");
-        let stored = std::fs::read_to_string(file).expect("read");
-        assert!(stored.contains("SUMMARY:Planning"), "the master is gone");
-        assert!(stored.contains("STATUS:CANCELLED"));
-        assert!(stored.contains("RECURRENCE-ID;TZID=Europe/Athens:20270112T100000"));
-        assert_eq!(stored.matches("BEGIN:VEVENT").count(), 2);
+        let events = stored_events(dir.path());
+        assert_eq!(events.len(), 1, "a stub override was left: {events:?}");
+        assert_eq!(events[0].summary, "Planning", "the master is gone");
+        let cancelled = chrono::NaiveDate::from_ymd_opt(2027, 1, 12)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        assert_eq!(
+            events[0].exdates,
+            vec![cancelled],
+            "the instance still shows"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_moved_instance_removes_its_override_too() {
+        let dir = collection();
+        apply(dir.path(), &weekly(1), "ada@example.com", None).expect("request");
+        let moved = request(2)
+            .replace(
+                "SEQUENCE:2\r\n",
+                "SEQUENCE:2\r\nRECURRENCE-ID;TZID=Europe/Athens:20270112T100000\r\n",
+            )
+            .replace("20270105T100000", "20270113T150000")
+            .replace("20270105T110000", "20270113T160000");
+        apply(dir.path(), &moved, "ada@example.com", None).expect("move");
+        assert_eq!(stored_events(dir.path()).len(), 2);
+
+        apply(
+            dir.path(),
+            &cancel(3, Some("20270112T100000")),
+            "ada@example.com",
+            None,
+        )
+        .expect("cancel");
+        let events = stored_events(dir.path());
+        assert_eq!(
+            events.len(),
+            1,
+            "the moved instance survived its cancellation"
+        );
+        assert!(events[0].recurrence_id.is_none());
     }
 
     #[test]
@@ -2063,5 +2271,79 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
             assert_eq!(outcome, Outcome::NotFromOrganizer);
         }
         assert!(dir.path().join("mine.ics").exists());
+    }
+
+    /// A weekly series this account organizes, with one attendee.
+    fn my_weekly_series(dir: &std::path::Path) {
+        let mine = weekly(1).replace("METHOD:REQUEST\r\n", "").replace(
+            "ATTENDEE;CN=Ada;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:ada@example.com\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:colleague@example.com\r\n",
+        );
+        std::fs::write(dir.join("series.ics"), mine).unwrap();
+    }
+
+    #[test]
+    fn a_reply_for_one_instance_answers_only_that_instance() {
+        let dir = collection();
+        my_weekly_series(dir.path());
+        let one = reply("ACCEPTED").replace(
+            "SEQUENCE:1\r\n",
+            "SEQUENCE:1\r\nRECURRENCE-ID;TZID=Europe/Athens:20270112T100000\r\n",
+        );
+        apply(dir.path(), &one, "boss@org.example", None).expect("reply");
+
+        let events = stored_events(dir.path());
+        let partstat = |event: &cosmic_pim_core::model::Event| {
+            event
+                .attendees
+                .iter()
+                .find(|a| a.email == "colleague@example.com")
+                .and_then(|a| a.partstat.clone())
+        };
+        let master = events.iter().find(|e| e.recurrence_id.is_none()).unwrap();
+        let instance = events
+            .iter()
+            .find(|e| e.recurrence_id.is_some())
+            .expect("no override");
+        assert_eq!(
+            partstat(master).as_deref(),
+            Some("NEEDS-ACTION"),
+            "the series was answered"
+        );
+        assert_eq!(partstat(instance).as_deref(), Some("ACCEPTED"));
+    }
+
+    #[test]
+    fn a_reply_that_is_not_one_attendee_with_a_real_answer_changes_nothing() {
+        let dir = collection();
+        my_weekly_series(dir.path());
+        let before = std::fs::read_to_string(dir.path().join("series.ics")).unwrap();
+
+        let two = reply("ACCEPTED").replace(
+            "END:VEVENT",
+            "ATTENDEE;PARTSTAT=DECLINED:mailto:boss@org.example\r\nEND:VEVENT",
+        );
+        let injected = reply("\"ACCEPTED;ROLE=CHAIR\"");
+        for payload in [two, injected] {
+            assert_eq!(
+                apply(dir.path(), &payload, "boss@org.example", None).expect("reply"),
+                Outcome::Ignored
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("series.ics")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_reply_older_than_the_event_is_stale() {
+        let dir = collection();
+        my_weekly_series(dir.path());
+        let old = reply("ACCEPTED").replace("SEQUENCE:1", "SEQUENCE:0");
+        assert_eq!(
+            apply(dir.path(), &old, "boss@org.example", None).expect("reply"),
+            Outcome::Stale
+        );
     }
 }

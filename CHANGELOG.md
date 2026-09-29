@@ -127,6 +127,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   marked for upload; a draft discarded during its first upload gets a
   tombstone so the server copy is retired; two sweeps of one account take
   turns instead of both uploading the same draft (audit F-34, Envelope F-15).
+- iTIP: a CANCEL for one instance writes an EXDATE on the master and removes
+  that instance's override, so the instance actually leaves the calendar (a
+  moved one no longer snaps back) (audit F-36).
+- iTIP: a REPLY updates exactly one attendee, only in the instance its
+  RECURRENCE-ID names (adding an override when needed), only with a valid
+  PARTSTAT, and not when older than the stored event; a one-instance answer no
+  longer rewrites the whole series (audit F-37).
 
 ### Changed
 
