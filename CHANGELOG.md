@@ -160,6 +160,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   read no longer strips `$junk`, `$MDNSent` or the user's labels; JMAP, Gmail
   and Graph pulls no longer zero the flag bits their protocol does not carry
   (answered, forwarded, custom keywords) (audit F-26).
+- Graph: after an expired delta link, the fresh re-read removes the messages
+  it no longer lists (deleted or moved during the gap) instead of keeping them
+  forever, with the empty-listing guard the other engines use (audit F-27).
 
 ### Changed
 
@@ -241,6 +244,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   scraper) (audit O-02, Circle C-09).
 - `mail::model::Flags::reported_over(server, held, reported: Reported) ->
   Flags` and `mail::model::Reported` (`READ_STAR_DRAFT`, `SYSTEM`).
+- `mail::store::RemoteIds::ids()`: every `(server id, local UID)` mapping.
+
 
 
 

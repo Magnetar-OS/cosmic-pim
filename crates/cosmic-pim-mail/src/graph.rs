@@ -625,6 +625,9 @@ fn walk(
     };
 
     let known = store.state()?;
+    // Every id a from-scratch walk lists, so that when it completes the
+    // messages it did *not* list can be removed. See below.
+    let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         let page = match session.delta_page(&url)? {
@@ -663,6 +666,7 @@ fn walk(
             let Some(message) = parse_message(entry) else {
                 continue;
             };
+            listed.insert(id.to_owned());
 
             match state.uid_of(id) {
                 Some(uid) => {
@@ -696,6 +700,33 @@ fn walk(
         match (next_link, delta_link) {
             (Some(next), _) => url = next,
             (None, Some(delta)) => {
+                // A from-scratch walk that reached its delta link has listed
+                // the whole folder. What it did not list is gone — deleted or
+                // moved while the old cursor was stale, its tombstone lost
+                // with that cursor. Treating the re-read as "nothing was
+                // deleted", as this once did, kept those messages forever
+                // (audit F-27). The guard every engine shares: a listing of
+                // nothing while we hold messages is believed to be a hiccup.
+                if from_scratch {
+                    let gone: Vec<(String, u32)> = state
+                        .ids()
+                        .filter(|(id, _)| !listed.contains(*id))
+                        .map(|(id, uid)| (id.to_owned(), uid))
+                        .collect();
+                    if listed.is_empty() && !gone.is_empty() {
+                        tracing::warn!(
+                            folder_id,
+                            held = gone.len(),
+                            "the folder listed no messages while we hold some; not removing"
+                        );
+                    } else {
+                        for (id, uid) in gone {
+                            state.forget(&id);
+                            store.remove(uid)?;
+                            outcome.removed += 1;
+                        }
+                    }
+                }
                 // Only now, with every page applied.
                 state.set_cursor(delta);
                 break;

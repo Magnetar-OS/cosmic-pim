@@ -292,6 +292,11 @@ impl RemoteIds {
         uid
     }
 
+    /// Every `(server id, local UID)` mapping held.
+    pub fn ids(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.seen.iter().map(|(id, uid)| (id.as_str(), *uid))
+    }
+
     /// Drops a mapping — the message left this mailbox, or was destroyed.
     pub fn forget(&mut self, id: &str) {
         self.seen.remove(id);

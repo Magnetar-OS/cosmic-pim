@@ -737,3 +737,31 @@ fn a_refused_send_stays_queued_rather_than_vanishing() {
     assert_eq!(outbox.count(), 1, "a refused send vanished from the queue");
     assert!(server.submitted().is_empty());
 }
+
+#[test]
+fn a_message_deleted_while_the_cursor_was_stale_is_removed_by_the_re_read() {
+    // After a 410 the whole folder is listed afresh. A message missing from
+    // that complete listing is gone, and the re-read must remove it — the
+    // tombstone that would have said so is behind the expired cursor.
+    let server = serve(vec![
+        Message::new("m1", RAW_ONE),
+        Message::new("m2", RAW_TWO),
+    ]);
+    let (dir, mut store) = maildir();
+    let mut state = graph::state(dir.path());
+    sync(&server, &mut store, &mut state);
+    assert_eq!(store.state().expect("state").entries.len(), 2);
+
+    server.delete("m1");
+    server.expire_cursors();
+    let outcome = sync(&server, &mut store, &mut state);
+
+    assert!(outcome.bootstrapped);
+    assert_eq!(
+        store.state().expect("state").entries.len(),
+        1,
+        "a message deleted during the gap survived the re-read"
+    );
+    assert!(state.uid_of("m1").is_none());
+    assert_eq!(outcome.removed, 1);
+}
