@@ -294,6 +294,7 @@ fn addresses(card: &VCard) -> Vec<Address> {
             };
 
             Address {
+                group: entry.group.clone(),
                 params: foreign_params(entry),
                 po_box: at(0),
                 extended: at(1),
@@ -793,6 +794,18 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     // from a caller preference — a patch never converts.
     let version = version_of_card(original, &contact.uid);
 
+    // The card as the model reads it now. A property the edit did not change
+    // is left exactly as written: rewriting it from the model dropped every
+    // parameter the model does not carry — `BDAY;X-APPLE-OMIT-YEAR=1604`
+    // became a birthday in 1604 — and re-added grouped addresses as
+    // duplicates (audit F-16).
+    let source = parse_vcards(original, "", "")
+        .into_iter()
+        .find(|card| card.uid == contact.uid);
+    let unchanged = |same: &dyn Fn(&Contact, &Contact) -> bool| {
+        source.as_ref().is_some_and(|s| same(s, contact))
+    };
+
     let set = |edits: &mut BTreeMap<String, Edit>, name: &str, lines: Vec<String>| {
         edits.insert(name.to_owned(), Edit::set(lines));
     };
@@ -820,12 +833,15 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     }
 
     // FN is REQUIRED (RFC 6350 §6.2.1), so it is set rather than removable.
-    edits.insert(
-        "FN".to_owned(),
-        Edit::set(vec![format!("FN:{}", escape_text(&contact.label()))]),
-    );
+    if !unchanged(&|s, c| s.label() == c.label()) {
+        edits.insert(
+            "FN".to_owned(),
+            Edit::set(vec![format!("FN:{}", escape_text(&contact.label()))]),
+        );
+    }
 
-    if contact.name.is_empty() {
+    if unchanged(&|s, c| s.name == c.name) {
+    } else if contact.name.is_empty() {
         edits.insert("N".to_owned(), Edit::remove());
     } else {
         set(
@@ -842,15 +858,17 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         );
     }
 
-    set(
-        &mut edits,
-        "NICKNAME",
-        contact
-            .nicknames
-            .iter()
-            .map(|n| format!("NICKNAME:{}", escape_text(n)))
-            .collect(),
-    );
+    if !unchanged(&|s, c| s.nicknames == c.nicknames) {
+        set(
+            &mut edits,
+            "NICKNAME",
+            contact
+                .nicknames
+                .iter()
+                .map(|n| format!("NICKNAME:{}", escape_text(n)))
+                .collect(),
+        );
+    }
     edits.insert(
         "EMAIL".to_owned(),
         split_typed("EMAIL", &contact.emails, version),
@@ -860,50 +878,76 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         split_typed("TEL", &contact.phones, version),
     );
     edits.insert("URL".to_owned(), split_typed("URL", &contact.urls, version));
-    set(
-        &mut edits,
-        "ADR",
-        contact.addresses.iter().map(address_line).collect(),
-    );
+    if !unchanged(&|s, c| s.addresses == c.addresses) {
+        // Grouped addresses are rewritten in place, like grouped EMAIL: an
+        // ungrouped line for each would sit beside the untouched grouped one.
+        let mut edit = Edit::set(
+            contact
+                .addresses
+                .iter()
+                .filter(|a| a.group.is_none())
+                .map(address_line)
+                .collect(),
+        );
+        for address in &contact.addresses {
+            if let Some(group) = &address.group {
+                edit = edit.with_group(group.clone(), address_value(address));
+            }
+        }
+        edits.insert("ADR".to_owned(), edit);
+    }
 
-    set(&mut edits, "ORG", org_lines(contact));
-    set(
-        &mut edits,
-        "TITLE",
-        contact
-            .title
-            .iter()
-            .map(|t| format!("TITLE:{}", escape_text(t)))
-            .collect(),
-    );
-    set(
-        &mut edits,
-        "NOTE",
-        contact
-            .note
-            .iter()
-            .map(|n| format!("NOTE:{}", escape_text(n)))
-            .collect(),
-    );
-    set(&mut edits, "BDAY", bday_lines(contact, version));
+    if !unchanged(&|s, c| {
+        s.organisation == c.organisation && s.organisation_units == c.organisation_units
+    }) {
+        set(&mut edits, "ORG", org_lines(contact));
+    }
+    if !unchanged(&|s, c| s.title == c.title) {
+        set(
+            &mut edits,
+            "TITLE",
+            contact
+                .title
+                .iter()
+                .map(|t| format!("TITLE:{}", escape_text(t)))
+                .collect(),
+        );
+    }
+    if !unchanged(&|s, c| s.note == c.note) {
+        set(
+            &mut edits,
+            "NOTE",
+            contact
+                .note
+                .iter()
+                .map(|n| format!("NOTE:{}", escape_text(n)))
+                .collect(),
+        );
+    }
+    if !unchanged(&|s, c| s.birthday == c.birthday && s.birthday_month_day == c.birthday_month_day)
+    {
+        set(&mut edits, "BDAY", bday_lines(contact, version));
+    }
 
-    set(
-        &mut edits,
-        "CATEGORIES",
-        if contact.categories.is_empty() {
-            Vec::new()
-        } else {
-            vec![format!(
-                "CATEGORIES:{}",
-                contact
-                    .categories
-                    .iter()
-                    .map(|c| escape_text(c))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )]
-        },
-    );
+    if !unchanged(&|s, c| s.categories == c.categories) {
+        set(
+            &mut edits,
+            "CATEGORIES",
+            if contact.categories.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "CATEGORIES:{}",
+                    contact
+                        .categories
+                        .iter()
+                        .map(|c| escape_text(c))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )]
+            },
+        );
+    }
 
     // REV records when we last touched the card; servers and other clients use
     // it to break ties.
@@ -1083,6 +1127,23 @@ fn org_line(organisation: &str, units: &[String]) -> String {
         line.push_str(&escape_text(unit));
     }
     line
+}
+
+/// An address's structured value, as it follows the colon.
+fn address_value(address: &Address) -> String {
+    [
+        &address.po_box,
+        &address.extended,
+        &address.street,
+        &address.locality,
+        &address.region,
+        &address.postal_code,
+        &address.country,
+    ]
+    .iter()
+    .map(|part| escape_text(part))
+    .collect::<Vec<_>>()
+    .join(";")
 }
 
 fn address_line(address: &Address) -> String {
@@ -2532,5 +2593,35 @@ mod photo_format_tests {
         let photo = photo(card).expect("a photo value");
         assert!(matches!(photo, Photo::Uri(_)));
         assert!(!photo.is_renderable(), "a URI carries no bytes to render");
+    }
+
+    #[test]
+    fn an_edit_keeps_parameters_it_did_not_touch_and_grouped_addresses_stay_single() {
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ada\r\nFN:Ada\r\nN:Lovelace;Ada;;;\r\n\
+BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-15\r\n\
+item1.ADR;TYPE=HOME:;;1 Main St;Athens;;10431;GR\r\nitem1.X-ABLabel:Home\r\n\
+END:VCARD\r\n";
+        let mut contact = parse_vcards(card, "b", "f.vcf").remove(0);
+        contact.emails.push(Typed::new("ada@example.com"));
+        let out = patch_vcard(card, &contact).expect("patched");
+        assert!(
+            out.contains("BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-15"),
+            "the birthday lost its parameter:\n{out}"
+        );
+        assert_eq!(
+            out.matches("ADR").count(),
+            1,
+            "the grouped address was duplicated:\n{out}"
+        );
+
+        // And an edit to the grouped address rewrites it in place.
+        let mut moved = parse_vcards(&out, "b", "f.vcf").remove(0);
+        moved.addresses[0].street = "2 Main St".into();
+        let out = patch_vcard(&out, &moved).expect("patched");
+        assert_eq!(out.matches("ADR").count(), 1, "{out}");
+        assert!(
+            out.contains("item1.ADR;TYPE=HOME:;;2 Main St;Athens;;10431;GR"),
+            "{out}"
+        );
     }
 }

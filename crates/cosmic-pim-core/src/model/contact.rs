@@ -99,6 +99,11 @@ pub struct Address {
     /// [`Typed::params`]. `GEO=` and `LABEL=` live here, and both are
     /// standard.
     pub params: Vec<String>,
+    /// The property group (`item1` in Apple's `item1.ADR`), when the line
+    /// had one. Kept so an edit rewrites the grouped line in place — its
+    /// `item1.X-ABLabel` sibling names it — instead of adding a second,
+    /// ungrouped copy on every save.
+    pub group: Option<String>,
 }
 
 impl Address {

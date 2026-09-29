@@ -151,6 +151,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   concurrency guard, instead of the snapshot it was loaded with, so a newer
   change to another card in the same `.vcf` is no longer reverted and pushed
   (audit F-15).
+- Saving a contact leaves FN, N, NICKNAME, ADR, ORG, TITLE, NOTE, BDAY and
+  CATEGORIES exactly as written unless the edit changed them, so their
+  parameters survive (`BDAY;X-APPLE-OMIT-YEAR` no longer turns a year-less
+  birthday into 1604), and an Apple-grouped `itemN.ADR` is edited in place
+  instead of duplicated on every save (audit F-16).
 
 ### Changed
 
@@ -202,6 +207,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `itip::scheduling_message(ics, method) -> String` builds what the organizer
   sends.
 - `cosmic-pim-mail` depends on `cosmic-ext-nib-text` 1.2.0 (was 1.1.0).
+- `model::Address` gains `group: Option<String>`; code building an `Address`
+  literal must set it (or use `..Address::default()`).
 
 ### Added
 
