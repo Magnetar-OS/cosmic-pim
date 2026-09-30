@@ -97,6 +97,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   the sync daemon) redeem the refresh token once. A provider that rotates
   refresh tokens refused the second redemption with `invalid_grant`, which
   asked the user to sign in again (audit F-44).
+- Drafts mirror: a display name holding a comma, colon, parentheses or angle
+  brackets is written as an encoded word, so `Smith, John` stays one
+  recipient instead of becoming two, and an address holding a line break,
+  whitespace or `<>,;` is not an address, so it can no longer add a header of
+  its own to the mirror copy (audit F-35).
 
 ## [2.0.0] - 2026-09-29
 

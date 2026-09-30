@@ -477,29 +477,53 @@ impl Draft {
     }
 }
 
-/// `"Name" <address>`, with the display name RFC 2047-encoded when it needs
+/// `Name <address>`, with the display name RFC 2047-encoded when it needs
 /// to be.
 fn header_mailbox(mailbox: &Mailbox) -> String {
     match mailbox.name.as_deref().filter(|n| !n.trim().is_empty()) {
-        Some(name) => format!("{} <{}>", header_text(name), mailbox.address),
+        Some(name) => format!("{} <{}>", display_name(name), mailbox.address),
         None => mailbox.address.clone(),
     }
 }
 
+/// A display name as it may stand in an address header: as written when it
+/// is plain words, encoded otherwise.
+///
+/// A name is a *phrase* (RFC 5322 section 3.2.5), and the specials end one:
+/// `Smith, John <j@x>` written bare is two addresses to every parser, and
+/// `Team: Ops` starts a group (audit F-35). An encoded word carries any of
+/// them, and every reader decodes it back to the name that was typed.
+fn display_name(name: &str) -> String {
+    let plain = name
+        .chars()
+        .all(|c| matches!(c, ' '..='~') && !"()<>[]:;@\\,\"".contains(c));
+    if plain {
+        name.to_owned()
+    } else {
+        encoded_words(name)
+    }
+}
+
 /// Header text, RFC 2047 B-encoded when it is not printable ASCII.
+fn header_text(text: &str) -> String {
+    let plain = text
+        .chars()
+        .all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\');
+    if plain {
+        text.to_owned()
+    } else {
+        encoded_words(text)
+    }
+}
+
+/// `text` as RFC 2047 B-encoded words.
 ///
 /// Encoded words are capped at 75 characters, so long text is split into a
 /// sequence of words joined by folding whitespace — which decoders collapse
 /// to nothing between adjacent encoded words. The split walks characters, so
 /// a multi-byte sequence is never cut in the middle.
-fn header_text(text: &str) -> String {
+fn encoded_words(text: &str) -> String {
     use base64::Engine as _;
-    let plain = text
-        .chars()
-        .all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\');
-    if plain {
-        return text.to_owned();
-    }
     // 45 input bytes encode to 60 base64 chars; with the =?UTF-8?B?…?= frame
     // that is comfortably under the 75-character cap.
     const CHUNK_BYTES: usize = 45;
@@ -670,6 +694,17 @@ fn forwarded(message: &Message) -> String {
 /// This catches "forgot the @" and "typed two", which is what people actually
 /// do.
 pub(crate) fn looks_like_an_address(address: &str) -> bool {
+    // An address has no whitespace, no control characters, and none of the
+    // characters that end one in a header. A line break is the dangerous
+    // one: the mirror writes the address into its headers as it is, and
+    // whatever followed the break would stand as a header of its own (audit
+    // F-35).
+    if address
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || "<>,;".contains(c))
+    {
+        return false;
+    }
     let mut parts = address.split('@');
     let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
@@ -1003,6 +1038,54 @@ mod tests {
         assert_eq!(back.cc[0].address, "bob@example.net");
         assert_eq!(back.in_reply_to.as_deref(), Some("parent@x"));
         assert_eq!(back.references, vec!["root@x", "parent@x"]);
+    }
+
+    #[test]
+    fn a_name_with_a_comma_in_the_mirror_stays_one_recipient() {
+        // `Smith, John <j@x>` written bare is two addresses to every parser:
+        // `Smith` and `John <j@x>`.
+        let mut draft = Draft::new(me());
+        for name in ["Smith, John", "Team: Ops", "Ada (work)", "R&D <lab>"] {
+            draft.to.push(Mailbox {
+                name: Some(name.into()),
+                address: format!("{}@example.com", draft.to.len()),
+            });
+        }
+
+        let raw = draft.mirror_bytes("id5@example.com", 0);
+        let back = Draft::from_mirror(&Message::parse(&raw).unwrap(), &raw, me());
+
+        let names: Vec<Option<&str>> = back.to.iter().map(|m| m.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            [
+                Some("Smith, John"),
+                Some("Team: Ops"),
+                Some("Ada (work)"),
+                Some("R&D <lab>")
+            ],
+            "{}",
+            String::from_utf8_lossy(&raw)
+        );
+    }
+
+    #[test]
+    fn an_address_carrying_a_line_break_cannot_add_a_header() {
+        // A pasted address with a CRLF in it went into the mirror verbatim,
+        // and whatever followed the break became a header of its own.
+        let mut draft = Draft::new(me());
+        draft.to.push(Mailbox {
+            name: None,
+            address: "ada@example.com\r\nX-Injected: yes".into(),
+        });
+        draft.subject = "x".into();
+
+        let raw = String::from_utf8(draft.mirror_bytes("id6@example.com", 0)).unwrap();
+        assert!(!raw.contains("\r\nX-Injected"), "{raw}");
+        assert!(
+            draft.problem().is_some(),
+            "a line break passed as an address"
+        );
     }
 
     #[test]
