@@ -229,13 +229,29 @@ pub fn write_todo(meta: &CalendarMeta, todo: &Todo) -> Result<(), StoreError> {
         return Err(StoreError::ReadOnly(meta.name.clone()));
     }
     let target = meta.path.join(&todo.file_name);
-    let text = match std::fs::read_to_string(&target) {
-        Ok(existing) if !existing.trim().is_empty() => upsert_vtodo(&existing, todo),
-        _ => todo_to_ics(todo),
+    let text = match existing_document(&target)? {
+        Some(existing) => upsert_vtodo(&existing, todo),
+        None => todo_to_ics(todo),
     };
     atomic::write(&target, &text, None)
         .map(|_| ())
         .map_err(Into::into)
+}
+
+/// The document a save must patch, or `None` when there is nothing to patch:
+/// no file yet, or an empty one.
+///
+/// A read that fails for any other reason is an error, not "nothing there".
+/// Reading it as nothing wrote a fresh single-record document over a file
+/// that merely could not be read — bytes that are not UTF-8, a permission
+/// change — and whatever else the file held was gone.
+fn existing_document(target: &Path) -> Result<Option<String>, StoreError> {
+    match std::fs::read_to_string(target) {
+        Ok(existing) if existing.trim().is_empty() => Ok(None),
+        Ok(existing) => Ok(Some(existing)),
+        Err(why) if why.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(why) => Err(why.into()),
+    }
 }
 
 /// Serialises every event in a collection into a single iCalendar document.
@@ -297,9 +313,9 @@ pub fn write_event_if_unchanged(
     // from this one event would delete them, so an existing document is
     // patched component-wise: only the VEVENT whose RECURRENCE-ID matches is
     // regenerated, and the rest passes through byte-for-byte.
-    let text = match std::fs::read_to_string(&target) {
-        Ok(existing) if !existing.trim().is_empty() => upsert_vevent(&existing, event),
-        _ => to_ics(event),
+    let text = match existing_document(&target)? {
+        Some(existing) => upsert_vevent(&existing, event),
+        None => to_ics(event),
     };
 
     atomic::write(&target, &text, expected).map_err(Into::into)
@@ -508,6 +524,36 @@ mod tests {
         let read = read_collection(&cal);
         assert_eq!(read.len(), 1, "a corrupt file swallowed the valid one");
         assert_eq!(read[0].summary, "Good");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_not_replaced_by_a_save() {
+        // A read that fails is not an empty file. Treating it as one wrote a
+        // fresh single-event document over whatever the file held — every
+        // other component in it, and every byte the model does not carry.
+        let root = temp_root();
+        let cal = create_collection(root.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        let mut event = Event::draft(
+            &cal.id,
+            NaiveDate::from_ymd_opt(2026, 8, 4)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            chrono_tz::UTC,
+        );
+        event.file_name = "shared.ics".into();
+        let unreadable = [b"BEGIN:VCALENDAR\r\n".as_slice(), &[0xff, 0xfe], b"\r\n"].concat();
+        std::fs::write(cal.path.join("shared.ics"), &unreadable).unwrap();
+
+        assert!(write_event(&cal, &event).is_err());
+        let mut todo = Todo::draft(&cal.id);
+        todo.file_name = "shared.ics".into();
+        assert!(write_todo(&cal, &todo).is_err());
+        assert_eq!(
+            std::fs::read(cal.path.join("shared.ics")).unwrap(),
+            unreadable,
+            "the file was replaced"
+        );
     }
 
     #[test]

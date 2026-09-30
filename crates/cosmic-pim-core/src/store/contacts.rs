@@ -441,7 +441,13 @@ impl ContactStore {
             // import may target the same file, and the second must see what
             // the first wrote.
             let path = meta.path.join(&file_name);
-            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            let current = match std::fs::read_to_string(&path) {
+                Ok(current) => current,
+                Err(why) if why.kind() == std::io::ErrorKind::NotFound => String::new(),
+                // Not "empty": a file that cannot be read may hold several
+                // people, and writing this card over it would delete them.
+                Err(why) => return Err(why.into()),
+            };
             let text = if crate::vcard::card_count(&current) > 1 {
                 crate::vcard::replace_vcard(&current, &card.uid, &segment).unwrap_or_else(|| {
                     // In the file but not locatable by uid — a card with no

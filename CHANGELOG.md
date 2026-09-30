@@ -27,6 +27,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   written with lowercase `begin:vcard` no longer unlinks or replaces the file
   and everyone else in it: cards are counted whatever case the delimiters use
   (audit F-46).
+- Saving an event or task into a file that exists but cannot be read (bytes
+  that are not UTF-8, a permission error) is an error instead of replacing the
+  file with a fresh single-record document; importing a contact over such a
+  file is refused the same way.
 
 ## [2.0.0] - 2026-09-29
 
