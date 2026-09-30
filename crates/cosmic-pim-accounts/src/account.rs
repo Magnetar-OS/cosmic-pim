@@ -540,6 +540,23 @@ impl AccountStore {
         })
     }
 
+    /// Holds off every other handle and process renewing this account's
+    /// grant until the returned lock is dropped.
+    ///
+    /// A renewal is read, redeem, store. Two processes doing that at once —
+    /// an app and the sync daemon finding the same expired token — both
+    /// redeem the one refresh token, and a provider that rotates refresh
+    /// tokens refuses the second use and may revoke the grant. The second
+    /// renewer takes this lock, reads again, and finds the grant already
+    /// renewed.
+    pub fn credential_lock(&self, id: &str) -> Result<cosmic_pim_core::atomic::Lock> {
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let target = dir.join(format!("grant-{id}"));
+        cosmic_pim_core::atomic::lock(&target)
+            .map_err(|why| Error::config(format!("locking {}: {why}", target.display())))
+    }
+
     fn store_credential_for(&self, account: &Account, credential: &OAuthCredential) -> Result<()> {
         let json = serde_json::to_string(credential)
             .map_err(|why| Error::config(format!("serialising an OAuth grant: {why}")))?;

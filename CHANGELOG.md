@@ -36,6 +36,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   resource inside it. `VdirStore::reload()` re-reads the sidecar.
 - `Pending::wait_for(timeout)`: `Pending::wait` with a timeout of the
   caller's choosing.
+- `AccountStore::credential_lock(id)`: a cross-process lock over one
+  account's grant, held while it is renewed.
 
 ### Fixed
 
@@ -90,6 +92,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - OAuth sign-in: a connection to the redirect listener that sends nothing —
   a browser's spare connection — is set aside after two seconds instead of
   failing the whole sign-in while the real redirect waits behind it.
+- `auth::resolve` renews an expired grant under a per-account lock and reads
+  it again first, so two processes finding the same expired token (an app and
+  the sync daemon) redeem the refresh token once. A provider that rotates
+  refresh tokens refused the second redemption with `invalid_grant`, which
+  asked the user to sign in again (audit F-44).
 
 ## [2.0.0] - 2026-09-29
 

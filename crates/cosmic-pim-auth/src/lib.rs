@@ -121,6 +121,19 @@ pub fn resolve(
         return Ok(Secret::AccessToken(stored.access_token));
     }
 
+    // Renewal is read, redeem, store, and another process may be doing the
+    // same right now. Under the grant's lock, read again: if that process
+    // renewed while this one waited, its grant is the one to use. Redeeming
+    // the refresh token a second time is refused by a provider that rotates
+    // them, and may cost the whole grant (audit F-44).
+    let _renewing = accounts.credential_lock(account_id)?;
+    let stored = accounts
+        .credential(account_id)?
+        .ok_or_else(|| Error::GrantRejected("no sign-in is saved for this account".to_owned()))?;
+    if !stored.is_expired() {
+        return Ok(Secret::AccessToken(stored.access_token));
+    }
+
     if !stored.is_renewable() {
         return Err(Error::NoRefreshToken);
     }
@@ -221,6 +234,97 @@ mod tests {
             !error.is_transient(),
             "a dead grant was marked as worth retrying"
         );
+    }
+
+    /// A token endpoint that rotates refresh tokens and treats a second use
+    /// of one as a stolen token (RFC 9700 section 4.14.2): the answer is
+    /// `invalid_grant`. It answers slowly, so two renewals can overlap.
+    /// Returns its URL and how many renewals it granted.
+    fn rotating_token_endpoint() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/token",
+            server.server_addr().to_ip().unwrap().port()
+        );
+        let granted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&granted);
+        std::thread::spawn(move || {
+            let mut current = "stored-refresh-token".to_owned();
+            for mut request in server.incoming_requests() {
+                let mut form = String::new();
+                request.as_reader().read_to_string(&mut form).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let presented = form
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("refresh_token="))
+                    .unwrap_or_default()
+                    .to_owned();
+                let response = if presented == current {
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    current = format!("rotated-{n}");
+                    tiny_http::Response::from_string(format!(
+                        r#"{{"access_token":"access-{n}","refresh_token":"{current}","expires_in":3600}}"#
+                    ))
+                } else {
+                    tiny_http::Response::from_string(r#"{"error":"invalid_grant"}"#)
+                        .with_status_code(400)
+                };
+                let _ = request.respond(response);
+            }
+        });
+        (url, granted)
+    }
+
+    #[test]
+    fn two_processes_renewing_one_grant_redeem_it_once() {
+        // The app and the sync daemon find the same expired token at the
+        // same moment. Both redeemed the one refresh token; a provider that
+        // rotates refresh tokens refuses the second use — and may revoke the
+        // whole grant — so one of them, and then the account, needed a new
+        // sign-in (audit F-44).
+        let dir = tempfile::tempdir().unwrap();
+        let (token_url, granted) = rotating_token_endpoint();
+        std::fs::write(
+            dir.path().join("rotating.toml"),
+            format!(
+                "id = \"rotating\"\nname = \"Rotating\"\n[oauth]\nclient_id = \"c\"\n\
+                 auth_url = \"http://127.0.0.1:1/auth\"\ntoken_url = \"{token_url}\"\n\
+                 scopes = [\"mail\"]\n"
+            ),
+        )
+        .unwrap();
+        let account = Account::new("Rotating", "", "ada@example.com");
+        let id = account.id.clone();
+        accounts_at(dir.path())
+            .add_oauth(account, "rotating", &grant(-10))
+            .unwrap();
+
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<Secret>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut accounts = accounts_at(dir.path());
+                        let registry = Registry::load_from(dir.path());
+                        barrier.wait();
+                        resolve(&mut accounts, &registry, &id)
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+
+        for result in &results {
+            assert!(result.is_ok(), "a renewal was refused: {result:?}");
+        }
+        assert_eq!(
+            granted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the grant was renewed twice"
+        );
+        let stored = accounts_at(dir.path()).credential(&id).unwrap().unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rotated-1"));
     }
 
     #[test]
