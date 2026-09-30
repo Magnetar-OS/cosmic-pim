@@ -7,7 +7,25 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `model::Trigger { alarm, days }` (`#[non_exhaustive]`, built with
+  `Trigger::new(alarm, days)`): a VALARM trigger with the days its offset was
+  written in kept apart, and `Trigger::fires_at(start, end)`, which takes
+  `DateTime<chrono_tz::Tz>` in the event's zone and counts those days on the
+  wall clock, adding the rest as exact time (RFC 5545 section 3.3.6). A
+  `-P1D` reminder for a 09:00 event fires at 09:00 the day before across a
+  daylight-saving change, not 24 hours before; `-PT24H` still fires 24
+  hours before. The readers are `Store::triggers(&Event)`,
+  `Store::todo_triggers(&Todo)`, `ical::event_triggers(text, uid,
+  recurrence_id)` and `ical::todo_triggers(text, uid)`. `Alarm`,
+  `Alarm::fires_at` and the `alarms` readers are unchanged: their offsets
+  stay exact (Slate audit F-09 follow-up).
+
 ### Fixed
+
+- `ical::parse_iso_duration` returns `None` for a duration too long to
+  represent, where it could overflow or panic.
 
 - A POP3 sync pass whose POP3 server cannot be reached no longer returns an
   error after its outbox drain has sent mail. The pass sends over SMTP before

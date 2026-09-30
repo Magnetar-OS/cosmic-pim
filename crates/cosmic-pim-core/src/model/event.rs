@@ -427,6 +427,10 @@ pub enum Alarm {
 
 impl Alarm {
     /// The instant this alarm fires for an occurrence running `start..end`.
+    ///
+    /// Every offset is an exact duration here, its days included. RFC 5545
+    /// counts the days of an offset written in days or weeks on the wall
+    /// clock instead; [`Trigger::fires_at`] does that.
     #[must_use]
     pub fn fires_at(self, start: DateTime<Utc>, end: DateTime<Utc>) -> DateTime<Utc> {
         match self {
@@ -434,6 +438,55 @@ impl Alarm {
             Alarm::End(offset) => end + offset,
             Alarm::At(instant) => instant,
         }
+    }
+}
+
+/// One `VALARM` trigger as written: its [`Alarm`], and how many days of the
+/// offset the source wrote as days or weeks.
+///
+/// RFC 5545 section 3.3.6 makes those days nominal. `-P1D` fires at the same
+/// wall-clock time a day earlier, which across a daylight-saving change is
+/// 23 or 25 hours before, not 24. `-PT24H` is exactly 24 hours. The two are
+/// the same [`Alarm`], whose offset is exact, and differ here.
+/// [`crate::Store::triggers`] and [`crate::ical::event_triggers`] return
+/// these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Trigger {
+    pub alarm: Alarm,
+    /// The whole days in the offset (a week is seven), signed like it. Zero
+    /// for [`Alarm::At`] and for an offset written in hours, minutes and
+    /// seconds only. `-P1DT2H` is `-1`.
+    pub days: i64,
+}
+
+impl Trigger {
+    /// A trigger whose offset holds `days` nominal days; the rest of the
+    /// offset is exact. `days` of `0` makes it fire where [`Alarm::fires_at`]
+    /// does.
+    #[must_use]
+    pub fn new(alarm: Alarm, days: i64) -> Self {
+        Self { alarm, days }
+    }
+
+    /// The instant this trigger fires for an occurrence running `start..end`.
+    ///
+    /// Pass `start` and `end` in the zone the event's times are written in,
+    /// or the viewer's zone for a floating or all-day event: that is the wall
+    /// clock the days are counted on. The days move the wall-clock time, and
+    /// the rest of the offset is then added as an exact duration. A
+    /// wall-clock time that a change skips moves forward past the gap, and
+    /// one it repeats is the earlier of the two, as [`EventTime::to_utc`]
+    /// resolves them.
+    #[must_use]
+    pub fn fires_at(self, start: DateTime<Tz>, end: DateTime<Tz>) -> DateTime<Utc> {
+        let (anchor, offset) = match self.alarm {
+            Alarm::Start(offset) => (start, offset),
+            Alarm::End(offset) => (end, offset),
+            Alarm::At(instant) => return instant,
+        };
+        let nominal = chrono::Duration::days(self.days);
+        resolve(anchor.naive_local() + nominal, anchor.timezone()) + (offset - nominal)
     }
 }
 

@@ -15,7 +15,8 @@ pub mod todo;
 pub use calendar::{CalendarMeta, DEFAULT_CALENDAR_COLOR, PALETTE, Rgb};
 pub use contact::{Address, Contact, StructuredName, Typed};
 pub use event::{
-    Alarm, Attendee, Event, EventTime, Freq, Occurrence, Recurrence, RepeatEnd, normalise_address,
+    Alarm, Attendee, Event, EventTime, Freq, Occurrence, Recurrence, RepeatEnd, Trigger,
+    normalise_address,
 };
 pub use recur::{
     count_of, expand, expand_merged, instant_of, naive_in_series_zone, rid_for, truncate_rule,

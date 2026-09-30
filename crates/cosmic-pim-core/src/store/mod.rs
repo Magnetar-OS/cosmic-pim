@@ -409,6 +409,25 @@ impl Store {
         Ok(crate::ical::todo_alarms(&text, &todo.uid))
     }
 
+    /// [`Self::alarms`], each with the days its offset was written in, which
+    /// [`crate::model::Trigger::fires_at`] counts on the wall clock. What an
+    /// application firing reminders should read.
+    pub fn triggers(&self, event: &Event) -> Result<Vec<crate::model::Trigger>, StoreError> {
+        let text = self.record_text(&event.calendar_id, &event.file_name)?;
+        Ok(crate::ical::event_triggers(
+            &text,
+            &event.uid,
+            event.recurrence_id,
+        ))
+    }
+
+    /// [`Self::todo_alarms`], each with its nominal days. See
+    /// [`Self::triggers`].
+    pub fn todo_triggers(&self, todo: &Todo) -> Result<Vec<crate::model::Trigger>, StoreError> {
+        let text = self.record_text(&todo.calendar_id, &todo.file_name)?;
+        Ok(crate::ical::todo_triggers(&text, &todo.uid))
+    }
+
     /// The text of one record's file.
     fn record_text(&self, calendar_id: &str, file_name: &str) -> Result<String, StoreError> {
         let meta = self
@@ -1197,6 +1216,38 @@ END:VEVENT\r\nEND:VCALENDAR\r\n",
         assert_eq!(
             store.alarms(&event).unwrap(),
             vec![crate::model::Alarm::End(Duration::minutes(-5))]
+        );
+    }
+
+    #[test]
+    fn the_store_hands_back_each_trigger_with_its_nominal_days() {
+        use crate::model::{Alarm, Trigger};
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        std::fs::write(
+            cal.path.join("e.ics"),
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VEVENT\r\nUID:e@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART;TZID=Europe/Athens:20260329T090000\r\nSUMMARY:Planning\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER:-P1D\r\nEND:VALARM\r\n\
+END:VEVENT\r\n\
+BEGIN:VTODO\r\nUID:t@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DUE:20260329T090000Z\r\nSUMMARY:Report\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER;RELATED=END:-P1W\r\nEND:VALARM\r\n\
+END:VTODO\r\nEND:VCALENDAR\r\n",
+        )
+        .unwrap();
+        store.refresh().unwrap();
+
+        let event = store.event(&cal.id, "e@example.com").unwrap().unwrap();
+        assert_eq!(
+            store.triggers(&event).unwrap(),
+            vec![Trigger::new(Alarm::Start(Duration::days(-1)), -1)]
+        );
+        let todo = store.todo(&cal.id, "t@example.com").unwrap();
+        assert_eq!(
+            store.todo_triggers(&todo).unwrap(),
+            vec![Trigger::new(Alarm::End(Duration::weeks(-1)), -7)]
         );
     }
 

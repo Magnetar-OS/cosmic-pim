@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::model::{Alarm, Attendee, Event, EventTime, Todo, TodoStatus};
+use crate::model::{Alarm, Attendee, Event, EventTime, Todo, TodoStatus, Trigger};
 use calcard::Parser;
 use calcard::icalendar::{
     ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarParameterName,
@@ -296,7 +296,7 @@ fn vevent_extras(text: &str) -> Vec<Extras> {
             } else if component.eq_ignore_ascii_case("VEVENT")
                 && let Some((start, mut done)) = current.take()
             {
-                done.alarms = alarms_between(&lines, start, i);
+                done.alarms = alarms_of(triggers_between(&lines, start, i));
                 out.push(done);
             }
             continue;
@@ -619,13 +619,13 @@ fn in_series_frame(time: EventTime, start: EventTime) -> NaiveDateTime {
 /// One `VALARM` directly inside a component: the lines it spans, and when
 /// it fires.
 ///
-/// `alarm` is `None` for one that never fires — `ACTION:NONE`, which is how
+/// `trigger` is `None` for one that never fires — `ACTION:NONE`, which is how
 /// Apple's calendars write "this event has no alarm" (with a trigger in 1976)
 /// — and for one whose trigger cannot be read.
 struct AlarmBlock {
     start: usize,
     end: usize,
-    alarm: Option<Alarm>,
+    trigger: Option<Trigger>,
 }
 
 /// The `VALARM` blocks directly inside the component whose `BEGIN` is line
@@ -642,7 +642,7 @@ fn alarm_blocks(
     let mut out = Vec::new();
     let mut depth = 0usize;
     // The open block's first line, its trigger, and whether it is silenced.
-    let mut open: Option<(usize, Option<Alarm>, bool)> = None;
+    let mut open: Option<(usize, Option<Trigger>, bool)> = None;
 
     for (i, line) in lines.iter().enumerate().take(last).skip(first + 1) {
         if let Some(name) = line.begins() {
@@ -654,22 +654,22 @@ fn alarm_blocks(
         }
         if line.ends().is_some() {
             if depth == 1
-                && let Some((start, alarm, silenced)) = open.take()
+                && let Some((start, trigger, silenced)) = open.take()
             {
                 out.push(AlarmBlock {
                     start,
                     end: i,
-                    alarm: alarm.filter(|_| !silenced),
+                    trigger: trigger.filter(|_| !silenced),
                 });
             }
             depth = depth.saturating_sub(1);
             continue;
         }
         if depth == 1
-            && let Some((_, alarm, silenced)) = open.as_mut()
+            && let Some((_, trigger, silenced)) = open.as_mut()
         {
             match line.name().as_str() {
-                "TRIGGER" => *alarm = trigger_of(line),
+                "TRIGGER" => *trigger = trigger_of(line),
                 "ACTION" => *silenced = line.value().trim().eq_ignore_ascii_case("NONE"),
                 _ => {}
             }
@@ -678,45 +678,51 @@ fn alarm_blocks(
     out
 }
 
-/// Every alarm of the component spanning lines `first..=last`, in document
+/// Every trigger of the component spanning lines `first..=last`, in document
 /// order.
-fn alarms_between(
+fn triggers_between(
     lines: &[crate::patch::ContentLine<'_>],
     first: usize,
     last: usize,
-) -> Vec<Alarm> {
+) -> Vec<Trigger> {
     alarm_blocks(lines, first, last)
         .into_iter()
-        .filter_map(|block| block.alarm)
+        .filter_map(|block| block.trigger)
         .collect()
 }
 
-/// One `TRIGGER` line as an [`Alarm`].
+/// The alarms of `triggers`, without their nominal days.
+fn alarms_of(triggers: Vec<Trigger>) -> Vec<Alarm> {
+    triggers.into_iter().map(|trigger| trigger.alarm).collect()
+}
+
+/// One `TRIGGER` line as a [`Trigger`].
 ///
 /// All three forms are kept. An absolute trigger and one anchored to the end
 /// were once skipped, which left an event whose only alarm was one of those
 /// looking as if it had none — and an application's default reminder fired
 /// in its place (Slate audit F-09).
-fn trigger_of(line: &crate::patch::ContentLine<'_>) -> Option<Alarm> {
+fn trigger_of(line: &crate::patch::ContentLine<'_>) -> Option<Trigger> {
     let value = line.value().trim();
-    if let Some(offset) = parse_iso_duration(value) {
+    if let Some((days, offset)) = duration_parts(value) {
         let related_to_end = line.params().split(';').any(|param| {
             param.split_once('=').is_some_and(|(key, related)| {
                 key.trim().eq_ignore_ascii_case("RELATED")
                     && related.trim().trim_matches('"').eq_ignore_ascii_case("END")
             })
         });
-        return Some(if related_to_end {
+        let alarm = if related_to_end {
             Alarm::End(offset)
         } else {
             Alarm::Start(offset)
-        });
+        };
+        return Some(Trigger::new(alarm, days));
     }
     // An absolute trigger is always in UTC (RFC 5545 section 3.8.6.3).
     let utc = value.strip_suffix(['Z', 'z'])?;
     NaiveDateTime::parse_from_str(utc, "%Y%m%dT%H%M%S")
         .ok()
-        .map(|instant| Alarm::At(instant.and_utc()))
+        .map(|instant| Trigger::new(Alarm::At(instant.and_utc()), 0))
 }
 
 /// The start-relative alarms, as the offsets [`Event::alarms`] holds.
@@ -766,12 +772,12 @@ fn patch_alarms(
     let blocks = alarm_blocks(&lines, target.start, target.end);
     let held: Vec<chrono::Duration> = blocks
         .iter()
-        .filter_map(|block| match block.alarm {
+        .filter_map(|block| match block.trigger.map(|trigger| trigger.alarm) {
             Some(Alarm::Start(offset)) => Some(offset),
             _ => None,
         })
         .collect();
-    let unwanted = |block: &AlarmBlock| matches!(block.alarm, Some(Alarm::Start(offset)) if !wanted.contains(&offset));
+    let unwanted = |block: &AlarmBlock| matches!(block.trigger.map(|trigger| trigger.alarm), Some(Alarm::Start(offset)) if !wanted.contains(&offset));
     let mut added: Vec<chrono::Duration> = wanted
         .iter()
         .copied()
@@ -818,9 +824,18 @@ fn patch_alarms(
 /// The full picture behind [`Event::alarms`]: alarms relative to the end and
 /// alarms at a fixed time are here too. An override carries its own alarms;
 /// ask for the master's when it has none. Empty when the document holds no
-/// such event.
+/// such event. [`event_triggers`] has the same alarms with their nominal
+/// days.
 #[must_use]
 pub fn event_alarms(text: &str, uid: &str, recurrence_id: Option<EventTime>) -> Vec<Alarm> {
+    alarms_of(event_triggers(text, uid, recurrence_id))
+}
+
+/// Every alarm of one event in `text`, as [`event_alarms`] reads them, each
+/// with the days its offset was written in: what
+/// [`crate::model::Trigger::fires_at`] counts on the wall clock.
+#[must_use]
+pub fn event_triggers(text: &str, uid: &str, recurrence_id: Option<EventTime>) -> Vec<Trigger> {
     let lines = crate::patch::logical_lines(text);
     let components = top_level_components(&lines);
     components
@@ -832,20 +847,27 @@ pub fn event_alarms(text: &str, uid: &str, recurrence_id: Option<EventTime>) -> 
                 .as_ref()
                 .is_some_and(|(u, r)| u == uid && *r == recurrence_id)
         })
-        .map(|(component, _)| alarms_between(&lines, component.start, component.end))
+        .map(|(component, _)| triggers_between(&lines, component.start, component.end))
         .unwrap_or_default()
 }
 
 /// Every alarm of the task `uid` in `text`. See [`event_alarms`].
 #[must_use]
 pub fn todo_alarms(text: &str, uid: &str) -> Vec<Alarm> {
+    alarms_of(todo_triggers(text, uid))
+}
+
+/// Every alarm of the task `uid` in `text`, with its nominal days. See
+/// [`event_triggers`].
+#[must_use]
+pub fn todo_triggers(text: &str, uid: &str) -> Vec<Trigger> {
     let lines = crate::patch::logical_lines(text);
     top_level_components(&lines)
         .iter()
         .find(|component| {
             component.name == "VTODO" && component_uid(&lines, component).as_deref() == Some(uid)
         })
-        .map(|component| alarms_between(&lines, component.start, component.end))
+        .map(|component| triggers_between(&lines, component.start, component.end))
         .unwrap_or_default()
 }
 
@@ -2239,8 +2261,22 @@ fn datetime_line(property: &str, time: EventTime) -> String {
 /* Durations                                                          */
 
 /// Parses an RFC 5545 duration such as `-PT15M`, `PT1H30M`, `-P1D`, `P1W`.
+///
+/// The whole duration, as an exact span: a day is 86 400 seconds. See
+/// [`duration_parts`] for the days kept apart.
 #[must_use]
 pub fn parse_iso_duration(value: &str) -> Option<chrono::Duration> {
+    duration_parts(value).map(|(_, total)| total)
+}
+
+/// Parses an RFC 5545 duration into its nominal days (a week is seven) and
+/// its whole length, both signed like it: `-P1DT2H` is `(-1, -26 hours)`.
+///
+/// RFC 5545 section 3.3.6 counts the days on the wall clock and the rest as
+/// exact time, so the two are kept apart for whoever needs the difference
+/// (see [`crate::model::Trigger`]). `None` for anything malformed, or too
+/// long to represent.
+fn duration_parts(value: &str) -> Option<(i64, chrono::Duration)> {
     let raw = value.trim();
     let (negative, rest) = match raw.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -2254,6 +2290,7 @@ pub fn parse_iso_duration(value: &str) -> Option<chrono::Duration> {
         None => (rest, ""),
     };
 
+    let mut days: i64 = 0;
     let mut seconds: i64 = 0;
     let mut digits = String::new();
 
@@ -2264,11 +2301,12 @@ pub fn parse_iso_duration(value: &str) -> Option<chrono::Duration> {
         }
         let n: i64 = digits.parse().ok()?;
         digits.clear();
-        seconds += match c.to_ascii_uppercase() {
-            'W' => n * 7 * 86_400,
-            'D' => n * 86_400,
+        let unit_days = match c.to_ascii_uppercase() {
+            'W' => n.checked_mul(7)?,
+            'D' => n,
             _ => return None,
         };
+        days = days.checked_add(unit_days)?;
     }
     if !digits.is_empty() {
         return None;
@@ -2281,22 +2319,21 @@ pub fn parse_iso_duration(value: &str) -> Option<chrono::Duration> {
         }
         let n: i64 = digits.parse().ok()?;
         digits.clear();
-        seconds += match c.to_ascii_uppercase() {
-            'H' => n * 3_600,
-            'M' => n * 60,
-            'S' => n,
+        let unit = match c.to_ascii_uppercase() {
+            'H' => 3_600,
+            'M' => 60,
+            'S' => 1,
             _ => return None,
         };
+        seconds = seconds.checked_add(n.checked_mul(unit)?)?;
     }
     if !digits.is_empty() {
         return None;
     }
 
-    Some(chrono::Duration::seconds(if negative {
-        -seconds
-    } else {
-        seconds
-    }))
+    let total = days.checked_mul(86_400)?.checked_add(seconds)?;
+    let total = chrono::Duration::try_seconds(if negative { -total } else { total })?;
+    Some((if negative { -days } else { days }, total))
 }
 
 /// Renders a duration back to the RFC 5545 form.
@@ -2628,6 +2665,104 @@ mod tests {
         assert_eq!(Alarm::Start(-ten).fires_at(start, end), start - ten);
         assert_eq!(Alarm::End(-ten).fires_at(start, end), end - ten);
         assert_eq!(Alarm::At(fixed).fires_at(start, end), fixed);
+    }
+
+    /// A wall-clock time in Athens, 2026.
+    fn athens(month: u32, day: u32, hour: u32, minute: u32) -> chrono::DateTime<Tz> {
+        use chrono::TimeZone as _;
+        chrono_tz::Europe::Athens
+            .with_ymd_and_hms(2026, month, day, hour, minute, 0)
+            .unwrap()
+    }
+
+    /// One VALARM with this trigger line.
+    fn valarm(trigger: &str) -> String {
+        format!("BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\n{trigger}\r\nEND:VALARM")
+    }
+
+    #[test]
+    fn a_day_before_is_a_wall_clock_day_across_a_dst_change() {
+        // Athens moves to summer time at 03:00 on 29 March 2026 and back at
+        // 04:00 on 25 October. "One day before" a 09:00 event is 09:00 the
+        // day before (RFC 5545 section 3.3.6): 23 hours earlier in March, 25
+        // in October. It fired an exact 24 hours before, at 08:00 and 10:00.
+        let ics = wrap(&format!(
+            "DTSTART;TZID=Europe/Athens:20260329T090000\r\nSUMMARY:x\r\n{}\r\n{}",
+            valarm("TRIGGER:-P1D"),
+            valarm("TRIGGER:-PT24H"),
+        ));
+        let triggers = event_triggers(&ics, "x@test", None);
+        assert_eq!(
+            triggers,
+            vec![
+                Trigger::new(Alarm::Start(chrono::Duration::days(-1)), -1),
+                Trigger::new(Alarm::Start(chrono::Duration::hours(-24)), 0),
+            ],
+            "P1D and PT24H must stay apart"
+        );
+        let [day, hours] = triggers[..] else {
+            unreachable!("two triggers, as asserted")
+        };
+
+        let spring = athens(3, 29, 9, 0);
+        assert_eq!(day.fires_at(spring, spring), athens(3, 28, 9, 0));
+        assert_eq!(hours.fires_at(spring, spring), athens(3, 28, 8, 0));
+
+        let autumn = athens(10, 25, 9, 0);
+        assert_eq!(day.fires_at(autumn, autumn), athens(10, 24, 9, 0));
+        assert_eq!(hours.fires_at(autumn, autumn), athens(10, 24, 10, 0));
+
+        // The exact reading is still the one `Alarm` gives.
+        assert_eq!(
+            day.alarm.fires_at(spring.to_utc(), spring.to_utc()),
+            athens(3, 28, 8, 0)
+        );
+    }
+
+    #[test]
+    fn weeks_are_nominal_and_hours_after_the_days_are_exact() {
+        let spring = athens(3, 29, 9, 0);
+        let fires = |trigger: &str, end| {
+            let ics = wrap(&format!(
+                "DTSTART;TZID=Europe/Athens:20260329T090000\r\nSUMMARY:x\r\n{}",
+                valarm(trigger)
+            ));
+            event_triggers(&ics, "x@test", None)[0].fires_at(spring, end)
+        };
+
+        assert_eq!(fires("TRIGGER:-P1W", spring), athens(3, 22, 9, 0));
+        // A day on the wall clock, then an exact hour.
+        assert_eq!(fires("TRIGGER:-P1DT1H", spring), athens(3, 28, 8, 0));
+        // Anchored to the end, the days are counted from the end.
+        let end = athens(3, 29, 10, 0);
+        assert_eq!(fires("TRIGGER;RELATED=END:-P1D", end), athens(3, 28, 10, 0));
+        // A fixed time has no days to count.
+        assert_eq!(
+            fires("TRIGGER;VALUE=DATE-TIME:20260328T070000Z", spring),
+            athens(3, 28, 9, 0)
+        );
+    }
+
+    #[test]
+    fn a_day_before_that_lands_in_the_skipped_hour_moves_past_it() {
+        // 03:30 on 29 March does not exist in Athens. Read with the offset
+        // before the gap (RFC 5545 section 3.3.5), it is 04:30 summer time.
+        let start = athens(3, 30, 3, 30);
+        let trigger = Trigger::new(Alarm::Start(chrono::Duration::days(-1)), -1);
+        assert_eq!(trigger.fires_at(start, start), athens(3, 29, 4, 30));
+    }
+
+    #[test]
+    fn a_duration_keeps_its_days_apart_from_its_length() {
+        let hours = chrono::Duration::hours;
+        assert_eq!(duration_parts("-P1DT2H"), Some((-1, hours(-26))));
+        assert_eq!(duration_parts("P2W"), Some((14, hours(14 * 24))));
+        assert_eq!(duration_parts("PT24H"), Some((0, hours(24))));
+        assert_eq!(duration_parts("+P1D"), Some((1, hours(24))));
+        // Too long for any clock: refused, not wrapped or panicked on.
+        assert_eq!(duration_parts("P99999999999999999999D"), None);
+        assert_eq!(duration_parts("P999999999999999W"), None);
+        assert_eq!(duration_parts("PT9999999999999999999S"), None);
     }
 
     #[test]
