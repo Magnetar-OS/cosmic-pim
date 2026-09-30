@@ -41,6 +41,8 @@ pub use engine::{AccountReport, CollectionReport, SyncTally, sync_account, sync_
 pub use error::{Error, Result};
 pub use freebusy::{Answer, account_for_collection, availability};
 #[cfg(feature = "mail")]
-pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};
+pub use mail::{
+    DrainReport, MailReport, MailboxReport, credentials_for, drain_outbox, sync_account_mail,
+};
 pub use provision::{Provisioned, provision_account};
 pub use writeback::{Saved, queue_delete, queue_save, queue_save_with_base, save_and_queue};

@@ -38,6 +38,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   caller's choosing.
 - `AccountStore::credential_lock(id)`: a cross-process lock over one
   account's grant, held while it is renewed.
+- `cosmic_pim_sync::drain_outbox(&Account, &Credentials, mail_root, now_ms)
+  -> Result<DrainReport>` sends what is due in one account's outbox and does
+  nothing else: no mailbox is listed or pulled. It submits the way the
+  account's sync pass does (SMTP for IMAP, JMAP and POP3; `messages.send` for
+  Gmail; `sendMail` for Graph) and files the Sent copy where that pass would,
+  connecting to IMAP or JMAP only when something went. `DrainReport { sent,
+  given_up }` carries the outbox ids that went, like `MailReport::sent`.
 
 ### Changed
 

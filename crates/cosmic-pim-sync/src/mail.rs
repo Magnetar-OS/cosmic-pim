@@ -74,6 +74,122 @@ impl MailReport {
     }
 }
 
+/// What [`drain_outbox`] did.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct DrainReport {
+    /// The outbox ids of the messages that went, in the order they went —
+    /// the same ids [`MailReport::sent`] carries.
+    pub sent: Vec<String>,
+    /// Sends the outbox gave up on during this drain. These need a person.
+    pub given_up: usize,
+}
+
+/// Sends what is due in one account's outbox, and does nothing else.
+///
+/// The light alternative to [`sync_account_mail`] for an application with a
+/// send due on an account it is not otherwise syncing: no mailbox is listed
+/// or pulled. Each protocol submits the way its sync pass does — SMTP for
+/// IMAP, JMAP and POP3 accounts, `messages.send` for Gmail, `sendMail` for
+/// Graph — through the same outbox, with the same claim, backoff and
+/// never-retry-an-ambiguous-send rules.
+///
+/// The Sent copy goes where the pass puts it. IMAP and JMAP connect to file
+/// it only when something actually went, and a filing failure is logged,
+/// not returned: the message has been delivered, and an error would invite
+/// sending it again. Gmail and Graph file their own copy; POP3 has no Sent
+/// folder.
+///
+/// # Errors
+///
+/// When the outbox cannot be read or written, or a Gmail or Graph session
+/// cannot be set up (a password where an OAuth token is needed). A message
+/// that fails to send is not an error: it stays queued, with its reason.
+pub fn drain_outbox(
+    account: &Account,
+    credentials: &Credentials,
+    mail_root: &Path,
+    now_ms: i64,
+) -> Result<DrainReport> {
+    let Some(mail) = account.mail.as_ref() else {
+        return Ok(DrainReport::default());
+    };
+
+    let drained = match mail.protocol {
+        MailProtocol::Imap => {
+            let drained = send_over_smtp(account, mail, credentials, mail_root, now_ms)?;
+            if !drained.accepted.is_empty() {
+                let filed = Session::connect(&imap_endpoint(account, mail), credentials).and_then(
+                    |mut session| {
+                        let folders = session.folders()?;
+                        file_over_imap(account, &mut session, &folders, &drained.accepted);
+                        if let Err(why) = session.logout() {
+                            tracing::debug!(account = account.display_name, %why, "IMAP logout failed");
+                        }
+                        Ok(())
+                    },
+                );
+                if let Err(why) = filed {
+                    tracing::warn!(
+                        account = account.display_name, %why,
+                        "sent, but the Sent copies could not be filed"
+                    );
+                }
+            }
+            drained
+        }
+        MailProtocol::Jmap => {
+            let drained = send_over_smtp(account, mail, credentials, mail_root, now_ms)?;
+            if !drained.accepted.is_empty() {
+                let filed = mail
+                    .jmap_session_url
+                    .as_deref()
+                    .ok_or_else(|| {
+                        cosmic_pim_mail::Error::Jmap(
+                            "this account is set to use JMAP but names no session resource"
+                                .to_owned(),
+                        )
+                    })
+                    .and_then(|url| {
+                        cosmic_pim_mail::jmap::Session::connect(
+                            url,
+                            account.mail_username(),
+                            credentials,
+                        )
+                    })
+                    .and_then(|session| {
+                        let mailboxes = session.mailboxes()?;
+                        file_over_jmap(account, &session, &mailboxes, &drained.accepted);
+                        Ok(())
+                    });
+                if let Err(why) = filed {
+                    tracing::warn!(
+                        account = account.display_name, %why,
+                        "sent, but the Sent copies could not be filed"
+                    );
+                }
+            }
+            drained
+        }
+        MailProtocol::Pop3 => send_over_smtp(account, mail, credentials, mail_root, now_ms)?,
+        MailProtocol::Gmail => {
+            let session =
+                cosmic_pim_mail::gmail::Session::connect(credentials).map_err(Error::Mail)?;
+            drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft))?
+        }
+        MailProtocol::Graph => {
+            let session =
+                cosmic_pim_mail::graph::Session::connect(credentials).map_err(Error::Mail)?;
+            drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft))?
+        }
+    };
+
+    Ok(DrainReport {
+        sent: drained.ids(),
+        given_up: drained.given_up,
+    })
+}
+
 /// A resolved account secret, in the shape the mail protocols take.
 ///
 /// A free function rather than a `From` impl because both types are foreign to
@@ -843,6 +959,55 @@ mod tests {
         let queued = &outbox.list().unwrap()[0];
         assert_eq!(queued.attempts, 1, "the queued message was never attempted");
         assert!(queued.last_error.is_some());
+    }
+
+    #[test]
+    fn draining_alone_reaches_no_mailbox_server() {
+        // Only the submission server is contacted, and the mailbox server
+        // only to file what actually went: here nothing does, so an IMAP
+        // server that is down does not matter.
+        let mut account = account_with_mail();
+        refusing(&mut account, MailProtocol::Imap);
+        let dir = tempfile::tempdir().unwrap();
+        let password = Credentials::Password("pw".into());
+
+        let nothing = drain_outbox(&account, &password, dir.path(), 1_000).unwrap();
+        assert!(nothing.sent.is_empty() && nothing.given_up == 0);
+
+        let outbox = queue_one(&account, dir.path());
+        let report = drain_outbox(&account, &password, dir.path(), 1_000).unwrap();
+        assert!(report.sent.is_empty());
+        assert_eq!(report.given_up, 0);
+        let queued = &outbox.list().unwrap()[0];
+        assert_eq!(queued.attempts, 1, "the due message was not attempted");
+        assert!(queued.is_live(), "a refused connection gave the message up");
+    }
+
+    #[test]
+    fn every_protocol_drains_its_own_way() {
+        // POP3 submits over SMTP like IMAP; the API engines need a token and
+        // say so rather than sending nothing quietly.
+        let dir = tempfile::tempdir().unwrap();
+        let password = Credentials::Password("pw".into());
+        let mut pop3 = account_with_mail();
+        refusing(&mut pop3, MailProtocol::Pop3);
+        let outbox = queue_one(&pop3, dir.path());
+        drain_outbox(&pop3, &password, dir.path(), 1_000).unwrap();
+        assert_eq!(outbox.list().unwrap()[0].attempts, 1);
+
+        for protocol in [MailProtocol::Gmail, MailProtocol::Graph] {
+            let mut account = account_with_mail();
+            account.mail.as_mut().unwrap().protocol = protocol;
+            assert!(drain_outbox(&account, &password, dir.path(), 1_000).is_err());
+        }
+
+        let calendar_only = Account::new("Calendar only", "https://dav.example/", "ada");
+        assert!(
+            drain_outbox(&calendar_only, &password, dir.path(), 1_000)
+                .unwrap()
+                .sent
+                .is_empty()
+        );
     }
 
     #[test]
