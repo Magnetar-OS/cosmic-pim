@@ -15,6 +15,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   could neither mark the messages they answered nor file their Sent copies.
   The connection failure is now the inbox's `MailboxReport::outcome` (counted
   by `MailReport::failed`), and `MailReport::sent` keeps what went.
+- A Graph sync pass lists its folders before it drains the outbox, as the
+  IMAP and JMAP passes do. It listed them after, so a folder list that failed
+  returned an error in place of the ids `sendMail` had just accepted.
+  `sync_account_mail` now documents the rule every protocol keeps: an error
+  means the pass sent nothing, and once the drain has run, later failures are
+  reported per mailbox and `MailReport::sent` holds what went.
 
 ## [2.1.0] - 2026-09-30
 

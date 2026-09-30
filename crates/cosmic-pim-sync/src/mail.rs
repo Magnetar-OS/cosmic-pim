@@ -55,7 +55,8 @@ pub struct MailReport {
     pub mailboxes: Vec<MailboxReport>,
     /// The outbox ids of the messages that left this pass, in the order they
     /// went — what an app keyed a queued message's follow-up on (marking the
-    /// message it answers, for one) can settle by.
+    /// message it answers, for one) can settle by. Complete even when a
+    /// mailbox failed after the drain: see [`sync_account_mail`]'s errors.
     pub sent: Vec<String>,
     /// Sends the outbox has given up on. These need a person.
     pub given_up: usize,
@@ -240,6 +241,15 @@ fn security(transport: cosmic_pim_accounts::Transport) -> Security {
 /// everywhere else in this suite: a message sent and then filed to Sent by the
 /// server should be found by the pull that follows, in the same pass, rather
 /// than appearing a cycle later.
+///
+/// # Errors
+///
+/// Only from a step before the outbox is drained: the session, and the folder
+/// list the pass walks and files Sent copies into. So an error means this
+/// pass sent nothing. Once the drain has run, whatever fails after it is
+/// reported per mailbox in [`MailboxReport::outcome`] (and counted by
+/// [`MailReport::failed`]) — including a POP3 server that cannot be reached,
+/// which is its inbox failing — and [`MailReport::sent`] holds what went.
 pub fn sync_account_mail(
     account: &Account,
     credentials: &Credentials,
@@ -444,10 +454,26 @@ fn sync_over_graph(
     mail_root: &Path,
     now_ms: i64,
 ) -> Result<MailReport> {
+    let session = cosmic_pim_mail::graph::Session::connect(credentials).map_err(Error::Mail)?;
+    sync_graph_session(account, &session, mail_root, now_ms)
+}
+
+/// The Graph pass over a session already built — split from
+/// [`sync_over_graph`] so a test can point it at a scripted server.
+fn sync_graph_session(
+    account: &Account,
+    session: &cosmic_pim_mail::graph::Session,
+    mail_root: &Path,
+    now_ms: i64,
+) -> Result<MailReport> {
     use cosmic_pim_mail::graph;
 
-    let session = graph::Session::connect(credentials).map_err(Error::Mail)?;
     let mut report = MailReport::default();
+
+    // The folder list before the drain, as the IMAP and JMAP passes do: it is
+    // the last step that can fail the whole pass, and an error returned after
+    // the drain would take the ids of what it sent with it.
+    let folders = session.folders().map_err(Error::Mail)?;
 
     // The outbox before the pull. `sendMail` is the path that still works
     // when a tenant has SMTP AUTH switched off, and Exchange files its own
@@ -462,13 +488,13 @@ fn sync_over_graph(
         }
     }
 
-    for remote in session.folders().map_err(Error::Mail)? {
+    for remote in folders {
         let folder = graph::folder_for(&remote);
         let outcome = (|| {
             let path = mailbox_path(mail_root, &account.id, &folder);
             let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
             let mut state = graph::state(&path);
-            let result = graph::sync_folder(&session, &remote.id, &mut store, &mut state, now_ms);
+            let result = graph::sync_folder(session, &remote.id, &mut store, &mut state, now_ms);
             let outcome = save_after(result, || state.save(&path))?;
             Ok(SyncOutcome {
                 fetched: outcome.fetched,
@@ -1044,6 +1070,83 @@ mod tests {
         assert_eq!(outbox.count(), 0, "the message did not go");
         assert_eq!(report.failed(), 1, "the unreachable inbox went unreported");
         assert_eq!(report.mailboxes[0].wire_name, "INBOX");
+    }
+
+    /// A Graph root on this machine that accepts `sendMail` and answers every
+    /// other request 503. Returns its URL and the request lines it received.
+    fn graph_that_cannot_list() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut out = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() {
+                    continue;
+                }
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let status = if request.starts_with("POST /me/sendMail ") {
+                    "202 Accepted"
+                } else {
+                    "503 Service Unavailable"
+                };
+                log.lock().unwrap().push(request.trim_end().to_owned());
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    #[test]
+    fn a_graph_pass_that_fails_has_sent_nothing() {
+        // `sendMail` took the message, then the folder list failed. The pass
+        // returned that error and the sent id with it.
+        let (url, seen) = graph_that_cannot_list();
+        let mut account = account_with_mail();
+        account.mail.as_mut().unwrap().protocol = MailProtocol::Graph;
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = queue_one(&account, dir.path());
+        let session =
+            cosmic_pim_mail::graph::Session::connect_to(&url, &Credentials::OAuth2("t".into()))
+                .unwrap();
+
+        let result = sync_graph_session(&account, &session, dir.path(), 1_000);
+
+        assert!(result.is_err(), "the folder list failed");
+        assert_eq!(
+            outbox.count(),
+            1,
+            "the pass sent a message and then returned an error in place of its id"
+        );
+        assert!(
+            !seen.lock().unwrap().iter().any(|r| r.contains("sendMail")),
+            "sendMail was called by a pass that went on to fail"
+        );
     }
 
     #[test]
