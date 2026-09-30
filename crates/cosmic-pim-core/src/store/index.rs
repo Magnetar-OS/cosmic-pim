@@ -703,7 +703,11 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             .and_then(|s| DateTime::from_timestamp(s, 0)),
         recurrence_id: {
             let kind: i64 = row.get(18)?;
-            (kind != RID_NONE).then(|| join_time(kind, row.get(19).unwrap_or(0), row.get(20).ok()))
+            if kind == RID_NONE {
+                None
+            } else {
+                Some(join_time(kind, row.get(19)?, row.get(20)?))
+            }
         },
         attendees: row
             .get::<_, String>(21)?
@@ -1221,6 +1225,25 @@ mod tests {
             .sync_calendar(&cal)
             .expect("the older table was kept and the insert failed");
         assert_eq!(index.event_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_recurrence_id_that_cannot_be_read_is_an_error_not_the_epoch() {
+        // A row whose recurrence-id column holds something unreadable used to
+        // come back as an override of the instance at 1970-01-01: a wrong
+        // answer, where every other column of the row raises the error.
+        let (_root, cal, mut index) = setup();
+        let master = write_series_with_override(&cal);
+        index.sync_calendar(&cal).unwrap();
+        index
+            .conn
+            .execute(
+                "UPDATE events SET rid_naive = 'not a number' WHERE rid_kind != -1",
+                [],
+            )
+            .unwrap();
+
+        assert!(index.events_with_uid(&cal.id, &master.uid).is_err());
     }
 
     #[test]

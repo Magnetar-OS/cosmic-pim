@@ -15,6 +15,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - The calendar index rebuilds itself when its table predates the recurrence-id
   and attendee columns, instead of passing the staleness check and failing on
   every write (audit F-46).
+- An index row whose recurrence-id cannot be read is an error, like every
+  other column, instead of an override of the instance at 1970-01-01 (audit
+  F-46).
 
 ## [2.0.0] - 2026-09-29
 
