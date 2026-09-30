@@ -16,7 +16,7 @@ jobs:
     name: fmt, clippy, tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rustup reads rust-toolchain.toml on the first cargo invocation and
       # installs the pinned channel with its components. No toolchain action
@@ -90,7 +90,7 @@ jobs:
             pass: ci-password-1
             expect: Baikal
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Show the pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -241,7 +241,7 @@ jobs:
     name: live IMAP (dovecot)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Show the pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
