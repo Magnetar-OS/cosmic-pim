@@ -44,6 +44,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   file is refused the same way.
 - An alarm with `ACTION:NONE` (how Apple's calendars write "no alarm") is no
   longer read as an alarm.
+- Adding, changing or removing a reminder on an event or task that already
+  exists is written to its file. The save patched properties only, and an
+  alarm is a nested component, so the edit was accepted and then dropped.
+  Alarms the edit did not touch — another client's e-mail alarm, an alarm
+  relative to the end or at a fixed time — are left exactly as written.
 
 ## [2.0.0] - 2026-09-29
 

@@ -616,41 +616,57 @@ fn in_series_frame(time: EventTime, start: EventTime) -> NaiveDateTime {
     }
 }
 
-/// Every alarm of the component whose `BEGIN` is line `first` and whose
-/// `END` is line `last`, in document order.
+/// One `VALARM` directly inside a component: the lines it spans, and when
+/// it fires.
 ///
-/// One that never fires is left out: `ACTION:NONE`, which is how Apple's
-/// calendars write "this event has no alarm" (with a trigger in 1976), and
-/// one whose trigger cannot be read.
-fn alarms_between(
+/// `alarm` is `None` for one that never fires — `ACTION:NONE`, which is how
+/// Apple's calendars write "this event has no alarm" (with a trigger in 1976)
+/// — and for one whose trigger cannot be read.
+struct AlarmBlock {
+    start: usize,
+    end: usize,
+    alarm: Option<Alarm>,
+}
+
+/// The `VALARM` blocks directly inside the component whose `BEGIN` is line
+/// `first` and whose `END` is line `last`.
+///
+/// Read from the text rather than from the parser's components, so that the
+/// reader and the patcher ([`patch_alarms`]) agree line for line on which
+/// block is which alarm.
+fn alarm_blocks(
     lines: &[crate::patch::ContentLine<'_>],
     first: usize,
     last: usize,
-) -> Vec<Alarm> {
+) -> Vec<AlarmBlock> {
     let mut out = Vec::new();
     let mut depth = 0usize;
-    // The open alarm's trigger, and whether it is silenced.
-    let mut open: Option<(Option<Alarm>, bool)> = None;
+    // The open block's first line, its trigger, and whether it is silenced.
+    let mut open: Option<(usize, Option<Alarm>, bool)> = None;
 
-    for line in lines.iter().take(last).skip(first + 1) {
+    for (i, line) in lines.iter().enumerate().take(last).skip(first + 1) {
         if let Some(name) = line.begins() {
             depth += 1;
             if depth == 1 && name == "VALARM" {
-                open = Some((None, false));
+                open = Some((i, None, false));
             }
             continue;
         }
         if line.ends().is_some() {
             if depth == 1
-                && let Some((alarm, silenced)) = open.take()
+                && let Some((start, alarm, silenced)) = open.take()
             {
-                out.extend(alarm.filter(|_| !silenced));
+                out.push(AlarmBlock {
+                    start,
+                    end: i,
+                    alarm: alarm.filter(|_| !silenced),
+                });
             }
             depth = depth.saturating_sub(1);
             continue;
         }
         if depth == 1
-            && let Some((alarm, silenced)) = open.as_mut()
+            && let Some((_, alarm, silenced)) = open.as_mut()
         {
             match line.name().as_str() {
                 "TRIGGER" => *alarm = trigger_of(line),
@@ -660,6 +676,19 @@ fn alarms_between(
         }
     }
     out
+}
+
+/// Every alarm of the component spanning lines `first..=last`, in document
+/// order.
+fn alarms_between(
+    lines: &[crate::patch::ContentLine<'_>],
+    first: usize,
+    last: usize,
+) -> Vec<Alarm> {
+    alarm_blocks(lines, first, last)
+        .into_iter()
+        .filter_map(|block| block.alarm)
+        .collect()
 }
 
 /// One `TRIGGER` line as an [`Alarm`].
@@ -701,6 +730,85 @@ fn start_offsets(alarms: &[Alarm]) -> Vec<chrono::Duration> {
         .collect();
     out.sort();
     out.dedup();
+    out
+}
+
+/// Brings the start-relative alarms of the `index`-th top-level `component`
+/// in line with `wanted`, leaving every other byte of the document alone.
+///
+/// An alarm whose offset is still wanted keeps its block exactly as written
+/// — its action, its description, anything another client put there. One
+/// whose offset is no longer wanted is removed, and a wanted offset with no
+/// block gets a new display alarm before the component's `END`. Alarms that
+/// are not start-relative are not in `wanted` by definition and are never
+/// touched.
+///
+/// Without this an alarm edit on an existing event or task was dropped on
+/// the floor: the save patches properties, and an alarm is a nested
+/// component.
+fn patch_alarms(
+    text: &str,
+    component: &str,
+    index: usize,
+    wanted: &[chrono::Duration],
+    summary: &str,
+) -> String {
+    let lines = crate::patch::logical_lines(text);
+    let components = top_level_components(&lines);
+    let Some(target) = components
+        .iter()
+        .filter(|candidate| candidate.name == component)
+        .nth(index)
+    else {
+        return text.to_owned();
+    };
+
+    let blocks = alarm_blocks(&lines, target.start, target.end);
+    let held: Vec<chrono::Duration> = blocks
+        .iter()
+        .filter_map(|block| match block.alarm {
+            Some(Alarm::Start(offset)) => Some(offset),
+            _ => None,
+        })
+        .collect();
+    let unwanted = |block: &AlarmBlock| matches!(block.alarm, Some(Alarm::Start(offset)) if !wanted.contains(&offset));
+    let mut added: Vec<chrono::Duration> = wanted
+        .iter()
+        .copied()
+        .filter(|offset| !held.contains(offset))
+        .collect();
+    added.sort();
+    added.dedup();
+    if added.is_empty() && !blocks.iter().any(unwanted) {
+        return text.to_owned();
+    }
+
+    let terminator = crate::patch::terminator_of(text);
+    let mut out = String::with_capacity(text.len() + 96 * added.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i == target.end {
+            for offset in &added {
+                for new_line in [
+                    "BEGIN:VALARM".to_owned(),
+                    "ACTION:DISPLAY".to_owned(),
+                    // DESCRIPTION is REQUIRED on a DISPLAY alarm (RFC 5545
+                    // section 3.6.6); servers that validate reject the
+                    // component without it.
+                    format!("DESCRIPTION:{}", escape_text(summary)),
+                    format!("TRIGGER:{}", format_iso_duration(*offset)),
+                    "END:VALARM".to_owned(),
+                ] {
+                    crate::patch::fold(&new_line, terminator, &mut out);
+                }
+            }
+        }
+        let dropped = blocks
+            .iter()
+            .any(|block| unwanted(block) && i >= block.start && i <= block.end);
+        if !dropped {
+            out.push_str(line.raw());
+        }
+    }
     out
 }
 
@@ -1094,7 +1202,7 @@ pub fn upsert_vtodo(text: &str, todo: &Todo) -> String {
         }
 
         if let Some(patched) = patch_nth_component(text, "VTODO", index, &edits) {
-            return patched;
+            return patch_alarms(&patched, "VTODO", index, &todo.alarms, &todo.summary);
         }
     }
 
@@ -1559,7 +1667,14 @@ fn patch_vevent(text: &str, index: usize, event: &Event) -> Option<String> {
         },
     );
 
-    patch_nth_component(text, "VEVENT", index, &edits)
+    let patched = patch_nth_component(text, "VEVENT", index, &edits)?;
+    Some(patch_alarms(
+        &patched,
+        "VEVENT",
+        index,
+        &event.alarms,
+        &event.summary,
+    ))
 }
 
 /// The parameter section of every property occurrence inside the `index`-th
@@ -2485,6 +2600,92 @@ mod tests {
         assert_eq!(Alarm::Start(-ten).fires_at(start, end), start - ten);
         assert_eq!(Alarm::End(-ten).fires_at(start, end), end - ten);
         assert_eq!(Alarm::At(fixed).fires_at(start, end), fixed);
+    }
+
+    #[test]
+    fn an_alarm_added_to_an_existing_event_is_written() {
+        // A save patches the event's properties in place, and an alarm is a
+        // nested component: the edit was accepted and silently not written.
+        let ics = wrap(
+            "DTSTART:20260804T090000Z\r\nSUMMARY:Standup\r\n\
+             BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Standup\r\nTRIGGER:-PT10M\r\nEND:VALARM",
+        );
+        let mut event = one(&ics);
+        event.alarms = vec![
+            chrono::Duration::minutes(-30),
+            chrono::Duration::minutes(-10),
+        ];
+
+        let saved = upsert_vevent(&ics, &event);
+
+        assert_eq!(one(&saved).alarms, event.alarms, "{saved}");
+    }
+
+    #[test]
+    fn an_alarm_removed_from_an_existing_event_is_gone() {
+        let ics = wrap(
+            "DTSTART:20260804T090000Z\r\nSUMMARY:Standup\r\n\
+             BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Standup\r\nTRIGGER:-PT10M\r\nEND:VALARM",
+        );
+        let mut event = one(&ics);
+        event.alarms.clear();
+
+        let saved = upsert_vevent(&ics, &event);
+
+        assert!(one(&saved).alarms.is_empty(), "{saved}");
+        assert!(!saved.contains("VALARM"), "{saved}");
+    }
+
+    #[test]
+    fn a_save_leaves_the_alarms_it_did_not_change_exactly_as_written() {
+        // The e-mail alarm's recipients, the end-relative and the fixed-time
+        // alarms, and the placeholder are not things the offsets can
+        // describe; none of them may be rewritten or dropped.
+        let ics = wrap(EVERY_TRIGGER);
+        let mut event = one(&ics);
+        event.summary = "Renamed".into();
+        event.alarms.push(chrono::Duration::hours(-1));
+
+        let saved = upsert_vevent(&ics, &event);
+
+        for kept in [
+            "BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n",
+            "TRIGGER;RELATED=END:PT0S\r\n",
+            "ATTENDEE:mailto:ada@example.com\r\nTRIGGER;VALUE=DATE-TIME:20260803T170000Z\r\n",
+            "X-APPLE-DEFAULT-ALARM:TRUE\r\nACTION:NONE\r\n",
+        ] {
+            assert!(saved.contains(kept), "{kept:?} was rewritten:\n{saved}");
+        }
+        assert_eq!(saved.matches("BEGIN:VALARM").count(), 5, "{saved}");
+        assert!(saved.contains("TRIGGER:-PT1H\r\n"), "{saved}");
+
+        // And a save that changes no alarm changes no alarm bytes.
+        event.alarms.pop();
+        let untouched = upsert_vevent(&ics, &event);
+        assert_eq!(untouched.matches("BEGIN:VALARM").count(), 4, "{untouched}");
+    }
+
+    #[test]
+    fn an_alarm_edit_on_one_instance_leaves_the_series_alone() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+            BEGIN:VEVENT\r\nUID:s@test\r\nDTSTART:20260804T090000Z\r\nRRULE:FREQ=WEEKLY\r\n\
+            SUMMARY:Standup\r\n\
+            BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Standup\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n\
+            END:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:s@test\r\nRECURRENCE-ID:20260811T090000Z\r\n\
+            DTSTART:20260811T140000Z\r\nSUMMARY:Standup (moved)\r\nEND:VEVENT\r\n\
+            END:VCALENDAR\r\n";
+        let mut moved = parse_ics(ics, "c", "s.ics")
+            .into_iter()
+            .find(|event| event.recurrence_id.is_some())
+            .unwrap();
+        moved.alarms = vec![chrono::Duration::minutes(-5)];
+
+        let saved = upsert_vevent(ics, &moved);
+
+        let events = parse_ics(&saved, "c", "s.ics");
+        assert_eq!(events[0].alarms, vec![chrono::Duration::minutes(-10)]);
+        assert_eq!(events[1].alarms, vec![chrono::Duration::minutes(-5)]);
     }
 
     #[test]
@@ -3476,6 +3677,24 @@ mod todo_tests {
             vec![Alarm::At(
                 Utc.with_ymd_and_hms(2026, 8, 4, 6, 30, 0).unwrap()
             )]
+        );
+    }
+
+    #[test]
+    fn an_alarm_edit_on_an_existing_task_is_written() {
+        let ics = wrap(
+            "SUMMARY:x\r\nDUE:20260804T170000Z\r\n\
+             BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER:-PT30M\r\nEND:VALARM",
+        );
+        let mut todo = one(&ics);
+        todo.alarms = vec![chrono::Duration::hours(-2)];
+
+        let saved = upsert_vtodo(&ics, &todo);
+
+        assert_eq!(
+            one(&saved).alarms,
+            vec![chrono::Duration::hours(-2)],
+            "{saved}"
         );
     }
 

@@ -376,6 +376,8 @@ pub struct Event {
     ///
     /// Start-relative triggers only. An alarm set relative to the end, or at
     /// a fixed time, is not here — see [`Alarm`] for where to read those.
+    /// A save reconciles the file's start-relative alarms with this list and
+    /// leaves every other alarm as written.
     pub alarms: Vec<chrono::Duration>,
     pub sequence: i32,
     pub created: Option<DateTime<Utc>>,
