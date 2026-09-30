@@ -801,7 +801,8 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 ## Testing
 
-Roughly 930 tests in the substrate, `cargo test --workspace`.
+1265 tests in the substrate at 2.1.0, `cargo test --workspace`, and two ignored
+unless asked for: the performance baseline and the live CalDAV server test.
 
 `caldav/tests/live_server.rs` is the odd one out: it scripts nothing. Gated on
 `COSMIC_PIM_LIVE_CALDAV_URL` and ignored by default, it drives the real engine

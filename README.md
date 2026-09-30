@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/Magnetar-OS/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/Magnetar-OS/circle) | **Circle** | Contacts | Working — create and edit with photos and groups, CardDAV sync, GNOME Contacts parity closed |
 | [envelope](https://github.com/Magnetar-OS/envelope) | **Envelope** | Mail | Working — reads, threads and syncs over IMAP; composes and sends over SMTP with a durable outbox, drafts and attachments |
-| **cosmic-pim** | — | This substrate | 1131 tests |
+| **cosmic-pim** | — | This substrate | 1265 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
