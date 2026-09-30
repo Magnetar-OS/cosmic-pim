@@ -187,6 +187,82 @@ fn a_changed_feed_updates_removes_and_adds_in_place() {
     assert_eq!(summaries, ["May Day", "New Year's Day"]);
 }
 
+/// A calendar that is valid and holds nothing.
+const FEED_EMPTY: &str =
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//feed//EN\r\nEND:VCALENDAR\r\n";
+
+#[test]
+fn a_feed_that_stays_empty_is_believed_the_second_time() {
+    // One empty answer while events are held is more likely the host having
+    // a moment than a feed that emptied itself, so it removes nothing. But
+    // the validators of that answer were recorded, the next refresh was a
+    // 304, and a feed that really had been emptied was never looked at
+    // again: its events stayed for good.
+    let server = serve(FEED_V1, "\"v1\"");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let meta = feed::subscribe(dir.path(), "Holidays", &server.url, Rgb(1, 2, 3), None)
+        .expect("subscribe");
+    feed::refresh(&meta.path, 1_000).expect("first refresh");
+
+    server.publish(FEED_EMPTY, "\"empty\"");
+    let first = feed::refresh(&meta.path, 2_000).expect("the empty answer");
+    assert!(first.guard_tripped);
+    assert_eq!(first.removed, 0);
+    assert_eq!(vdir::read_collection(&meta).len(), 2);
+
+    let second = feed::refresh(&meta.path, 3_000).expect("the same answer again");
+    assert!(
+        !second.unchanged,
+        "the empty feed was not read again: its validators had been recorded"
+    );
+    assert_eq!(second.removed, 2);
+    assert!(vdir::read_collection(&meta).is_empty());
+}
+
+#[test]
+fn an_empty_answer_followed_by_events_removes_nothing() {
+    let server = serve(FEED_V1, "\"v1\"");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let meta = feed::subscribe(dir.path(), "Holidays", &server.url, Rgb(1, 2, 3), None)
+        .expect("subscribe");
+    feed::refresh(&meta.path, 1_000).expect("first refresh");
+
+    server.publish(FEED_EMPTY, "\"empty\"");
+    feed::refresh(&meta.path, 2_000).expect("the empty answer");
+    server.publish(FEED_V1, "\"v1-again\"");
+    feed::refresh(&meta.path, 3_000).expect("the feed is back");
+
+    // A later single empty answer starts from scratch.
+    server.publish(FEED_EMPTY, "\"empty-2\"");
+    let outcome = feed::refresh(&meta.path, 4_000).expect("empty once more");
+    assert!(outcome.guard_tripped);
+    assert_eq!(vdir::read_collection(&meta).len(), 2);
+}
+
+#[test]
+fn a_feed_cut_short_is_refused_and_nothing_is_removed() {
+    // A body that stops before END:VCALENDAR is not the feed. Applying it
+    // removed every event past the cut.
+    let server = serve(FEED_V1, "\"v1\"");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let meta = feed::subscribe(dir.path(), "Holidays", &server.url, Rgb(1, 2, 3), None)
+        .expect("subscribe");
+    feed::refresh(&meta.path, 1_000).expect("first refresh");
+
+    let cut = &FEED_V1[..FEED_V1
+        .find("BEGIN:VEVENT\r\nUID:mar25")
+        .expect("the second event")
+        + 20];
+    server.publish(cut, "\"cut\"");
+
+    assert!(feed::refresh(&meta.path, 2_000).is_err());
+    assert_eq!(
+        vdir::read_collection(&meta).len(),
+        2,
+        "the events past the cut were removed"
+    );
+}
+
 #[test]
 fn an_unchanged_event_is_not_rewritten() {
     // Rewriting identical bytes churns mtimes, and the watcher would wake

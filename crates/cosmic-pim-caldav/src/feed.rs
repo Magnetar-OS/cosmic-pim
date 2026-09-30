@@ -100,6 +100,38 @@ fn default_refresh() -> u32 {
     DEFAULT_REFRESH_MINUTES
 }
 
+/// The sidecar as [`refresh`] keeps it: the subscription, and one thing only
+/// a refresh needs to remember.
+#[derive(Debug, Serialize, Deserialize)]
+struct Sidecar {
+    #[serde(flatten)]
+    state: FeedState,
+    /// The last refresh found the feed empty while events were held, and
+    /// removed nothing. If the next one finds it empty too, that is the feed,
+    /// not a hiccup. See [`FeedOutcome::guard_tripped`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    empty_seen: bool,
+}
+
+impl Sidecar {
+    fn load(collection: &Path) -> Option<Self> {
+        let state = FeedState::load(collection)?;
+        let empty_seen = std::fs::read_to_string(collection.join(STATE_FILE))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Self>(&text).ok())
+            .is_some_and(|sidecar| sidecar.empty_seen);
+        Some(Self { state, empty_seen })
+    }
+
+    fn save(&self, collection: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|why| Error::internal(format!("serialising feed state: {why}")))?;
+        atomic::write(&collection.join(STATE_FILE), &json, None)
+            .map(|_| ())
+            .map_err(|why| Error::internal(format!("writing feed state: {why}")))
+    }
+}
+
 impl FeedState {
     /// Reads the sidecar in `collection`, if this collection is a feed.
     #[must_use]
@@ -198,7 +230,8 @@ pub struct FeedOutcome {
     pub removed: usize,
     /// The feed parsed to nothing while files were held, so removals were
     /// skipped — the same guard the CalDAV planner applies to an empty
-    /// listing.
+    /// listing, confirmed the same way: the next refresh reads the feed
+    /// again, and if it is still empty the removals are applied.
     pub guard_tripped: bool,
 }
 
@@ -214,12 +247,13 @@ impl FeedOutcome {
 /// `now_ms` is recorded as the check time whatever happens short of an error,
 /// so a 304 still resets the interval.
 pub fn refresh(collection: &Path, now_ms: i64) -> Result<FeedOutcome> {
-    let Some(mut state) = FeedState::load(collection) else {
+    let Some(mut sidecar) = Sidecar::load(collection) else {
         return Err(Error::internal(format!(
             "{} is not a feed collection",
             collection.display()
         )));
     };
+    let state = &mut sidecar.state;
 
     let http = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -241,7 +275,7 @@ pub fn refresh(collection: &Path, now_ms: i64) -> Result<FeedOutcome> {
     let status = response.status().as_u16();
     if status == 304 {
         state.last_checked_ms = now_ms;
-        state.save(collection)?;
+        sidecar.save(collection)?;
         return Ok(FeedOutcome {
             unchanged: true,
             ..Default::default()
@@ -262,45 +296,85 @@ pub fn refresh(collection: &Path, now_ms: i64) -> Result<FeedOutcome> {
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
 
-    let body = {
-        use std::io::Read as _;
-        let mut text = String::new();
-        response
-            .take(MAX_FEED_BYTES)
-            .read_to_string(&mut text)
-            .map_err(|why| Error::protocol(format!("feed {}: reading body: {why}", state.url)))?;
-        text
-    };
+    let body = read_capped(response, MAX_FEED_BYTES)
+        .map_err(|why| Error::protocol(format!("feed {}: {why}", state.url)))?;
+    check_whole(&body).map_err(|why| Error::protocol(format!("feed {} {why}", state.url)))?;
 
-    // The SSO-portal check, same as the DAV store's: a login page served as
-    // `200 text/calendar` must not replace a real calendar with HTML.
-    if !body
-        .trim_start()
-        .get(..15)
-        .is_some_and(|head| head.eq_ignore_ascii_case("BEGIN:VCALENDAR"))
-    {
-        return Err(Error::protocol(format!(
-            "feed {} did not return an iCalendar body",
-            state.url
-        )));
+    let outcome = apply(collection, &body, state, sidecar.empty_seen)?;
+
+    if outcome.guard_tripped {
+        // Not the feed's validators: recording them turns the next refresh
+        // into a 304, and a feed that really was emptied is then never
+        // looked at again (audit F-21). Dropping them makes the next
+        // refresh read the body, which is what confirms or clears this.
+        state.etag = None;
+        state.last_modified = None;
+    } else {
+        state.etag = etag;
+        state.last_modified = last_modified;
     }
-
-    let outcome = apply(collection, &body, &mut state)?;
-
-    state.etag = etag;
-    state.last_modified = last_modified;
-    state.last_checked_ms = now_ms;
-    state.save(collection)?;
+    sidecar.empty_seen = outcome.guard_tripped;
+    sidecar.state.last_checked_ms = now_ms;
+    sidecar.save(collection)?;
 
     Ok(outcome)
 }
 
+/// Reads a body of at most `limit` bytes as text, refusing a longer one.
+///
+/// Refusing, not truncating: a body cut at the limit is a calendar missing
+/// its tail, and applying it removes every event past the cut.
+fn read_capped(body: impl std::io::Read, limit: u64) -> std::result::Result<String, String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    body.take(limit.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(|why| format!("reading body: {why}"))?;
+    if text.len() as u64 > limit {
+        return Err(format!("is larger than {limit} bytes; refusing it"));
+    }
+    Ok(text)
+}
+
+/// Whether `body` is one whole calendar: it opens as one and it closes.
+///
+/// The opening is the SSO-portal check, same as the DAV store's: a login
+/// page served as `200 text/calendar` must not replace a real calendar with
+/// HTML. The closing is what tells a complete feed from one whose transfer
+/// stopped early.
+fn check_whole(body: &str) -> std::result::Result<(), &'static str> {
+    let opens = body
+        .trim_start()
+        .get(..15)
+        .is_some_and(|head| head.eq_ignore_ascii_case("BEGIN:VCALENDAR"));
+    if !opens {
+        return Err("did not return an iCalendar body");
+    }
+    let closes = body
+        .trim_end()
+        .rsplit('\n')
+        .next()
+        .is_some_and(|last| last.trim().eq_ignore_ascii_case("END:VCALENDAR"));
+    if !closes {
+        return Err("was cut short: the calendar does not end");
+    }
+    Ok(())
+}
+
 /// Splits the fetched calendar and reconciles the collection's files with it.
-fn apply(collection: &Path, body: &str, state: &mut FeedState) -> Result<FeedOutcome> {
+///
+/// `empty_confirmed` says the previous refresh already found the feed empty,
+/// which is what lets this one believe it.
+fn apply(
+    collection: &Path,
+    body: &str,
+    state: &mut FeedState,
+    empty_confirmed: bool,
+) -> Result<FeedOutcome> {
     let mut outcome = FeedOutcome::default();
     let split = split_by_uid(body);
 
-    if split.is_empty() && !state.files.is_empty() {
+    if split.is_empty() && !state.files.is_empty() && !empty_confirmed {
         // An empty-but-valid calendar while we hold events is far more likely
         // to be the host having a moment than a feed that emptied itself.
         // The same tradeoff as the CalDAV mass-delete guard, for the same
@@ -309,7 +383,8 @@ fn apply(collection: &Path, body: &str, state: &mut FeedState) -> Result<FeedOut
         tracing::warn!(
             collection = %collection.display(),
             held = state.files.len(),
-            "the feed parsed to no events while we hold some; skipping removals"
+            "the feed parsed to no events while we hold some; \
+             skipping removals until the next refresh confirms"
         );
         outcome.guard_tripped = true;
         return Ok(outcome);
@@ -630,6 +705,23 @@ END:VCALENDAR\r\n";
     fn garbage_yields_nothing_rather_than_a_panic() {
         assert!(split_by_uid("").is_empty());
         assert!(split_by_uid("not a calendar at all").is_empty());
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_refused_not_truncated() {
+        assert_eq!(read_capped(&b"12345678"[..], 8).as_deref(), Ok("12345678"));
+        assert!(
+            read_capped(&b"123456789"[..], 8).is_err(),
+            "a body one byte over the limit was cut and accepted"
+        );
+    }
+
+    #[test]
+    fn a_calendar_that_does_not_end_is_not_whole() {
+        assert!(check_whole(FEED).is_ok());
+        assert!(check_whole("BEGIN:VCALENDAR\nEND:VCALENDAR").is_ok());
+        assert!(check_whole(&FEED[..FEED.len() - 20]).is_err());
+        assert!(check_whole("<html>Sign in</html>").is_err());
     }
 
     #[test]

@@ -60,6 +60,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   then remove every component with that UID from the old file, which deleted
   the changed occurrences. A read-only calendar at either end is refused
   before anything is written.
+- ICS feeds: a feed found empty while events are held is read again on the
+  next refresh and believed then, instead of its validators being recorded so
+  that every later refresh was a 304 and an emptied feed kept its events for
+  good. A feed over the size limit, or one whose body stops before
+  `END:VCALENDAR`, is refused instead of being truncated and applied, which
+  removed every event past the cut (audit F-21).
 
 ## [2.0.0] - 2026-09-29
 
