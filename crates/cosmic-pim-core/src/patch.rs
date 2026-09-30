@@ -486,6 +486,82 @@ pub fn patch_nth_component(
     Some(out)
 }
 
+/// Sets the values of the `property` lines in `group`, inside the `index`-th
+/// `component`, in document order: the i-th such line takes `values[i]`,
+/// keeping its group prefix and every parameter.
+///
+/// For a group holding more than one line of one property, which a single
+/// [`Edit::groups`] value cannot address: it rewrote every one of them to the
+/// same value. Nothing is changed unless the group holds exactly
+/// `values.len()` such lines — with a line more or less, which value belongs
+/// to which line is a guess. `None` when there is no such component.
+pub(crate) fn set_grouped_values(
+    text: &str,
+    component: &str,
+    index: usize,
+    property: &str,
+    group: &str,
+    values: &[String],
+) -> Option<String> {
+    let lines = logical_lines(text);
+    let terminator = terminator_of(text);
+    let own = own_lines(&lines, component, index);
+    if !own.iter().any(|&line| line) {
+        return None;
+    }
+    let targets: Vec<usize> = (0..lines.len())
+        .filter(|&i| {
+            own[i]
+                && lines[i].name().eq_ignore_ascii_case(property)
+                && lines[i]
+                    .group()
+                    .is_some_and(|g| g.eq_ignore_ascii_case(group))
+        })
+        .collect();
+    if targets.len() != values.len() {
+        return Some(text.to_owned());
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        match targets.iter().position(|&target| target == i) {
+            Some(n) => {
+                let unfolded = line.unfolded();
+                let head = &unfolded[..find_unquoted_colon(unfolded).unwrap_or(unfolded.len())];
+                fold(&format!("{head}:{}", values[n]), terminator, &mut out);
+            }
+            None => out.push_str(line.raw()),
+        }
+    }
+    Some(out)
+}
+
+/// Which lines are the `index`-th `component`'s own properties: inside it,
+/// outside anything nested in it. Its BEGIN and END lines are not.
+fn own_lines(lines: &[ContentLine<'_>], component: &str, index: usize) -> Vec<bool> {
+    let mut own = vec![false; lines.len()];
+    let (mut seen, mut inside, mut nested) = (0usize, false, 0usize);
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(name) = line.begins() {
+            if inside {
+                nested += 1;
+            } else if name.eq_ignore_ascii_case(component) {
+                inside = true;
+            }
+        } else if line.ends().is_some() {
+            if nested > 0 {
+                nested -= 1;
+            } else if inside {
+                inside = false;
+                seen += 1;
+            }
+        } else {
+            own[i] = inside && nested == 0 && seen == index;
+        }
+    }
+    own
+}
+
 #[cfg(test)]
 mod tests {
 

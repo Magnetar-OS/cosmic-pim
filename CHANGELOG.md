@@ -146,6 +146,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - The POP3 sync pass sends what the account's outbox holds, over SMTP and
   before POP3 is reached. It had no drain at all, so a send queued on a POP3
   account (a failed attempt, Send later, the undo grace) never went.
+- Saving a contact whose card holds two lines of one property in one group
+  (`item1.EMAIL:a` and `item1.EMAIL:b`) keeps each line's own value. Both
+  were rewritten to the last one on any save (Circle audit S-04).
 
 ## [2.0.0] - 2026-09-29
 

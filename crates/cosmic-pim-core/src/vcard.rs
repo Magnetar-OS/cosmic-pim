@@ -773,10 +773,11 @@ pub fn remove_photo(raw: &str, uid: &str) -> Option<String> {
 /// and anything else this crate does not model — fine for a card this app
 /// created, silent data loss for one that came from a server.
 ///
-/// Grouped lines (`item1.EMAIL` and its `item1.X-ABLabel`) are preserved
-/// untouched, so Apple-style custom labels survive. That also means an edit to
-/// `contact.emails` does not reach them; see [`crate::patch`] for why, and for
-/// how to address one deliberately.
+/// A grouped line (`item1.EMAIL` beside its `item1.X-ABLabel`) has its value
+/// edited in place, keeping its group and parameters, so Apple-style custom
+/// labels survive; the label lines are never touched. Removing a grouped
+/// entry is [`crate::patch::remove_grouped`]'s job, since it has to take the
+/// label with it.
 ///
 /// The card patched is the one whose `UID` matches `contact`, not simply the
 /// first. A `.vcf` may hold many cards — every export from Google, Apple and
@@ -828,21 +829,62 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     /// Without this split, an entry parsed from `item1.EMAIL` would be written
     /// back as a plain `EMAIL` line *in addition to* the untouched grouped one
     /// — the contact would gain a duplicate address on every save.
-    fn split_typed(name: &str, values: &[Typed], version: WriteVersion) -> Edit {
-        let mut edit = Edit::set(
+    fn split_typed(
+        name: &str,
+        values: &[Typed],
+        version: WriteVersion,
+        several: &mut Vec<(String, String, Vec<String>)>,
+    ) -> Edit {
+        let edit = Edit::set(
             values
                 .iter()
                 .filter(|v| !v.is_grouped())
                 .map(|v| typed_line_versioned(name, v, version))
                 .collect(),
         );
-        for value in values.iter().filter(|v| v.is_grouped()) {
-            if let Some(group) = &value.group {
-                edit = edit.with_group(group.clone(), escape_text(&value.value));
+        in_groups(
+            edit,
+            name,
+            values
+                .iter()
+                .filter_map(|v| Some((v.group.clone()?, escape_text(&v.value)))),
+            several,
+        )
+    }
+
+    /// Adds grouped values to `edit`, one group at a time.
+    ///
+    /// A group with one line of this property is edited through
+    /// [`Edit::with_group`]. A group with several goes to `several`, set line
+    /// by line after the patch: one value per group rewrote *every* line in
+    /// it, so `item1.EMAIL:a` and `item1.EMAIL:b` both became `b` on any save
+    /// (Circle audit S-04).
+    fn in_groups(
+        mut edit: Edit,
+        name: &str,
+        grouped: impl Iterator<Item = (String, String)>,
+        several: &mut Vec<(String, String, Vec<String>)>,
+    ) -> Edit {
+        let mut by_group: Vec<(String, Vec<String>)> = Vec::new();
+        for (group, value) in grouped {
+            match by_group
+                .iter_mut()
+                .find(|(g, _)| g.eq_ignore_ascii_case(&group))
+            {
+                Some((_, values)) => values.push(value),
+                None => by_group.push((group, vec![value])),
+            }
+        }
+        for (group, mut values) in by_group {
+            if values.len() == 1 {
+                edit = edit.with_group(group, values.remove(0));
+            } else {
+                several.push((name.to_owned(), group, values));
             }
         }
         edit
     }
+    let mut several: Vec<(String, String, Vec<String>)> = Vec::new();
 
     // FN is REQUIRED (RFC 6350 §6.2.1), so it is set rather than removable.
     if !unchanged(&|s, c| s.label() == c.label()) {
@@ -883,17 +925,20 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
     }
     edits.insert(
         "EMAIL".to_owned(),
-        split_typed("EMAIL", &contact.emails, version),
+        split_typed("EMAIL", &contact.emails, version, &mut several),
     );
     edits.insert(
         "TEL".to_owned(),
-        split_typed("TEL", &contact.phones, version),
+        split_typed("TEL", &contact.phones, version, &mut several),
     );
-    edits.insert("URL".to_owned(), split_typed("URL", &contact.urls, version));
+    edits.insert(
+        "URL".to_owned(),
+        split_typed("URL", &contact.urls, version, &mut several),
+    );
     if !unchanged(&|s, c| s.addresses == c.addresses) {
         // Grouped addresses are rewritten in place, like grouped EMAIL: an
         // ungrouped line for each would sit beside the untouched grouped one.
-        let mut edit = Edit::set(
+        let edit = Edit::set(
             contact
                 .addresses
                 .iter()
@@ -901,12 +946,14 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
                 .map(address_line)
                 .collect(),
         );
-        for address in &contact.addresses {
-            if let Some(group) = &address.group {
-                edit = edit.with_group(group.clone(), address_value(address));
-            }
-        }
-        edits.insert("ADR".to_owned(), edit);
+        let grouped = contact
+            .addresses
+            .iter()
+            .filter_map(|a| Some((a.group.clone()?, address_value(a))));
+        edits.insert(
+            "ADR".to_owned(),
+            in_groups(edit, "ADR", grouped, &mut several),
+        );
     }
 
     if !unchanged(&|s, c| {
@@ -971,10 +1018,13 @@ pub fn patch_vcard(original: &str, contact: &Contact) -> Option<String> {
         )]),
     );
 
-    match vcard_index_of(original, &contact.uid) {
-        Some(index) => crate::patch::patch_nth_component(original, "VCARD", index, &edits),
-        None => None,
+    let index = vcard_index_of(original, &contact.uid)?;
+    let mut patched = crate::patch::patch_nth_component(original, "VCARD", index, &edits)?;
+    for (property, group, values) in &several {
+        patched =
+            crate::patch::set_grouped_values(&patched, "VCARD", index, property, group, values)?;
     }
+    Some(patched)
 }
 
 /// One card's own text, sliced out of a document that may hold several.
@@ -1610,6 +1660,44 @@ END:VCARD\r\n";
     /* ------------- editing one card in a file that holds several ------------- */
 
     /// What every mainstream exporter produces: one file, all the contacts.
+    #[test]
+    fn two_values_in_one_group_keep_their_own_values_on_a_save() {
+        // One group, two lines of one property. A grouped edit carried one
+        // value per group, so both lines became the last value on any save
+        // at all — here, a rename (Circle audit S-04).
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ada\r\nFN:Ada\r\n\
+item1.EMAIL;type=INTERNET:a@example.com\r\nitem1.EMAIL;type=INTERNET:b@example.com\r\n\
+item1.X-ABLabel:Home\r\nEND:VCARD\r\n";
+        let mut contact = parse_vcards(card, "c", "ada.vcf").remove(0);
+        assert_eq!(contact.emails.len(), 2, "the fixture reads as two emails");
+
+        contact.display_name = "Ada Lovelace".into();
+        let saved = patch_vcard(card, &contact).unwrap();
+        let values = |text: &str| -> Vec<String> {
+            parse_vcards(text, "c", "ada.vcf")
+                .remove(0)
+                .emails
+                .into_iter()
+                .map(|e| e.value)
+                .collect()
+        };
+        assert_eq!(
+            values(&saved),
+            ["a@example.com", "b@example.com"],
+            "{saved}"
+        );
+        assert!(saved.contains("item1.EMAIL;type=INTERNET:a@example.com\r\n"));
+
+        contact.emails[1].value = "c@example.com".into();
+        let edited = patch_vcard(card, &contact).unwrap();
+        assert_eq!(
+            values(&edited),
+            ["a@example.com", "c@example.com"],
+            "{edited}"
+        );
+        assert!(edited.contains("item1.X-ABLabel:Home\r\n"));
+    }
+
     const TWO_CARDS: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:card-1\r\n\
 FN:Ada Lovelace\r\nN:Lovelace;Ada;;;\r\nEMAIL:ada@example.com\r\n\
 X-WHICH:first\r\nEND:VCARD\r\n\
