@@ -50,6 +50,18 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
+  # Known vulnerabilities in the locked dependency graph, from the RustSec
+  # database. An advisory the workspace carries on purpose is listed, with its
+  # reason, in deny.toml; anything else fails here (audit O-06).
+  advisories:
+    name: advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
   # The server matrix 00-suite.md asks for: the real sync engine against real
   # CalDAV servers, exercising discovery, MKCALENDAR, listing, multiget,
   # writeback, the 412 path and guarded deletes against something nobody

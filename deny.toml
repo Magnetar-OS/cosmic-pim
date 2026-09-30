@@ -1,0 +1,10 @@
+# cargo-deny, run by CI's advisories job (audit O-06). Only the advisory check
+# is used: it reads the RustSec database against Cargo.lock.
+
+[advisories]
+# Advisories this workspace carries knowingly, each with the reason it cannot
+# move yet. Anything not listed fails CI, which is the point: a new advisory,
+# or a fix for one of these, is noticed on the next push.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 (Marvin timing side channel), reached through pgp 0.20 from cosmic-pim-mail. No fixed rsa release exists (0.10 is a release candidate) and pgp 0.20 requires rsa ^0.9. The mail crate verifies with public keys; the attack needs private-key operations. Revisit when pgp moves to rsa 0.10 (audit C-03)." },
+]
