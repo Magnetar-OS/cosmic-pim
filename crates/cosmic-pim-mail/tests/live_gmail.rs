@@ -282,15 +282,31 @@ fn route(
     }
 
     if tail == "/messages" {
-        let label = first(params, "labelIds").unwrap_or_default().to_owned();
-        note(format!("list {label}"));
-
-        let ids: Vec<Value> = state
-            .messages
-            .iter()
-            .filter(|m| m.labels.iter().any(|l| l == &label))
-            .map(|m| json!({ "id": m.id }))
-            .collect();
+        let ids: Vec<Value> = if let Some(query) = first(params, "q") {
+            // The one query the engine sends: the archive. Gmail leaves the
+            // bin and junk out of any listing unless asked.
+            note(format!("list q={query}"));
+            assert_eq!(query, "-in%3Ainbox%20-in%3Asent%20-in%3Adrafts");
+            state
+                .messages
+                .iter()
+                .filter(|m| {
+                    !m.labels
+                        .iter()
+                        .any(|l| ["INBOX", "SENT", "DRAFT", "TRASH", "SPAM"].contains(&l.as_str()))
+                })
+                .map(|m| json!({ "id": m.id }))
+                .collect()
+        } else {
+            let label = first(params, "labelIds").unwrap_or_default().to_owned();
+            note(format!("list {label}"));
+            state
+                .messages
+                .iter()
+                .filter(|m| m.labels.iter().any(|l| l == &label))
+                .map(|m| json!({ "id": m.id }))
+                .collect()
+        };
 
         return (200, json!({ "messages": ids }).to_string());
     }
@@ -565,6 +581,38 @@ fn an_expired_cursor_re_bootstraps_rather_than_freezing_or_emptying() {
         "no listing was made: {:?}",
         server.calls()
     );
+}
+
+#[test]
+fn an_expired_cursor_re_reads_the_archive_too() {
+    // The archive has no label to list, and its re-read used to open a new
+    // cursor and nothing else: mail archived while the cursor was stale
+    // never arrived, and mail that left the archive never went.
+    let server = serve(vec![Message::new("M1", &["INBOX"], RAW_ONE)]);
+    let (dir, mut archive) = maildir();
+    let mut state = gmail::state(dir.path());
+    sync(&server, "archive", &mut archive, &mut state);
+    server.relabel("M1", &[], &["INBOX"]);
+    sync(&server, "archive", &mut archive, &mut state);
+    assert!(state.uid_of("M1").is_some(), "the fixture archived nothing");
+
+    // During the gap: M1 goes back to the inbox, M2 arrives archived.
+    server.relabel("M1", &["INBOX"], &[]);
+    server.deliver(Message::new("M2", &[], RAW_TWO));
+    server.expire_history();
+
+    let outcome = sync(&server, "archive", &mut archive, &mut state);
+
+    assert!(outcome.bootstrapped);
+    assert!(
+        state.uid_of("M1").is_none(),
+        "a message that left the archive during the gap stayed"
+    );
+    assert!(
+        state.uid_of("M2").is_some(),
+        "a message archived during the gap never arrived"
+    );
+    assert_eq!(archive.state().expect("state").entries.len(), 1);
 }
 
 #[test]

@@ -121,6 +121,14 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   random bits. From the clock alone, two ids minted in one millisecond — two
   windows sending at once, a queued reply and a saved draft — were the same,
   and one record overwrote the other. Ids still sort by creation time.
+- Gmail: after an expired history cursor, the archive holding mail is read
+  again — its newest part listed by query, and every held message the
+  listing does not name asked about by itself — so mail archived during the
+  gap arrives and mail that left the archive goes. It used to open a new
+  cursor and nothing else (audit F-28).
+- Gmail: a message moved out of junk or the bin (to the inbox, the archive or
+  Sent) loses `SPAM` and `TRASH`, which outrank every other label; moved to
+  the inbox from junk it stayed in junk and came back there (audit F-28).
 
 ## [2.0.0] - 2026-09-29
 

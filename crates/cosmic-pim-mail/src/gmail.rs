@@ -201,16 +201,22 @@ pub fn label_delta(from: Flags, to: Flags) -> (Vec<&'static str>, Vec<&'static s
 /// removal of `INBOX` and nothing else. A client that models it as a move to
 /// an "Archive" folder either creates a label Gmail does not want or loses the
 /// operation entirely.
+///
+/// A move *out of* the bin or junk takes `TRASH` and `SPAM` off too. Those
+/// two outrank every other label in [`folder_from_labels`], so a message
+/// "moved to the inbox" from junk that kept `SPAM` stayed in junk, and came
+/// back there on the next pass (audit F-28). Removing a label a message does
+/// not carry is a no-op to Gmail.
 #[must_use]
 pub fn move_delta(destination: &str) -> (Vec<&'static str>, Vec<&'static str>) {
     match destination {
-        "archive" => (Vec::new(), vec!["INBOX"]),
-        "inbox" => (vec!["INBOX"], Vec::new()),
-        "trash" => (vec!["TRASH"], vec!["INBOX"]),
-        "junk" => (vec!["SPAM"], vec!["INBOX"]),
+        "archive" => (Vec::new(), vec!["INBOX", "SPAM", "TRASH"]),
         // Restoring from junk is not simply removing SPAM: Gmail leaves the
         // message nowhere visible unless INBOX goes back on.
-        "sent" => (vec!["SENT"], Vec::new()),
+        "inbox" => (vec!["INBOX"], vec!["SPAM", "TRASH"]),
+        "trash" => (vec!["TRASH"], vec!["INBOX", "SPAM"]),
+        "junk" => (vec!["SPAM"], vec!["INBOX", "TRASH"]),
+        "sent" => (vec!["SENT"], vec!["SPAM", "TRASH"]),
         _ => (Vec::new(), Vec::new()),
     }
 }
@@ -350,13 +356,19 @@ impl Session {
 
     /// Ids in one label, newest first, bounded by `limit`.
     pub fn list(&self, label: &str, limit: usize) -> Result<Vec<String>> {
+        self.list_where(&format!("labelIds={label}"), limit)
+    }
+
+    /// Ids matching `filter` — a `messages.list` parameter, already encoded
+    /// — newest first, bounded by `limit`.
+    fn list_where(&self, filter: &str, limit: usize) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut page_token: Option<String> = None;
 
         while ids.len() < limit {
             let take = PAGE_SIZE.min(limit - ids.len());
             let base = &self.base;
-            let mut url = format!("{base}/messages?labelIds={label}&maxResults={take}");
+            let mut url = format!("{base}/messages?{filter}&maxResults={take}");
             if let Some(token) = &page_token {
                 url.push_str("&pageToken=");
                 url.push_str(token);
@@ -696,9 +708,11 @@ pub const GMAIL_UID_VALIDITY: u32 = 1;
 /// The maildir folders this engine maintains, and the label each bootstraps
 /// from.
 ///
-/// `archive` has no label of its own — it is "all mail without INBOX" — so it
-/// is populated by history deltas rather than bootstrapped. Bootstrapping it
-/// would mean listing the entire account.
+/// `archive` has no label of its own — it is "all mail without INBOX" — so a
+/// first sync opens its cursor and lets history deltas populate it, rather
+/// than downloading the newest part of the whole account. A *re*-read, after
+/// the cursor expired with archived mail held, lists it by
+/// [`ARCHIVE_FILTER`] instead.
 const BOOTSTRAP_LABELS: &[(&str, &str)] = &[
     ("inbox", "INBOX"),
     ("sent", "SENT"),
@@ -706,6 +720,12 @@ const BOOTSTRAP_LABELS: &[(&str, &str)] = &[
     ("trash", "TRASH"),
     ("junk", "SPAM"),
 ];
+
+/// The archive as a `messages.list` filter: mail in none of the folders that
+/// outrank it in [`folder_from_labels`]. `messages.list` leaves the bin and
+/// junk out unless asked, so those two need no term; every result is still
+/// placed by its own labels.
+const ARCHIVE_FILTER: &str = "q=-in%3Ainbox%20-in%3Asent%20-in%3Adrafts";
 
 /// The folder a maildir path was opened for.
 #[must_use]
@@ -793,17 +813,25 @@ fn bootstrap(
     // bootstrap is caught by the next delta rather than skipped by a cursor
     // newer than the data it was recorded with.
     let opened_at = session.profile_history_id()?;
+    let known = store.state()?;
 
-    let Some((_, label)) = BOOTSTRAP_LABELS.iter().find(|(folder, _)| *folder == slug) else {
-        // `archive` and anything else: nothing to list, and the deltas will
-        // populate it. Opening the cursor is still right — otherwise this
-        // maildir bootstraps forever.
-        state.set_cursor(opened_at);
-        return Ok(outcome);
+    let filter = match BOOTSTRAP_LABELS.iter().find(|(folder, _)| *folder == slug) {
+        Some((_, label)) => format!("labelIds={label}"),
+        // The archive after an expired cursor, holding mail. Opening the
+        // cursor alone — what this once did — took "I cannot tell you what
+        // changed" for "nothing changed": mail archived during the gap never
+        // arrived, and mail that left it never went (audit F-28).
+        None if slug == "archive" && !known.entries.is_empty() => ARCHIVE_FILTER.to_owned(),
+        None => {
+            // A first archive sync, or a folder with nothing to list: the
+            // deltas populate it. Opening the cursor is still right —
+            // otherwise this maildir bootstraps forever.
+            state.set_cursor(opened_at);
+            return Ok(outcome);
+        }
     };
 
-    let ids = session.list(label, limit)?;
-    let known = store.state()?;
+    let ids = session.list_where(&filter, limit)?;
     let mut present = Vec::new();
 
     for id in &ids {
@@ -847,10 +875,31 @@ fn bootstrap(
         }
     }
 
+    if slug == "archive" {
+        // The listing is the newest part of what may be the whole account,
+        // so a held message it does not name is asked about by itself: gone,
+        // or placed elsewhere by its labels, it leaves; still archived, just
+        // older than the window, it stays.
+        for uid in known.entries.keys().copied().collect::<Vec<_>>() {
+            if present.contains(&uid) {
+                continue;
+            }
+            let Some(id) = state.id_of(uid).map(ToOwned::to_owned) else {
+                continue;
+            };
+            let still_here = session
+                .metadata(&id)?
+                .is_some_and(|message| message.folder() == slug);
+            if !still_here {
+                state.forget(&id);
+                store.remove(uid)?;
+                outcome.removed += 1;
+            }
+        }
     // The mass-delete guard: a listing that came back empty while we hold
     // messages is far more likely to be a server having a moment than a
     // mailbox that emptied itself.
-    if !ids.is_empty() {
+    } else if !ids.is_empty() {
         for uid in known.entries.keys().copied().collect::<Vec<_>>() {
             if !present.contains(&uid) && ids.len() < limit {
                 if let Some(id) = state.id_of(uid).map(ToOwned::to_owned) {
@@ -1176,14 +1225,35 @@ mod tests {
         // The operation IMAP cannot express, and the reason this module
         // exists. A client that models it as a move to a folder either invents
         // a label or loses the change.
-        assert_eq!(move_delta("archive"), (Vec::new(), vec!["INBOX"]));
+        let (add, remove) = move_delta("archive");
+        assert!(add.is_empty());
+        assert!(remove.contains(&"INBOX"));
     }
 
     #[test]
     fn binning_and_junking_also_leave_the_inbox() {
         // Leaving INBOX on means the message shows in both places.
-        assert_eq!(move_delta("trash"), (vec!["TRASH"], vec!["INBOX"]));
-        assert_eq!(move_delta("junk"), (vec!["SPAM"], vec!["INBOX"]));
+        assert!(move_delta("trash").1.contains(&"INBOX"));
+        assert!(move_delta("junk").1.contains(&"INBOX"));
+    }
+
+    #[test]
+    fn a_move_lands_the_message_where_it_was_sent_from_anywhere() {
+        // Moving to the inbox from junk added INBOX and left SPAM, which
+        // outranks it: the message stayed in junk and the next pass put it
+        // back there.
+        let apply = |labels: &[&str], destination: &str| {
+            let (add, remove) = move_delta(destination);
+            let mut labels: Vec<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+            labels.retain(|l| !remove.contains(&l.as_str()));
+            labels.extend(add.iter().map(|l| (*l).to_owned()));
+            folder_from_labels(&labels)
+        };
+        for from in [&["INBOX"][..], &["SPAM"], &["TRASH", "INBOX"], &[]] {
+            for to in ["inbox", "archive", "trash", "junk"] {
+                assert_eq!(apply(from, to), to, "{from:?} moved to {to}");
+            }
+        }
     }
 
     #[test]
