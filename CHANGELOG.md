@@ -87,6 +87,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   timeout (five minutes for `wait`) and releases the redirect port. The wait
   blocked in `accept` and looked at its deadline only when a connection
   arrived, so it never ended (audit F-43).
+- OAuth sign-in: a connection to the redirect listener that sends nothing —
+  a browser's spare connection — is set aside after two seconds instead of
+  failing the whole sign-in while the real redirect waits behind it.
 
 ## [2.0.0] - 2026-09-29
 

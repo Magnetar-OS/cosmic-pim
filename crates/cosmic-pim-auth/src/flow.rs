@@ -47,6 +47,13 @@ use crate::token::{self, TokenRequest};
 /// manager, and a second factor on a phone that is in another room.
 const REDIRECT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a connection to the listener may take to send its request line.
+///
+/// The redirect's arrives at once. A browser also opens spare connections
+/// that send nothing, and one of those is given this long and then set
+/// aside, not taken for a failed sign-in.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How often an idle wait looks for a connection.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
@@ -196,17 +203,33 @@ impl Pending {
     /// Reads one request. `Ok(None)` means it was not the redirect.
     fn handle(&self, mut stream: TcpStream) -> Result<Option<String>> {
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(REQUEST_TIMEOUT))
             .map_err(|why| Error::Redirect(why.to_string()))?;
 
         let mut line = String::new();
-        BufReader::new(
+        let read = BufReader::new(
             stream
                 .try_clone()
                 .map_err(|why| Error::Redirect(why.to_string()))?,
         )
-        .read_line(&mut line)
-        .map_err(|why| Error::Redirect(why.to_string()))?;
+        .read_line(&mut line);
+        match read {
+            Ok(0) => return Ok(None),
+            Ok(_) => {}
+            // A connection that never sent a request — a browser's spare —
+            // is not the redirect, and not a reason to give up on it. It
+            // failed the whole sign-in while the real redirect waited behind
+            // it.
+            Err(why)
+                if matches!(
+                    why.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(why) => return Err(Error::Redirect(why.to_string())),
+        }
 
         // "GET /callback?code=…&state=… HTTP/1.1"
         let Some(target) = line.split_whitespace().nth(1) else {
@@ -436,6 +459,29 @@ mod tests {
             matches!(&outcome, Err(Error::Redirect(why)) if why.contains("timed out")),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_connection_that_never_speaks_does_not_end_the_sign_in() {
+        // Browsers open a spare connection beside the one they use. One
+        // that sends nothing timed out reading and failed the whole sign-in,
+        // with the real redirect queued behind it.
+        let pending = begin(&provider_on_any_port()).unwrap();
+        let address = format!("127.0.0.1:{}", pending.port());
+        let state = pending.state.clone();
+        let _idle = TcpStream::connect(&address).unwrap();
+        std::thread::spawn(move || {
+            let mut real = TcpStream::connect(&address).unwrap();
+            let _ = write!(
+                real,
+                "GET /callback?code=the-code&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
+            );
+            let _ = std::io::Read::read_to_end(&mut real, &mut Vec::new());
+        });
+
+        let outcome = wait_on_a_thread(pending, Duration::from_secs(20), Duration::from_secs(20))
+            .expect("the wait never returned");
+        assert_eq!(outcome.ok().as_deref(), Some("the-code"));
     }
 
     fn provider(port: u16) -> OAuth {
