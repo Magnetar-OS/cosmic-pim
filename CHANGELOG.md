@@ -136,6 +136,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - Gmail: a message moved out of junk or the bin (to the inbox, the archive or
   Sent) loses `SPAM` and `TRASH`, which outrank every other label; moved to
   the inbox from junk it stayed in junk and came back there (audit F-28).
+- The POP3 sync pass sends what the account's outbox holds, over SMTP and
+  before POP3 is reached. It had no drain at all, so a send queued on a POP3
+  account (a failed attempt, Send later, the undo grace) never went.
 
 ## [2.0.0] - 2026-09-29
 
