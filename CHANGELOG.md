@@ -7,6 +7,15 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-30
+
+A minor version: every API change is an addition (a new type, new readers
+and a new function), so code built against 2.1.0 compiles unchanged. Two
+behaviours change, both under **Changed** and **Fixed**: `save_and_queue`
+skips files a write left as they were, and a mail sync pass that has sent
+mail no longer returns an error that drops the sent ids. Consumers stay on
+`"2"`.
+
 ### Added
 
 - `model::Trigger { alarm, days }` (`#[non_exhaustive]`, built with
