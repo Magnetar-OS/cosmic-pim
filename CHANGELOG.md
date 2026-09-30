@@ -7,6 +7,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-30
+
+A minor version: every API change is an addition (new functions, types, a
+re-export and a trait method with a default body), so code built against
+2.0.0 compiles unchanged. The one change of observable output is under
+**Changed**: `Debug` now redacts secrets. Consumers stay on `"2"`.
+
 ### Added
 
 - `model::Alarm` (`Start(Duration)`, `End(Duration)`, `At(DateTime<Utc>)`)
