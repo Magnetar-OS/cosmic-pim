@@ -47,6 +47,9 @@ use crate::token::{self, TokenRequest};
 /// manager, and a second factor on a phone that is in another room.
 const REDIRECT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How often an idle wait looks for a connection.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
 /// A sign-in that has been started and not yet completed.
 ///
 /// Holds the two secrets that must never travel in the authorize URL. Dropping
@@ -145,22 +148,39 @@ impl Pending {
     /// looking at it: a tab that hangs on a connection reset gives them no way
     /// to tell "it worked, close this" from "something broke".
     pub fn wait(&self) -> Result<String> {
+        self.wait_for(REDIRECT_TIMEOUT)
+    }
+
+    /// [`Self::wait`], giving up after `timeout` — for a dialog that offers a
+    /// shorter wait, or a Cancel that should not hold the port for minutes.
+    ///
+    /// The listener is polled rather than blocked on. A blocking `accept`
+    /// has no timeout, so the deadline was only looked at once a connection
+    /// arrived: a sign-in abandoned in the browser never ended, and its port
+    /// stayed bound (audit F-43).
+    pub fn wait_for(&self, timeout: Duration) -> Result<String> {
         self.listener
-            .set_nonblocking(false)
+            .set_nonblocking(true)
             .map_err(|why| Error::Redirect(why.to_string()))?;
 
-        let deadline = std::time::Instant::now() + REDIRECT_TIMEOUT;
+        let deadline = std::time::Instant::now() + timeout;
 
         loop {
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::Redirect(
-                    "timed out waiting for the sign-in to finish".to_owned(),
-                ));
-            }
-
-            let (stream, _peer) = self
-                .listener
-                .accept()
+            let stream = match self.listener.accept() {
+                Ok((stream, _peer)) => stream,
+                Err(why) if why.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Redirect(
+                            "timed out waiting for the sign-in to finish".to_owned(),
+                        ));
+                    }
+                    std::thread::sleep(ACCEPT_POLL);
+                    continue;
+                }
+                Err(why) => return Err(Error::Redirect(why.to_string())),
+            };
+            stream
+                .set_nonblocking(false)
                 .map_err(|why| Error::Redirect(why.to_string()))?;
 
             match self.handle(stream) {
@@ -377,6 +397,46 @@ fn decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider_on_any_port() -> OAuth {
+        OAuth {
+            client_id: Some("client".into()),
+            client_secret: None,
+            auth_url: "https://auth.example.com/authorize".into(),
+            token_url: "https://auth.example.com/token".into(),
+            scopes: vec!["mail".into()],
+            extra_params: BTreeMap::new(),
+            redirect_port: 0,
+        }
+    }
+
+    /// Runs `wait_for(timeout)` on a thread and reports what it came to, or
+    /// `None` if it had not returned after `patience`.
+    fn wait_on_a_thread(
+        pending: Pending,
+        timeout: Duration,
+        patience: Duration,
+    ) -> Option<Result<String>> {
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(pending.wait_for(timeout));
+        });
+        outcome.recv_timeout(patience).ok()
+    }
+
+    #[test]
+    fn a_sign_in_nobody_finishes_gives_up_on_time() {
+        // A closed browser tab: nothing ever connects. The deadline was only
+        // looked at after a connection arrived, so the wait never ended and
+        // the redirect port stayed bound (audit F-43).
+        let pending = begin(&provider_on_any_port()).unwrap();
+        let outcome = wait_on_a_thread(pending, Duration::from_millis(200), Duration::from_secs(5))
+            .expect("the wait never returned");
+        assert!(
+            matches!(&outcome, Err(Error::Redirect(why)) if why.contains("timed out")),
+            "{outcome:?}"
+        );
+    }
 
     fn provider(port: u16) -> OAuth {
         OAuth {

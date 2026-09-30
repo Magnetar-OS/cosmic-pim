@@ -34,6 +34,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   every other writer for one step; `VdirStore` implements it with the
   collection's lock, and the sync cycle decides about each pulled or deleted
   resource inside it. `VdirStore::reload()` re-reads the sidecar.
+- `Pending::wait_for(timeout)`: `Pending::wait` with a timeout of the
+  caller's choosing.
 
 ### Fixed
 
@@ -81,6 +83,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - A sync pass asks whether a resource has an unsent local edit and writes the
   server's copy as one step under the collection's lock, so an edit queued
   between the question and the write is no longer overwritten.
+- OAuth sign-in: a sign-in abandoned in the browser now gives up after its
+  timeout (five minutes for `wait`) and releases the redirect port. The wait
+  blocked in `accept` and looked at its deadline only when a connection
+  arrived, so it never ended (audit F-43).
 
 ## [2.0.0] - 2026-09-29
 
