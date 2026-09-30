@@ -527,6 +527,18 @@ pub fn split_vcards(text: &str) -> Vec<String> {
     out
 }
 
+/// How many cards a document holds.
+///
+/// Counted the way [`split_vcards`] finds them, whatever case the delimiters
+/// are written in: a count of the literal `BEGIN:VCARD` saw one card in a
+/// file of several lowercase ones, and the callers that ask — "is this file
+/// shared?" — then unlinked or replaced it whole (audit F-46).
+pub(crate) fn card_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.trim().eq_ignore_ascii_case("BEGIN:VCARD"))
+        .count()
+}
+
 /* ------------------------------------------------------------------ */
 /* Photos                                                             */
 

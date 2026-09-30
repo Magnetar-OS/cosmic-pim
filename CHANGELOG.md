@@ -23,6 +23,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   it and leaving the view stale after a large sync (audit F-46).
 - `birthdays::in_range` no longer reports a birthday in a year before the
   contact was born, at a negative age (audit F-46).
+- Deleting or importing one contact in a `.vcf` that holds several cards
+  written with lowercase `begin:vcard` no longer unlinks or replaces the file
+  and everyone else in it: cards are counted whatever case the delimiters use
+  (audit F-46).
 
 ## [2.0.0] - 2026-09-29
 

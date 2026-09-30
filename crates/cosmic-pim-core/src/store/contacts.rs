@@ -111,7 +111,7 @@ pub fn write_contact_versioned(
 
     let text = match crate::vcard::patch_vcard(source, contact) {
         Some(patched) => patched,
-        None if source.matches("BEGIN:VCARD").count() > 1 => {
+        None if crate::vcard::card_count(source) > 1 => {
             // Several cards in the file and none of them is this one. Falling
             // back to the model here would serialise one card over a document
             // holding many, deleting everybody else in it — so this refuses
@@ -349,7 +349,7 @@ impl ContactStore {
         // Google, Apple and Outlook is — must lose one card, not all of them.
         // Unlinking it here deleted everybody who happened to share the file
         // with the person being deleted.
-        if contact.raw.matches("BEGIN:VCARD").count() > 1 {
+        if crate::vcard::card_count(&contact.raw) > 1 {
             let remaining: String = split_vcards(&contact.raw)
                 .into_iter()
                 .filter(|card| {
@@ -442,7 +442,7 @@ impl ContactStore {
             // the first wrote.
             let path = meta.path.join(&file_name);
             let current = std::fs::read_to_string(&path).unwrap_or_default();
-            let text = if current.matches("BEGIN:VCARD").count() > 1 {
+            let text = if crate::vcard::card_count(&current) > 1 {
                 crate::vcard::replace_vcard(&current, &card.uid, &segment).unwrap_or_else(|| {
                     // In the file but not locatable by uid — a card with no
                     // UID of its own. Append rather than overwrite: a
@@ -762,6 +762,44 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob@x\r\nFN:Bob\r\nEND:VCARD\r\n";
             !ada.contains("Bob"),
             "one card's file carries the whole import: {ada}"
         );
+    }
+
+    #[test]
+    fn deleting_one_card_from_a_lowercase_file_keeps_the_others() {
+        // `begin:vcard` is as legal as `BEGIN:VCARD`. Counting the cards in
+        // a file case-sensitively saw one card where there were two, and
+        // deleting Ada unlinked the file and Bob with it.
+        let (_dir, mut store, meta) = store();
+        let shared = TWO_CARDS
+            .replace("BEGIN:VCARD", "begin:vcard")
+            .replace("END:VCARD", "end:vcard");
+        std::fs::write(meta.path.join("both.vcf"), shared).unwrap();
+        store.refresh();
+        assert_eq!(store.contacts().len(), 2);
+
+        store.delete(&meta.id, "ada@x").unwrap();
+        store.refresh();
+
+        let left: Vec<String> = store.contacts().iter().map(|c| c.uid.clone()).collect();
+        assert_eq!(left, ["bob@x"], "deleting one card took the other");
+    }
+
+    #[test]
+    fn importing_into_a_lowercase_shared_file_keeps_the_others() {
+        let (_dir, mut store, meta) = store();
+        let shared = TWO_CARDS
+            .replace("BEGIN:VCARD", "begin:vcard")
+            .replace("END:VCARD", "end:vcard");
+        std::fs::write(meta.path.join("both.vcf"), shared).unwrap();
+        store.refresh();
+
+        let update = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:ada@x\r\nFN:Ada Lovelace\r\nEND:VCARD\r\n";
+        store.import_vcf(update, &meta.id).unwrap();
+        store.refresh();
+
+        let mut names: Vec<String> = store.contacts().iter().map(|c| c.label()).collect();
+        names.sort();
+        assert_eq!(names, ["Ada Lovelace", "Bob"], "the import replaced the file");
     }
 
     #[test]
