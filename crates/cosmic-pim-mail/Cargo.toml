@@ -85,6 +85,9 @@ serde_json = "1"
 toml = "1.1"
 thiserror = "2"
 tracing = "0.1"
+# Draft and outbox ids carry 64 random bits after the clock. Already in the
+# graph through cosmic-pim-core, same version and feature.
+uuid = { version = "1.26", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

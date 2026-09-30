@@ -794,6 +794,7 @@ dependencies = [
  "tiny_http",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

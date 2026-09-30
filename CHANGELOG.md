@@ -117,6 +117,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   body on one line) is stored whole. It was stored as several lines with
   breaks inserted, and a piece that began with `.` was un-stuffed or taken
   for the end of the message (audit F-46).
+- `drafts::new_id` mints an id that is unique on its own: the clock, then 64
+  random bits. From the clock alone, two ids minted in one millisecond — two
+  windows sending at once, a queued reply and a saved draft — were the same,
+  and one record overwrote the other. Ids still sort by creation time.
 
 ## [2.0.0] - 2026-09-29
 

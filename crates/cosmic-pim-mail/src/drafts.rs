@@ -429,15 +429,20 @@ impl Drafts {
     }
 }
 
-/// A fresh draft id.
+/// A fresh draft id — also the id a queued message goes by, since a draft
+/// becomes its outbox entry under the same one.
 ///
-/// Derived from the clock rather than random so that ids sort by creation and a
-/// directory listing is chronological even without stat'ing every file. Two
-/// drafts created in the same millisecond would collide; the composer creates
-/// one at a time, in response to a keystroke.
+/// The clock first, so that ids sort by creation and a directory listing is
+/// chronological even without stat'ing every file; then 64 random bits, so
+/// that two ids minted in the same millisecond differ. From the clock alone,
+/// two windows sending at once, or a reply queued while a draft was being
+/// saved, got the same id and one overwrote the other — and so would two
+/// devices mirroring drafts into one server's Drafts folder, where the id is
+/// the mirror's `Message-ID`.
 #[must_use]
 pub fn new_id(now_ms: i64) -> String {
-    format!("{:016x}", now_ms.max(0))
+    let (random, _) = uuid::Uuid::new_v4().as_u64_pair();
+    format!("{:016x}{random:016x}", now_ms.max(0))
 }
 
 /// Is this an id this module could have minted?
@@ -457,6 +462,42 @@ fn modified_ms(path: &Path) -> i64 {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .and_then(|since| i64::try_from(since.as_millis()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn ids_minted_in_one_millisecond_are_all_different() {
+        // The composer is not the only caller: two windows sending at once,
+        // or a D-Bus reply queued while a draft saves, mint in the same
+        // millisecond, and the second record overwrote the first.
+        let ids: std::collections::HashSet<String> =
+            (0..10_000).map(|_| new_id(1_700_000_000_000)).collect();
+        assert_eq!(ids.len(), 10_000);
+        assert!(ids.iter().all(|id| is_valid_id(id)));
+    }
+
+    #[test]
+    fn ids_still_sort_by_when_they_were_made() {
+        let mut ids: Vec<String> = [3, 1_700_000_000_000, 2, 0x1_0000_0000]
+            .into_iter()
+            .map(new_id)
+            .collect();
+        ids.sort();
+        let prefixes: Vec<&str> = ids.iter().map(|id| &id[..16]).collect();
+        assert_eq!(
+            prefixes,
+            [
+                "0000000000000002",
+                "0000000000000003",
+                "0000000100000000",
+                "0000018bcfe56800"
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -745,14 +786,15 @@ mod tests {
         // The draft was discarded while its upload was in flight.
         let dir = tempfile::tempdir().unwrap();
         let drafts = Drafts::open(dir.path()).unwrap();
+        let id = new_id(11);
         drafts
-            .mark_mirrored(&new_id(11), "gone@example.com", None, &draft())
+            .mark_mirrored(&id, "gone@example.com", None, &draft())
             .unwrap();
         assert_eq!(drafts.count(), 0, "a ghost record was created");
         // The copy that upload filed has nothing pointing at it but this.
         assert_eq!(
             drafts.pending_retractions(),
-            vec![(new_id(11), "gone@example.com".to_owned())],
+            vec![(id, "gone@example.com".to_owned())],
             "the server copy of a draft discarded mid-upload was orphaned"
         );
     }
