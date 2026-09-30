@@ -109,6 +109,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   resolvers answer with loopback, and judges an IPv4 address carried in an
   IPv6 one (`::ffff:127.0.0.1`) as the IPv4 address it is, so neither can
   point a probe at this machine (audit F-46).
+- IMAP `Session::append` files a message with exactly the flags asked for.
+  `\Seen` was added whatever the caller said, so an mbox import of unread mail
+  arrived read. The drafts mirror asks for `\Seen` itself, as before (audit
+  F-46).
 
 ## [2.0.0] - 2026-09-29
 

@@ -267,18 +267,10 @@ impl Session {
         raw: &[u8],
         flags: crate::model::Flags,
     ) -> Result<Option<(u32, u32)>> {
-        use imap::types::Flag as F;
-        let mut imap_flags = vec![F::Seen];
-        if flags.flagged {
-            imap_flags.push(F::Flagged);
-        }
-        if flags.draft {
-            imap_flags.push(F::Draft);
-        }
         let appended = self
             .inner
             .append(mailbox, raw)
-            .flags(imap_flags)
+            .flags(append_flags(flags))
             .finish()
             .map_err(imap_error)?;
         let validity = appended.uid_validity;
@@ -933,10 +925,49 @@ impl PushQueue for MemoryMailbox {
     }
 }
 
+/// The system flags a message is filed with: the ones `flags` sets, and no
+/// others.
+///
+/// `\\Seen` used to be added whatever the caller asked for, so an mbox import
+/// of unread mail arrived read (audit F-46). A caller filing something the
+/// user has read — a sent copy — says so.
+fn append_flags(flags: crate::model::Flags) -> Vec<imap::types::Flag<'static>> {
+    use imap::types::Flag as F;
+    [
+        (flags.seen, F::Seen),
+        (flags.answered, F::Answered),
+        (flags.flagged, F::Flagged),
+        (flags.draft, F::Draft),
+    ]
+    .into_iter()
+    .filter_map(|(set, flag)| set.then_some(flag))
+    .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_is_filed_with_the_flags_asked_for_and_no_others() {
+        use crate::model::Flags;
+        use imap::types::Flag as F;
+        assert!(
+            append_flags(Flags::default()).is_empty(),
+            "an unread message was filed as read"
+        );
+        assert_eq!(
+            append_flags(Flags {
+                seen: true,
+                answered: true,
+                flagged: true,
+                draft: true,
+                ..Flags::default()
+            }),
+            [F::Seen, F::Answered, F::Flagged, F::Draft]
+        );
+    }
 
     #[test]
     fn search_dates_are_rendered_the_only_way_the_rfc_accepts() {

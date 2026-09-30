@@ -173,8 +173,11 @@ fn mirror_one(
     let landed = session.append_returning_uid(
         wire_name,
         &draft.mirror_bytes(&message_id, now_ms),
+        // Seen as well: a draft is the user's own words, and a mirror
+        // showing up as unread mail on their phone would be noise.
         Flags {
             draft: true,
+            seen: true,
             ..Flags::default()
         },
     )?;
