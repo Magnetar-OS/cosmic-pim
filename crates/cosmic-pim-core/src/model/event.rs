@@ -78,10 +78,12 @@ fn resolve(dt: NaiveDateTime, tz: Tz) -> DateTime<Utc> {
         // Spring-forward gap: nudge forward an hour, which always lands in the
         // post-transition offset.
         LocalResult::None => {
-            let shifted = dt + chrono::Duration::hours(1);
-            match tz.from_local_datetime(&shifted) {
-                LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => t.with_timezone(&Utc),
-                LocalResult::None => Utc.from_utc_datetime(&dt),
+            let shifted = dt.checked_add_signed(chrono::Duration::hours(1));
+            match shifted.map(|shifted| tz.from_local_datetime(&shifted)) {
+                Some(LocalResult::Single(t) | LocalResult::Ambiguous(t, _)) => {
+                    t.with_timezone(&Utc)
+                }
+                Some(LocalResult::None) | None => Utc.from_utc_datetime(&dt),
             }
         }
     }
@@ -431,13 +433,31 @@ impl Alarm {
     /// Every offset is an exact duration here, its days included. RFC 5545
     /// counts the days of an offset written in days or weeks on the wall
     /// clock instead; [`Trigger::fires_at`] does that.
+    ///
+    /// An offset that would run past the calendar chrono can represent gives
+    /// its first or last instant (`DateTime::<Utc>::MIN_UTC` or `MAX_UTC`),
+    /// never a panic. The readers never produce one: they skip triggers more
+    /// than ten years from their event.
     #[must_use]
     pub fn fires_at(self, start: DateTime<Utc>, end: DateTime<Utc>) -> DateTime<Utc> {
-        match self {
-            Alarm::Start(offset) => start + offset,
-            Alarm::End(offset) => end + offset,
-            Alarm::At(instant) => instant,
-        }
+        let (anchor, offset) = match self {
+            Alarm::Start(offset) => (start, offset),
+            Alarm::End(offset) => (end, offset),
+            Alarm::At(instant) => return instant,
+        };
+        anchor
+            .checked_add_signed(offset)
+            .unwrap_or_else(|| past_the_calendar(offset < chrono::Duration::zero()))
+    }
+}
+
+/// The instant an alarm whose offset runs off the representable calendar
+/// saturates to: the first one when it runs backwards, the last otherwise.
+fn past_the_calendar(backwards: bool) -> DateTime<Utc> {
+    if backwards {
+        DateTime::<Utc>::MIN_UTC
+    } else {
+        DateTime::<Utc>::MAX_UTC
     }
 }
 
@@ -478,6 +498,9 @@ impl Trigger {
     /// wall-clock time that a change skips moves forward past the gap, and
     /// one it repeats is the earlier of the two, as [`EventTime::to_utc`]
     /// resolves them.
+    ///
+    /// Saturates as [`Alarm::fires_at`] does, in the direction of the offset
+    /// (of the days, for an offset of zero), rather than panicking.
     #[must_use]
     pub fn fires_at(self, start: DateTime<Tz>, end: DateTime<Tz>) -> DateTime<Utc> {
         let (anchor, offset) = match self.alarm {
@@ -485,8 +508,14 @@ impl Trigger {
             Alarm::End(offset) => (end, offset),
             Alarm::At(instant) => return instant,
         };
-        let nominal = chrono::Duration::days(self.days);
-        resolve(anchor.naive_local() + nominal, anchor.timezone()) + (offset - nominal)
+        let fired = chrono::Duration::try_days(self.days).and_then(|nominal| {
+            let moved = anchor.naive_local().checked_add_signed(nominal)?;
+            resolve(moved, anchor.timezone()).checked_add_signed(offset.checked_sub(&nominal)?)
+        });
+        fired.unwrap_or_else(|| {
+            let zero = chrono::Duration::zero();
+            past_the_calendar(offset < zero || (offset == zero && self.days < 0))
+        })
     }
 }
 

@@ -50,6 +50,13 @@ mail no longer returns an error that drops the sent ids. Consumers stay on
 
 - `ical::parse_iso_duration` returns `None` for a duration too long to
   represent, where it could overflow or panic.
+- An alarm can no longer panic when it fires. A trigger more than ten years
+  (3653 days) from its event, such as `-P100000000D`, is not read as an
+  alarm: the readers skip it and the VALARM stays in the file untouched.
+  `Alarm::fires_at` and `Trigger::fires_at` also use checked arithmetic and
+  saturate to `DateTime::<Utc>::MIN_UTC` or `MAX_UTC` for an offset built by
+  hand that runs past the calendar. Before, `Alarm::fires_at` panicked on
+  such a trigger, which a received invitation could carry.
 
 - A POP3 sync pass whose POP3 server cannot be reached no longer returns an
   error after its outbox drain has sent mail. The pass sends over SMTP before

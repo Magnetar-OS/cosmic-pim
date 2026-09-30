@@ -696,15 +696,31 @@ fn alarms_of(triggers: Vec<Trigger>) -> Vec<Alarm> {
     triggers.into_iter().map(|trigger| trigger.alarm).collect()
 }
 
+/// The furthest a `TRIGGER` offset may be from its event: ten years, leap
+/// days included (3653 days).
+///
+/// No real reminder is further off, and the bound keeps every alarm's
+/// instant well inside the calendar chrono can represent, so firing one read
+/// from a file cannot overflow. A trigger beyond it — `-P100000000D` is
+/// 270 000 years — is treated like one that cannot be read: the VALARM is
+/// kept in the file, and is not an alarm.
+const MAX_TRIGGER_DAYS: i64 = 3653;
+
 /// One `TRIGGER` line as a [`Trigger`].
 ///
 /// All three forms are kept. An absolute trigger and one anchored to the end
 /// were once skipped, which left an event whose only alarm was one of those
 /// looking as if it had none — and an application's default reminder fired
 /// in its place (Slate audit F-09).
+///
+/// An offset longer than [`MAX_TRIGGER_DAYS`] either way is not read as an
+/// alarm at all.
 fn trigger_of(line: &crate::patch::ContentLine<'_>) -> Option<Trigger> {
     let value = line.value().trim();
     if let Some((days, offset)) = duration_parts(value) {
+        if offset.abs() > chrono::Duration::days(MAX_TRIGGER_DAYS) {
+            return None;
+        }
         let related_to_end = line.params().split(';').any(|param| {
             param.split_once('=').is_some_and(|(key, related)| {
                 key.trim().eq_ignore_ascii_case("RELATED")
@@ -2763,6 +2779,76 @@ mod tests {
         assert_eq!(duration_parts("P99999999999999999999D"), None);
         assert_eq!(duration_parts("P999999999999999W"), None);
         assert_eq!(duration_parts("PT9999999999999999999S"), None);
+    }
+
+    #[test]
+    fn a_trigger_beyond_ten_years_is_not_an_alarm() {
+        use chrono::Datelike as _;
+        // `-P100000000D` parsed, and firing it panicked: 270 000 years before
+        // any start is past the end of chrono's calendar. An invitation could
+        // carry one.
+        let triggers = |trigger: &str| {
+            let ics = wrap(&format!(
+                "DTSTART:20260804T090000Z\r\nSUMMARY:x\r\n{}",
+                valarm(trigger)
+            ));
+            event_triggers(&ics, "x@test", None)
+        };
+        let start = athens(8, 4, 9, 0);
+        for absurd in [
+            "TRIGGER:-P100000000D",
+            "TRIGGER:P100000000W",
+            "TRIGGER:-PT2562047788015H",
+            "TRIGGER:PT9223372036854775S",
+            "TRIGGER;RELATED=END:-P3654D",
+        ] {
+            let read = triggers(absurd);
+            assert!(read.is_empty(), "{absurd} was read as {read:?}");
+        }
+        // Ten years is the bound, and it is an alarm.
+        let ten_years = triggers("TRIGGER:-P3653D");
+        assert_eq!(ten_years.len(), 1);
+        assert_eq!(
+            ten_years[0].fires_at(start, start),
+            athens(8, 4, 9, 0).with_year(2016).unwrap() - chrono::Duration::days(1),
+            "3653 days before 4 August 2026 is 3 August 2016"
+        );
+    }
+
+    #[test]
+    fn an_alarm_built_past_the_calendar_saturates_instead_of_panicking() {
+        // The parser bounds what it reads; these are built by hand, which
+        // the constructors allow.
+        use chrono::{DateTime, TimeDelta};
+        let start = athens(8, 4, 9, 0);
+        let (min, max) = (DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC);
+        let far_back = chrono::Duration::days(-100_000_000);
+
+        assert_eq!(
+            Alarm::Start(far_back).fires_at(start.to_utc(), start.to_utc()),
+            min
+        );
+        assert_eq!(
+            Alarm::End(TimeDelta::MAX).fires_at(start.to_utc(), start.to_utc()),
+            max
+        );
+        assert_eq!(
+            Trigger::new(Alarm::Start(far_back), -100_000_000).fires_at(start, start),
+            min
+        );
+        assert_eq!(
+            Trigger::new(Alarm::Start(TimeDelta::MIN), 0).fires_at(start, start),
+            min
+        );
+        assert_eq!(
+            Trigger::new(Alarm::End(TimeDelta::zero()), i64::MAX).fires_at(start, start),
+            max
+        );
+        assert_eq!(
+            Trigger::new(Alarm::Start(TimeDelta::MAX), i64::MIN).fires_at(start, start),
+            max,
+            "the offset's sign decides the direction"
+        );
     }
 
     #[test]
