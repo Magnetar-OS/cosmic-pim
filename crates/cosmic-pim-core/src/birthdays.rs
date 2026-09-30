@@ -61,6 +61,11 @@ pub fn in_range(contacts: &[Contact], start: NaiveDate, end: NaiveDate) -> Vec<B
         };
 
         for year in start.year()..=end.year() {
+            // Nobody has a birthday before the year they were born: a view
+            // of an earlier year showed one, at a negative age (audit F-46).
+            if birth_year.is_some_and(|born| year < born) {
+                continue;
+            }
             let Some(date) = celebrated_on(year, month, day) else {
                 continue;
             };
@@ -195,6 +200,25 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].turns, Some(211));
         assert_eq!(hits[1].turns, Some(212));
+    }
+
+    #[test]
+    fn nobody_has_a_birthday_before_they_are_born() {
+        // Browsing back past a child's birth year showed a birthday on which
+        // they "turned -2".
+        let child = contact("Child", Some(date(2024, 5, 1)), None);
+        assert!(
+            in_range(
+                std::slice::from_ref(&child),
+                date(2022, 1, 1),
+                date(2024, 1, 1)
+            )
+            .is_empty()
+        );
+        // The day itself is theirs.
+        let born = in_range(&[child], date(2024, 1, 1), date(2025, 1, 1));
+        assert_eq!(born.len(), 1);
+        assert_eq!(born[0].turns, Some(0));
     }
 
     #[test]

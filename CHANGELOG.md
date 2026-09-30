@@ -21,6 +21,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - The vdir watcher wakes its reader when the kernel's event queue overflowed
   and the events were dropped (notify's "rescan" event), instead of ignoring
   it and leaving the view stale after a large sync (audit F-46).
+- `birthdays::in_range` no longer reports a birthday in a year before the
+  contact was born, at a negative age (audit F-46).
 
 ## [2.0.0] - 2026-09-29
 
