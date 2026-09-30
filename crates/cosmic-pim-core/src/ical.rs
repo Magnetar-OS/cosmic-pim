@@ -2262,8 +2262,8 @@ fn datetime_line(property: &str, time: EventTime) -> String {
 
 /// Parses an RFC 5545 duration such as `-PT15M`, `PT1H30M`, `-P1D`, `P1W`.
 ///
-/// The whole duration, as an exact span: a day is 86 400 seconds. See
-/// [`duration_parts`] for the days kept apart.
+/// The whole duration, as an exact span: a day is 86 400 seconds. A VALARM
+/// trigger's days are kept apart in [`crate::model::Trigger`].
 #[must_use]
 pub fn parse_iso_duration(value: &str) -> Option<chrono::Duration> {
     duration_parts(value).map(|(_, total)| total)
