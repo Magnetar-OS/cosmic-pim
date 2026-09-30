@@ -202,81 +202,20 @@ fn reconcile(
             continue;
         };
 
-        // Deleted here, changed there. Putting the event back would undo the
-        // user's deletion without asking; letting the queued DELETE win would
-        // discard the server's change without asking. Both are recorded, and
-        // the queued DELETE waits for the answer.
-        if store.queued_delete(href)? {
-            tracing::warn!(
-                href,
-                "the server changed a resource this device deleted; recording a conflict"
-            );
-            store.record_conflict(&Conflict {
-                href: href.clone(),
-                kind: ConflictKind::DeletedHere,
-                local: String::new(),
-                remote: ics.clone(),
-                remote_etag: (*etag).to_owned(),
-                base: None,
-            })?;
-            applied.insert(href.as_str());
-            outcome.conflicts += 1;
-            continue;
-        }
-
-        // Both sides changed. With the base in hand, edits to different
-        // properties are not a disagreement — merge them and move on. Only a
-        // genuine overlap (or a missing base) is recorded for the user.
-        if let Some(local) = store.unpushed_local(href)?
-            && local != *ics
-        {
-            let base = store.unpushed_base(href)?;
-            if let Some(merged) = base
-                .as_deref()
-                .and_then(|base| cosmic_pim_core::merge::merge3(base, &local, ics))
-            {
-                tracing::info!(
-                    href,
-                    "both sides changed a resource in different places; merged automatically"
-                );
-                store.apply_merged(
-                    &merged,
-                    &RemoteEvent {
-                        href: href.clone(),
-                        etag: (*etag).to_owned(),
-                        ics: ics.clone(),
-                    },
-                )?;
-                applied.insert(href.as_str());
-                outcome.auto_merged += 1;
-                continue;
-            }
-
-            tracing::warn!(
-                href,
-                "the server and this device both changed a resource; \
-                 keeping the local copy and recording a conflict"
-            );
-            store.record_conflict(&Conflict {
-                href: href.clone(),
-                kind: ConflictKind::BothEdited,
-                local,
-                remote: ics.clone(),
-                remote_etag: (*etag).to_owned(),
-                base,
-            })?;
-            applied.insert(href.as_str());
-            outcome.conflicts += 1;
-            continue;
-        }
-
-        store.upsert(&RemoteEvent {
+        let remote = RemoteEvent {
             href: href.clone(),
             etag: (*etag).to_owned(),
             ics: ics.clone(),
-        })?;
+        };
+        // One step: an application saving this resource right now has
+        // either finished before the pull asks whether an edit is waiting,
+        // and is seen, or starts after the pull has written.
+        match store.exclusively(|store| apply_remote(store, &remote))? {
+            Applied::Fetched => outcome.fetched += 1,
+            Applied::Merged => outcome.auto_merged += 1,
+            Applied::Conflict => outcome.conflicts += 1,
+        }
         applied.insert(href.as_str());
-        outcome.fetched += 1;
     }
 
     // An href we asked for and did not get back is left exactly as it was —
@@ -295,28 +234,10 @@ fn reconcile(
     }
 
     for href in &plan.to_delete {
-        // Deleted there, changed here. Removing the file would take the
-        // user's unsent edit with it — "a pull never overwrites an unsent
-        // local edit" covers a deletion too.
-        if let Some(local) = store.unpushed_local(href)? {
-            tracing::warn!(
-                href,
-                "the server deleted a resource this device changed; recording a conflict"
-            );
-            let base = store.unpushed_base(href)?;
-            store.record_conflict(&Conflict {
-                href: href.clone(),
-                kind: ConflictKind::DeletedOnServer,
-                local,
-                remote: String::new(),
-                remote_etag: String::new(),
-                base,
-            })?;
-            outcome.conflicts += 1;
-            continue;
+        match store.exclusively(|store| apply_removal(store, href))? {
+            Applied::Conflict => outcome.conflicts += 1,
+            Applied::Fetched | Applied::Merged => outcome.deleted += 1,
         }
-        store.remove(href)?;
-        outcome.deleted += 1;
     }
 
     // 6. commit — only over a cycle that applied everything it was asked to.
@@ -333,6 +254,106 @@ fn reconcile(
         );
     }
     Ok(outcome)
+}
+
+/// What became of one resource the server changed.
+enum Applied {
+    /// The server's copy was taken (or, for a removal, the file went).
+    Fetched,
+    /// Both sides had changed it in different places; merged.
+    Merged,
+    /// Both sides had changed it; recorded for the user.
+    Conflict,
+}
+
+/// Applies the server's copy of one resource. Run under
+/// [`CalDavStore::exclusively`], so the questions and the write are one step.
+fn apply_remote(store: &mut impl CalDavStore, remote: &RemoteEvent) -> Result<Applied> {
+    let href = remote.href.as_str();
+
+    // Deleted here, changed there. Putting the event back would undo the
+    // user's deletion without asking; letting the queued DELETE win would
+    // discard the server's change without asking. Both are recorded, and
+    // the queued DELETE waits for the answer.
+    if store.queued_delete(href)? {
+        tracing::warn!(
+            href,
+            "the server changed a resource this device deleted; recording a conflict"
+        );
+        store.record_conflict(&Conflict {
+            href: href.to_owned(),
+            kind: ConflictKind::DeletedHere,
+            local: String::new(),
+            remote: remote.ics.clone(),
+            remote_etag: remote.etag.clone(),
+            base: None,
+        })?;
+        return Ok(Applied::Conflict);
+    }
+
+    // Both sides changed. With the base in hand, edits to different
+    // properties are not a disagreement — merge them and move on. Only a
+    // genuine overlap (or a missing base) is recorded for the user.
+    if let Some(local) = store.unpushed_local(href)?
+        && local != remote.ics
+    {
+        let base = store.unpushed_base(href)?;
+        if let Some(merged) = base
+            .as_deref()
+            .and_then(|base| cosmic_pim_core::merge::merge3(base, &local, &remote.ics))
+        {
+            tracing::info!(
+                href,
+                "both sides changed a resource in different places; merged automatically"
+            );
+            store.apply_merged(&merged, remote)?;
+            return Ok(Applied::Merged);
+        }
+
+        tracing::warn!(
+            href,
+            "the server and this device both changed a resource; \
+             keeping the local copy and recording a conflict"
+        );
+        store.record_conflict(&Conflict {
+            href: href.to_owned(),
+            kind: ConflictKind::BothEdited,
+            local,
+            remote: remote.ics.clone(),
+            remote_etag: remote.etag.clone(),
+            base,
+        })?;
+        return Ok(Applied::Conflict);
+    }
+
+    store.upsert(remote)?;
+    Ok(Applied::Fetched)
+}
+
+/// Applies the server's deletion of one resource. Run under
+/// [`CalDavStore::exclusively`], like [`apply_remote`].
+fn apply_removal(store: &mut impl CalDavStore, href: &str) -> Result<Applied> {
+    // Deleted there, changed here. Removing the file would take the user's
+    // unsent edit with it — "a pull never overwrites an unsent local edit"
+    // covers a deletion too.
+    if let Some(local) = store.unpushed_local(href)? {
+        tracing::warn!(
+            href,
+            "the server deleted a resource this device changed; recording a conflict"
+        );
+        let base = store.unpushed_base(href)?;
+        store.record_conflict(&Conflict {
+            href: href.to_owned(),
+            kind: ConflictKind::DeletedOnServer,
+            local,
+            remote: String::new(),
+            remote_etag: String::new(),
+            base,
+        })?;
+        return Ok(Applied::Conflict);
+    }
+    store.remove(href)?;
+    Ok(Applied::Fetched)
 }
 
 #[cfg(test)]

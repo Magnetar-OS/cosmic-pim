@@ -22,6 +22,18 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   every part that did not change are kept, so a rule `Recurrence::parse`
   accepts survives a parse and render byte for byte. `to_rrule` still renders
   from the fields alone, for a series that had no rule (Slate audit F-04).
+- `cosmic_pim_sync::save_and_queue(root, collection_id, file_names, write)`
+  runs an application's own save (or delete) and queues its upload as one step
+  under the collection's lock, returning `Saved { value, queued }`. A sync
+  pass can no longer pull a resource between the save and its enqueue and
+  overwrite the edit. It captures the pre-edit bytes as the merge base itself
+  and queues a deletion when the write removed the file. `queue_save`,
+  `queue_save_with_base` and `queue_delete` are unchanged and keep the gap
+  (audit F-09 residual, Slate F-06).
+- `CalDavStore::exclusively(step)` (default: runs `step`) holds a store against
+  every other writer for one step; `VdirStore` implements it with the
+  collection's lock, and the sync cycle decides about each pulled or deleted
+  resource inside it. `VdirStore::reload()` re-reads the sidecar.
 
 ### Fixed
 
@@ -66,6 +78,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   good. A feed over the size limit, or one whose body stops before
   `END:VCALENDAR`, is refused instead of being truncated and applied, which
   removed every event past the cut (audit F-21).
+- A sync pass asks whether a resource has an unsent local edit and writes the
+  server's copy as one step under the collection's lock, so an edit queued
+  between the question and the write is no longer overwritten.
 
 ## [2.0.0] - 2026-09-29
 

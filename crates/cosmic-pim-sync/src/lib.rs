@@ -19,7 +19,8 @@
 //!   collection, exactly once, across restarts.
 //! - [`engine`] — one pass over every enabled account, failing per-collection
 //!   rather than per-run.
-//! - [`writeback`] — turns a local save or delete into a queued push.
+//! - [`writeback`] — makes a local save or delete and its queued push one
+//!   step.
 //! - [`conflict`] — what a pass could not decide on its own: both sides
 //!   changed the same resource, and a person has to choose.
 //! - `mail` — the mail pass, behind the default `mail` feature. A contacts
@@ -42,4 +43,4 @@ pub use freebusy::{Answer, account_for_collection, availability};
 #[cfg(feature = "mail")]
 pub use mail::{MailReport, MailboxReport, credentials_for, sync_account_mail};
 pub use provision::{Provisioned, provision_account};
-pub use writeback::{queue_delete, queue_save, queue_save_with_base};
+pub use writeback::{Saved, queue_delete, queue_save, queue_save_with_base, save_and_queue};

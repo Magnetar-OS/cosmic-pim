@@ -184,6 +184,9 @@ pub struct VdirStore {
     /// Which kind of collection this is. Decides the file extension and what
     /// counts as a plausible payload.
     flavor: Flavor,
+    /// This handle is inside [`CalDavStore::exclusively`] and already holds
+    /// the collection's lock, which is not re-entrant.
+    held: bool,
 }
 
 impl VdirStore {
@@ -198,6 +201,7 @@ impl VdirStore {
             meta,
             flavor: state.flavor,
             state,
+            held: false,
         })
     }
 
@@ -525,8 +529,7 @@ impl VdirStore {
         change: impl FnOnce(&mut SidecarState, Flavor) -> Result<T>,
     ) -> Result<T> {
         let path = self.state_path();
-        let _lock = atomic::lock(&path)
-            .map_err(|why| Error::internal(format!("locking {}: {why}", path.display())))?;
+        let _lock = self.lock()?;
         if let Some(fresh) = read_sidecar(&path)? {
             self.state = fresh;
         }
@@ -538,15 +541,29 @@ impl VdirStore {
         Ok(value)
     }
 
-    /// Re-reads the sidecar so a read reflects what other handles queued.
-    fn refresh(&mut self) -> Result<()> {
+    /// Re-reads the sidecar, so what this handle answers from — the hrefs,
+    /// the etags, what is queued — is what is on disk now rather than what it
+    /// was when the handle was opened. Another handle, or another process,
+    /// may have queued or synced since.
+    pub fn reload(&mut self) -> Result<()> {
         let path = self.state_path();
-        let _lock = atomic::lock(&path)
-            .map_err(|why| Error::internal(format!("locking {}: {why}", path.display())))?;
+        let _lock = self.lock()?;
         if let Some(fresh) = read_sidecar(&path)? {
             self.state = fresh;
         }
         Ok(())
+    }
+
+    /// The collection's lock — or nothing, inside
+    /// [`CalDavStore::exclusively`], where this handle already holds it.
+    fn lock(&self) -> Result<Option<atomic::Lock>> {
+        if self.held {
+            return Ok(None);
+        }
+        let path = self.state_path();
+        atomic::lock(&path)
+            .map(Some)
+            .map_err(|why| Error::internal(format!("locking {}: {why}", path.display())))
     }
 }
 
@@ -840,7 +857,7 @@ impl CalDavStore for VdirStore {
     /// disappears again on the next sync is a visible annoyance; it is not the
     /// silent loss this method exists to prevent.
     fn unpushed_local(&mut self, href: &str) -> Result<Option<String>> {
-        self.refresh()?;
+        self.reload()?;
         let queued_put = self
             .state
             .pending
@@ -858,7 +875,7 @@ impl CalDavStore for VdirStore {
     }
 
     fn queued_delete(&mut self, href: &str) -> Result<bool> {
-        self.refresh()?;
+        self.reload()?;
         Ok(self
             .state
             .pending
@@ -896,7 +913,7 @@ impl CalDavStore for VdirStore {
     }
 
     fn unpushed_base(&mut self, href: &str) -> Result<Option<String>> {
-        self.refresh()?;
+        self.reload()?;
         Ok(self
             .state
             .pending
@@ -935,6 +952,17 @@ impl CalDavStore for VdirStore {
             state.conflicts.retain(|c| c.href != remote.href);
             Ok(())
         })
+    }
+
+    /// Holds the collection's lock for the whole of `step`: every change to
+    /// the sidecar and every file write made through this handle inside it
+    /// is one step to the app, the daemon, and any other handle.
+    fn exclusively<T>(&mut self, step: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let _lock = self.lock()?;
+        let outer = std::mem::replace(&mut self.held, true);
+        let result = step(self);
+        self.held = outer;
+        result
     }
 
     fn empty_sighting(&self) -> Result<Option<EmptySighting>> {
@@ -1162,7 +1190,7 @@ impl PushQueue for VdirStore {
     /// What is queued, as it is on disk now — including what another handle
     /// queued since this one was opened.
     fn pending(&mut self) -> Result<Vec<PendingPush>> {
-        self.refresh()?;
+        self.reload()?;
         Ok(self.state.pending.clone())
     }
 
@@ -1314,6 +1342,52 @@ mod push_queue_tests {
             "the newer edit would go out with the etag the server has replaced: {:?}",
             pending[0].op
         );
+    }
+
+    #[test]
+    fn nothing_is_queued_into_a_collection_another_handle_holds() {
+        // A pull asks whether an edit is waiting and then writes; those two
+        // moves have to be one step to an application queueing an edit, or
+        // the edit lands between them and is overwritten.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (dir, mut pull) = store();
+        let meta = vdir::collections(dir.path()).remove(0);
+        let mut app = VdirStore::open(meta).unwrap();
+        let decided = AtomicBool::new(false);
+        let (inside, entered) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                pull.exclusively(|pull| {
+                    assert_eq!(pull.unpushed_local("/cal/a.ics").unwrap(), None);
+                    inside.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    decided.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            });
+            entered.recv().unwrap();
+            app.queue_put("/cal/a.ics").unwrap();
+            assert!(
+                decided.load(Ordering::SeqCst),
+                "an edit was queued in the middle of another handle's step"
+            );
+        });
+    }
+
+    #[test]
+    fn a_handle_inside_its_own_step_does_not_wait_for_itself() {
+        let (_dir, mut store) = store();
+        store
+            .exclusively(|store| {
+                store.queue_put("/cal/a.ics")?;
+                store.exclusively(|store| store.queue_put("/cal/b.ics"))?;
+                // Still held after the inner step ends.
+                store.queue_put("/cal/c.ics")
+            })
+            .unwrap();
+        assert_eq!(store.pending().unwrap().len(), 3);
     }
 
     #[test]

@@ -225,6 +225,28 @@ pub trait CalDavStore {
         ))
     }
 
+    /// Runs `step` with nothing else able to change this store's sync state
+    /// or queue a push into it until `step` returns.
+    ///
+    /// A pull decides what to do with a resource in two moves — ask whether
+    /// a local change is waiting ([`Self::unpushed_local`]), then write — and
+    /// an application saves in two moves as well: write the file, then queue
+    /// it. Each pair must be one step as far as the other is concerned, or a
+    /// save landing between a pull's question and its write is overwritten,
+    /// and a pull landing between a save's write and its enqueue overwrites
+    /// it. Both sides run their pair through this.
+    ///
+    /// For a store shared between handles or processes this is its lock,
+    /// held for `step` — so `step` must not wait on the network, and must not
+    /// open another handle on the same store. The default, for a store
+    /// nothing else can reach, just runs it.
+    fn exclusively<T>(&mut self, step: impl FnOnce(&mut Self) -> Result<T>) -> Result<T>
+    where
+        Self: Sized,
+    {
+        step(self)
+    }
+
     /// The recorded first sighting of an empty listing, if one is pending
     /// confirmation. See [`EmptySighting`].
     fn empty_sighting(&self) -> Result<Option<EmptySighting>> {

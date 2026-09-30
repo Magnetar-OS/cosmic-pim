@@ -131,6 +131,21 @@ together, failing per collection rather than per run:
 let reports = cosmic_pim_sync::sync_all(&mut accounts, &registry, &calendar_root, &contacts_root);
 ```
 
+A local edit and the upload it needs, as one step, so that a sync pass can
+neither overwrite the edit before it is queued nor miss it:
+
+```rust
+let saved = cosmic_pim_sync::save_and_queue(
+    &calendar_root,
+    &event.calendar_id,
+    &[&event.file_name],
+    || store.save(&event),
+)?;
+if let Err(why) = saved.queued {
+    // Saved on this device, but not queued for the server.
+}
+```
+
 Mail, in whichever protocol the account uses — IMAP, JMAP, POP3, the Gmail API
 or Microsoft Graph. Every one of them lands in the same maildir, because each
 provider API is used as a change feed while the message bytes still come from
@@ -148,8 +163,8 @@ let report = cosmic_pim_sync::sync_account_mail(
 ```
 
 When the server and this device changed the same event, the pass first tries to
-settle it without asking: an app that hands the pre-edit bytes to
-`queue_save_with_base` gets non-overlapping changes three-way merged and
+settle it without asking: an app that saves through `save_and_queue` (which
+captures the pre-edit bytes) gets non-overlapping changes three-way merged and
 re-queued automatically. Only genuinely overlapping edits are recorded — local,
 remote, and base intact — for the user to decide:
 

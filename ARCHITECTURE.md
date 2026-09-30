@@ -415,9 +415,25 @@ versions instead of choosing one (`caldav::store::Conflict`). Resolution is the
 application's: keep local, take remote, or supply a merge. Nothing resolves
 itself with time, because the alternative to asking is guessing.
 
+**A save and its enqueue are one step, and so is a pull's decision.** Asking
+for unsent bytes only helps if the answer is still true when the pull writes,
+and if a save is queued by the time anyone asks. Neither held once: an
+application wrote its file and queued it as two calls, and a pull asked and
+then wrote as two calls, so a pull could land between a save and its enqueue
+(it found a changed file with nothing queued, and overwrote it), and a save
+could land between a pull's question and its write. Both pairs now run under
+the collection's lock — the `flock` beside `.caldav-state.json` that every
+sidecar change already takes. An application saves through
+`sync::save_and_queue`, which runs the write and the enqueue inside it; a pass
+decides about each resource inside `CalDavStore::exclusively`. The lock is held
+for local work only, never across a request. The older `queue_save` and
+`queue_delete` still queue a change already made, as a second step, and keep
+the gap; they remain for callers where no pass can be running.
+
 **A divergence with a base merges itself when the edits do not overlap.** The
-writeback queue captures the pre-edit bytes at the first enqueue (an app passes
-them through `sync::queue_save_with_base`; a second edit before the push drains
+writeback queue captures the pre-edit bytes at the first enqueue
+(`sync::save_and_queue` reads them under the lock, just before the write; a
+second edit before the push drains
 keeps the original base, because that is still the last text the server
 acknowledged). With that third point in hand, `core::merge::merge3` runs a
 conservative unit-level three-way merge before anything is recorded: the server
