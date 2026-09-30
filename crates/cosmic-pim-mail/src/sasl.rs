@@ -36,7 +36,7 @@
 /// account storage — that is what keeps it testable without a keychain and
 /// reusable without one. `sync` owns the one conversion, because `sync` is the
 /// crate that knows about both.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credentials {
     /// A password, which for most providers means an app password.
     Password(String),
@@ -56,6 +56,16 @@ impl Credentials {
     pub fn expose(&self) -> &str {
         match self {
             Self::Password(value) | Self::OAuth2(value) => value,
+        }
+    }
+}
+
+/// Never prints the secret either (audit O-04).
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password(_) => f.write_str("Password(<redacted>)"),
+            Self::OAuth2(_) => f.write_str("OAuth2(<redacted>)"),
         }
     }
 }
@@ -119,6 +129,17 @@ impl imap::Authenticator for XOAuth2 {
 mod tests {
     use super::*;
     use imap::Authenticator as _;
+
+    #[test]
+    fn debug_output_carries_no_secret() {
+        for credentials in [
+            Credentials::Password("hunter2".into()),
+            Credentials::OAuth2("ya29.hunter2".into()),
+        ] {
+            let printed = format!("{credentials:?}");
+            assert!(!printed.contains("hunter2"), "{printed}");
+        }
+    }
 
     #[test]
     fn the_xoauth2_payload_has_both_trailing_separators() {

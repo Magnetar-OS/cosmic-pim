@@ -36,7 +36,7 @@ pub trait TokenRequest {
 }
 
 /// A successful token response (RFC 6749 §5.1).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -51,6 +51,22 @@ pub struct TokenResponse {
     pub scope: Option<String>,
     #[serde(default = "bearer")]
     pub token_type: String,
+}
+
+/// The tokens are redacted (audit O-04).
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .field("token_type", &self.token_type)
+            .finish()
+    }
 }
 
 fn bearer() -> String {
@@ -158,6 +174,16 @@ fn classify(status: u16, code: &str, description: Option<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_carries_no_token() {
+        let response: TokenResponse = serde_json::from_str(
+            r#"{"access_token":"ya29.hunter2","refresh_token":"1//hunter2","expires_in":3600}"#,
+        )
+        .unwrap();
+        let printed = format!("{response:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+    }
 
     #[test]
     fn expires_in_becomes_an_absolute_instant() {

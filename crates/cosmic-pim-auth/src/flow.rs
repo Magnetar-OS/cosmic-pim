@@ -62,7 +62,6 @@ const ACCEPT_POLL: Duration = Duration::from_millis(100);
 /// Holds the two secrets that must never travel in the authorize URL. Dropping
 /// it abandons the attempt, which is the correct outcome of a cancelled dialog:
 /// the code that eventually arrives is then unredeemable.
-#[derive(Debug)]
 pub struct Pending {
     /// The URL to open in the user's browser.
     authorize_url: String,
@@ -70,6 +69,21 @@ pub struct Pending {
     state: String,
     redirect_uri: String,
     listener: TcpListener,
+}
+
+/// The PKCE verifier is redacted (see [`Pkce`]): it is the one secret here
+/// that never leaves this process, and what redeems the code (audit O-04).
+/// The state travels in the authorize URL, so it is shown there and not
+/// repeated.
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending")
+            .field("authorize_url", &self.authorize_url)
+            .field("pkce", &self.pkce)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("listener", &self.listener)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Starts a sign-in and binds the redirect listener.

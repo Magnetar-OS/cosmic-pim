@@ -24,10 +24,21 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 /// A verifier and the challenge derived from it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pkce {
     verifier: String,
     challenge: String,
+}
+
+/// The verifier is what proves this client asked for the code, so it is
+/// redacted; the challenge is public (it travels in the authorize URL).
+impl std::fmt::Debug for Pkce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pkce")
+            .field("verifier", &"<redacted>")
+            .field("challenge", &self.challenge)
+            .finish()
+    }
 }
 
 /// 32 bytes of entropy, base64url-encoded to 43 characters — the shortest

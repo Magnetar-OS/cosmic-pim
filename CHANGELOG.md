@@ -39,6 +39,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `AccountStore::credential_lock(id)`: a cross-process lock over one
   account's grant, held while it is renewed.
 
+### Changed
+
+- `{:?}` no longer prints secrets: `accounts::Secret`, `OAuthCredential`,
+  `auth::TokenResponse`, `Pkce`, `Pending` and `mail::Credentials` have
+  `Debug` implementations that redact passwords, tokens and the PKCE verifier
+  (audit O-04).
+
 ### Fixed
 
 - The calendar index no longer remembers a file it could not read as a file

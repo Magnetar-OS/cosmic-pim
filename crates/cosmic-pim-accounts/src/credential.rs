@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Nothing downstream of this needs to know which sign-in produced it — that
 /// is the point of the type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Secret {
     /// A password, which for most providers means an app password.
     Password(String),
@@ -69,7 +69,7 @@ impl std::fmt::Display for Secret {
 /// round trip), and `scope` is worth keeping because a provider may grant less
 /// than was asked for, which is the difference between "mail does not sync" and
 /// "mail was never authorised".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthCredential {
     pub access_token: String,
     /// Absent when the provider issued none — which for Google means the
@@ -88,6 +88,34 @@ pub struct OAuthCredential {
     pub scopes: Vec<String>,
     #[serde(default = "default_token_type")]
     pub token_type: String,
+}
+
+/// Never prints the secret: a `{:?}` in a log line or a panic message is
+/// how a password ends up in a bug report (audit O-04).
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password(_) => f.write_str("Password(<redacted>)"),
+            Self::AccessToken(_) => f.write_str("AccessToken(<redacted>)"),
+        }
+    }
+}
+
+/// The tokens are redacted; when the grant expires and what it covers are
+/// what a diagnosis needs (audit O-04).
+impl std::fmt::Debug for OAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCredential")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("scopes", &self.scopes)
+            .field("token_type", &self.token_type)
+            .finish()
+    }
 }
 
 fn default_token_type() -> String {
@@ -169,6 +197,27 @@ impl std::fmt::Display for OAuthCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_carries_no_secret() {
+        let secrets = [
+            format!("{:?}", Secret::Password("hunter2".into())),
+            format!("{:?}", Secret::AccessToken("ya29.hunter2".into())),
+            format!(
+                "{:?}",
+                OAuthCredential {
+                    access_token: "ya29.hunter2".into(),
+                    refresh_token: Some("1//hunter2".into()),
+                    expires_at: None,
+                    scopes: vec!["mail".into()],
+                    token_type: "Bearer".into(),
+                }
+            ),
+        ];
+        for printed in secrets {
+            assert!(!printed.contains("hunter2"), "{printed}");
+        }
+    }
 
     fn grant(expires_in_secs: i64) -> OAuthCredential {
         OAuthCredential {
