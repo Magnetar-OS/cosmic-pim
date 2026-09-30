@@ -115,6 +115,12 @@ const EXPECTED_COLUMNS: &[&str] = &[
     "start_utc",
     "end_utc",
     "until_utc",
+    "rid_kind",
+    "rid_naive",
+    "rid_tz",
+    "attendees",
+    "organizer",
+    "other",
 ];
 
 const KIND_DATE: i64 = 0;
@@ -1162,6 +1168,59 @@ mod tests {
             1,
             "a failed read was cached as an empty file"
         );
+    }
+
+    #[test]
+    fn the_staleness_check_knows_every_column_the_table_has() {
+        // The check that makes the cache self-healing compares the table on
+        // disk against a list, and the list had stopped at the columns of an
+        // earlier schema: a table missing the recurrence-id and attendee
+        // columns passed as current, and every insert then failed.
+        let index = Index::in_memory(chrono_tz::UTC).unwrap();
+        let mut on_disk: Vec<String> = index
+            .conn
+            .prepare("PRAGMA table_info(events)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        on_disk.sort();
+        let mut expected: Vec<String> = EXPECTED_COLUMNS.iter().map(|c| (*c).to_owned()).collect();
+        expected.sort();
+        assert_eq!(expected, on_disk);
+    }
+
+    #[test]
+    fn a_table_from_before_the_recurrence_id_columns_is_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE events (
+                    calendar_id TEXT, file_name TEXT, uid TEXT, summary TEXT,
+                    description TEXT, location TEXT, start_kind INTEGER,
+                    start_naive INTEGER, start_tz TEXT, end_kind INTEGER,
+                    end_naive INTEGER, end_tz TEXT, rrule TEXT, exdates TEXT,
+                    alarms TEXT, sequence INTEGER, created INTEGER, modified INTEGER,
+                    start_utc INTEGER, end_utc INTEGER, until_utc INTEGER);
+                 CREATE TABLE files (calendar_id TEXT, file_name TEXT, mtime_ns INTEGER, size INTEGER);
+                 INSERT INTO meta (key, value) VALUES
+                    ('schema_version', '{SCHEMA_VERSION}'), ('timezone', 'UTC');"
+            ))
+            .unwrap();
+        }
+
+        let mut index = Index::open(&path, chrono_tz::UTC).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cal = vdir::create_collection(root.path(), "Personal", Rgb(1, 2, 3)).unwrap();
+        write(&cal, "Standup", 4, None);
+        index
+            .sync_calendar(&cal)
+            .expect("the older table was kept and the insert failed");
+        assert_eq!(index.event_count().unwrap(), 1);
     }
 
     #[test]

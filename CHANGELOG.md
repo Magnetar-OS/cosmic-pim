@@ -12,6 +12,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - The calendar index no longer remembers a file it could not read as a file
   with no events: the file is read again on the next sync, instead of its
   events staying missing until something else changed it (audit F-22).
+- The calendar index rebuilds itself when its table predates the recurrence-id
+  and attendee columns, instead of passing the staleness check and failing on
+  every write (audit F-46).
 
 ## [2.0.0] - 2026-09-29
 
