@@ -387,6 +387,36 @@ impl Store {
         Ok(components.into_iter().find(|e| e.recurrence_id.is_none()))
     }
 
+    /// Every alarm on `event`, read from its file.
+    ///
+    /// [`Event::alarms`] holds the start-relative ones as bare offsets; this
+    /// also returns the alarms set relative to the end and the ones at a
+    /// fixed time, which an application needs both to fire them and to tell
+    /// "no alarm" from "an alarm the offsets cannot express". For an
+    /// override this is the override's own list.
+    pub fn alarms(&self, event: &Event) -> Result<Vec<crate::model::Alarm>, StoreError> {
+        let text = self.record_text(&event.calendar_id, &event.file_name)?;
+        Ok(crate::ical::event_alarms(
+            &text,
+            &event.uid,
+            event.recurrence_id,
+        ))
+    }
+
+    /// Every alarm on `todo`, read from its file. See [`Self::alarms`].
+    pub fn todo_alarms(&self, todo: &Todo) -> Result<Vec<crate::model::Alarm>, StoreError> {
+        let text = self.record_text(&todo.calendar_id, &todo.file_name)?;
+        Ok(crate::ical::todo_alarms(&text, &todo.uid))
+    }
+
+    /// The text of one record's file.
+    fn record_text(&self, calendar_id: &str, file_name: &str) -> Result<String, StoreError> {
+        let meta = self
+            .calendar(calendar_id)
+            .ok_or_else(|| StoreError::UnknownCalendar(calendar_id.to_owned()))?;
+        Ok(std::fs::read_to_string(meta.path.join(file_name))?)
+    }
+
     /// Deletes an event and re-indexes its calendar.
     ///
     /// For a series this removes the whole file — master and overrides
@@ -1012,6 +1042,29 @@ mod tests {
         assert!(
             restored.iter().all(|o| o.summary == "Renamed"),
             "the generated instance should be back: {restored:?}"
+        );
+    }
+
+    #[test]
+    fn the_store_hands_back_every_alarm_an_event_carries() {
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        std::fs::write(
+            cal.path.join("e.ics"),
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VEVENT\r\nUID:e@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\nSUMMARY:Planning\r\n\
+BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER;RELATED=END:-PT5M\r\nEND:VALARM\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n",
+        )
+        .unwrap();
+        store.refresh().unwrap();
+
+        let event = store.event(&cal.id, "e@example.com").unwrap().unwrap();
+        assert!(event.alarms.is_empty());
+        assert_eq!(
+            store.alarms(&event).unwrap(),
+            vec![crate::model::Alarm::End(Duration::minutes(-5))]
         );
     }
 

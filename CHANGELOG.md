@@ -7,6 +7,17 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `model::Alarm` (`Start(Duration)`, `End(Duration)`, `At(DateTime<Utc>)`)
+  with `Alarm::fires_at(start, end)`, and the readers that return every alarm
+  a component carries: `Store::alarms(&Event)`, `Store::todo_alarms(&Todo)`,
+  `ical::event_alarms(text, uid, recurrence_id)` and `ical::todo_alarms(text,
+  uid)`. Alarms set relative to the end or at a fixed time were skipped when
+  reading, so an event whose only alarm was one of those looked as if it had
+  none. `Event::alarms` and `Todo::alarms` are unchanged: the start-relative
+  offsets (Slate audit F-09).
+
 ### Fixed
 
 - The calendar index no longer remembers a file it could not read as a file
@@ -31,6 +42,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   that are not UTF-8, a permission error) is an error instead of replacing the
   file with a fresh single-record document; importing a contact over such a
   file is refused the same way.
+- An alarm with `ACTION:NONE` (how Apple's calendars write "no alarm") is no
+  longer read as an alarm.
 
 ## [2.0.0] - 2026-09-29
 

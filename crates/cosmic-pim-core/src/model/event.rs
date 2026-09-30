@@ -322,6 +322,38 @@ pub fn normalise_address(value: &str) -> String {
     without.trim().to_lowercase()
 }
 
+/// When one `VALARM` fires — the three forms a `TRIGGER` takes (RFC 5545
+/// section 3.8.6.3).
+///
+/// [`Event::alarms`] and [`crate::model::Todo::alarms`] carry the first form
+/// only, as bare offsets, because that is the form the editors write. This is
+/// every alarm a component has, including the two a reader cannot reduce to
+/// an offset from the start without knowing which occurrence is meant:
+/// [`crate::Store::alarms`] and [`crate::ical::event_alarms`] return it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alarm {
+    /// `TRIGGER:-PT15M` — an offset from the start. Negative means before.
+    Start(chrono::Duration),
+    /// `TRIGGER;RELATED=END:PT0S` — an offset from the end (a task's due
+    /// time).
+    End(chrono::Duration),
+    /// `TRIGGER;VALUE=DATE-TIME:20260930T090000Z` — one fixed instant,
+    /// whichever occurrence of a series is being looked at.
+    At(DateTime<Utc>),
+}
+
+impl Alarm {
+    /// The instant this alarm fires for an occurrence running `start..end`.
+    #[must_use]
+    pub fn fires_at(self, start: DateTime<Utc>, end: DateTime<Utc>) -> DateTime<Utc> {
+        match self {
+            Alarm::Start(offset) => start + offset,
+            Alarm::End(offset) => end + offset,
+            Alarm::At(instant) => instant,
+        }
+    }
+}
+
 /// A single `VEVENT`, as stored in one `.ics` file.
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -341,6 +373,9 @@ pub struct Event {
     pub exdates: Vec<NaiveDateTime>,
     /// `VALARM` triggers, as offsets from the event's start. Negative means
     /// "before", which is what almost every real alarm is.
+    ///
+    /// Start-relative triggers only. An alarm set relative to the end, or at
+    /// a fixed time, is not here — see [`Alarm`] for where to read those.
     pub alarms: Vec<chrono::Duration>,
     pub sequence: i32,
     pub created: Option<DateTime<Utc>>,

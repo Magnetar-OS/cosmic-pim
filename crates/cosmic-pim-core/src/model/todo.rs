@@ -92,6 +92,9 @@ pub struct Todo {
     /// Raw `RRULE`, preserved verbatim. Recurring tasks are unusual but legal.
     pub rrule: Option<String>,
     /// `VALARM` triggers, as offsets from the due date.
+    ///
+    /// Plain duration triggers only, as for [`crate::model::Event::alarms`];
+    /// [`crate::Store::todo_alarms`] has every alarm the task carries.
     pub alarms: Vec<chrono::Duration>,
     /// `RELATED-TO` — the uid of a parent task, for subtasks.
     pub related_to: Option<String>,

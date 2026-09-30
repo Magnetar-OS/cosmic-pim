@@ -33,7 +33,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::model::{Attendee, Event, EventTime, Todo, TodoStatus};
+use crate::model::{Alarm, Attendee, Event, EventTime, Todo, TodoStatus};
 use calcard::Parser;
 use calcard::icalendar::{
     ICalendarComponent, ICalendarComponentType, ICalendarEntry, ICalendarParameterName,
@@ -70,12 +70,13 @@ pub fn parse_ics(text: &str, calendar_id: &str, file_name: &str) -> Vec<Event> {
                     // walks cannot drift out of step.
                     let extra = extras.next();
                     if let Some(mut event) =
-                        convert_event(component, &ical, &resolver, calendar_id, file_name)
+                        convert_event(component, &resolver, calendar_id, file_name)
                     {
-                        if let Some((attendees, organizer, other)) = extra {
-                            event.attendees = attendees;
-                            event.organizer = organizer;
-                            event.other = other;
+                        if let Some(extra) = extra {
+                            event.attendees = extra.attendees;
+                            event.organizer = extra.organizer;
+                            event.other = extra.other;
+                            event.alarms = start_offsets(&extra.alarms);
                         }
                         out.push(event);
                     }
@@ -98,7 +99,6 @@ pub fn parse_ics(text: &str, calendar_id: &str, file_name: &str) -> Vec<Event> {
 
 fn convert_event(
     component: &ICalendarComponent,
-    ical: &calcard::icalendar::ICalendar,
     resolver: &TzResolver<&str>,
     calendar_id: &str,
     file_name: &str,
@@ -134,7 +134,6 @@ fn convert_event(
         end,
         rrule: rrule_text(component),
         exdates: extract_exdates(component, start, resolver),
-        alarms: extract_alarms(component, ical),
         sequence: integer_property(component, &ICalendarProperty::Sequence).unwrap_or(0) as i32,
         created: utc_property(component, &ICalendarProperty::Created),
         last_modified: utc_property(component, &ICalendarProperty::LastModified),
@@ -143,6 +142,7 @@ fn convert_event(
         // Filled by `parse_ics`, which has the source text these are read
         // from verbatim; calcard's parsed component has already lost the
         // spelling they need to keep.
+        alarms: Vec::new(),
         attendees: Vec::new(),
         organizer: None,
         other: Vec::new(),
@@ -236,6 +236,15 @@ fn param_text(value: &str) -> String {
         .collect()
 }
 
+/// What [`vevent_extras`] reads for one VEVENT.
+#[derive(Default)]
+struct Extras {
+    attendees: Vec<Attendee>,
+    organizer: Option<Attendee>,
+    other: Vec<String>,
+    alarms: Vec<Alarm>,
+}
+
 /// Property names `write_vevent` emits itself. Everything else in a VEVENT is
 /// captured verbatim into [`Event::other`] so it survives a round trip.
 const MODELLED: &[&str] = &[
@@ -263,20 +272,21 @@ const MODELLED: &[&str] = &[
 /// its attendees, its organizer, and every other content line, in document
 /// order, one entry per VEVENT.
 ///
-/// Nested components are skipped entirely — `VALARM` is modelled separately
-/// and written back from [`Event::alarms`], so collecting its lines here
-/// would emit every alarm twice.
-fn vevent_extras(text: &str) -> Vec<(Vec<Attendee>, Option<Attendee>, Vec<String>)> {
+/// Nested components are not collected as lines — a `VALARM` is read as an
+/// [`Alarm`] instead, and written back from [`Event::alarms`], so collecting
+/// its lines here would emit every alarm twice.
+fn vevent_extras(text: &str) -> Vec<Extras> {
+    let lines = crate::patch::logical_lines(text);
     let mut out = Vec::new();
-    let mut current: Option<(Vec<Attendee>, Option<Attendee>, Vec<String>)> = None;
+    let mut current: Option<(usize, Extras)> = None;
     let mut nested = 0usize;
 
-    for line in crate::patch::logical_lines(text) {
+    for (i, line) in lines.iter().enumerate() {
         if let Some(component) = line.begins() {
             if current.is_some() {
                 nested += 1;
             } else if component.eq_ignore_ascii_case("VEVENT") {
-                current = Some((Vec::new(), None, Vec::new()));
+                current = Some((i, Extras::default()));
             }
             continue;
         }
@@ -284,8 +294,9 @@ fn vevent_extras(text: &str) -> Vec<(Vec<Attendee>, Option<Attendee>, Vec<String
             if nested > 0 {
                 nested -= 1;
             } else if component.eq_ignore_ascii_case("VEVENT")
-                && let Some(done) = current.take()
+                && let Some((start, mut done)) = current.take()
             {
+                done.alarms = alarms_between(&lines, start, i);
                 out.push(done);
             }
             continue;
@@ -295,7 +306,16 @@ fn vevent_extras(text: &str) -> Vec<(Vec<Attendee>, Option<Attendee>, Vec<String
         if nested > 0 {
             continue;
         }
-        let Some((attendees, organizer, other)) = current.as_mut() else {
+        let Some((
+            _,
+            Extras {
+                attendees,
+                organizer,
+                other,
+                ..
+            },
+        )) = current.as_mut()
+        else {
             continue;
         };
 
@@ -596,51 +616,129 @@ fn in_series_frame(time: EventTime, start: EventTime) -> NaiveDateTime {
     }
 }
 
-/// Reads `VALARM` triggers as offsets from the event's start.
+/// Every alarm of the component whose `BEGIN` is line `first` and whose
+/// `END` is line `last`, in document order.
 ///
-/// Only duration triggers are understood. An absolute
-/// `TRIGGER;VALUE=DATE-TIME` names one wall-clock instant, which is meaningless
-/// the moment the event recurs, and one anchored to the event's end would need
-/// the duration to resolve. Both are skipped rather than guessed at: a reminder
-/// that fires at the wrong time is worse than one that does not fire.
-///
-/// VALARMs are siblings in calcard's flat component list, reached through the
-/// parent's `component_ids` rather than by nesting.
-fn extract_alarms(
-    component: &ICalendarComponent,
-    ical: &calcard::icalendar::ICalendar,
-) -> Vec<chrono::Duration> {
+/// One that never fires is left out: `ACTION:NONE`, which is how Apple's
+/// calendars write "this event has no alarm" (with a trigger in 1976), and
+/// one whose trigger cannot be read.
+fn alarms_between(
+    lines: &[crate::patch::ContentLine<'_>],
+    first: usize,
+    last: usize,
+) -> Vec<Alarm> {
     let mut out = Vec::new();
+    let mut depth = 0usize;
+    // The open alarm's trigger, and whether it is silenced.
+    let mut open: Option<(Option<Alarm>, bool)> = None;
 
-    for id in &component.component_ids {
-        let Some(alarm) = ical.component_by_id(*id) else {
-            continue;
-        };
-        if alarm.component_type != ICalendarComponentType::VAlarm {
-            continue;
-        }
-
-        let Some(entry) = alarm.property(&ICalendarProperty::Trigger) else {
-            continue;
-        };
-
-        // RELATED=END would need the event's duration to resolve.
-        let related_to_end = entry
-            .parameter(&ICalendarParameterName::Related)
-            .and_then(calcard::icalendar::ICalendarParameterValue::as_text)
-            .is_some_and(|v| v.eq_ignore_ascii_case("END"));
-        if related_to_end {
+    for line in lines.iter().take(last).skip(first + 1) {
+        if let Some(name) = line.begins() {
+            depth += 1;
+            if depth == 1 && name == "VALARM" {
+                open = Some((None, false));
+            }
             continue;
         }
-
-        if let Some(ICalendarValue::Duration(d)) = entry.values.first() {
-            out.push(chrono::Duration::seconds(d.as_seconds()));
+        if line.ends().is_some() {
+            if depth == 1
+                && let Some((alarm, silenced)) = open.take()
+            {
+                out.extend(alarm.filter(|_| !silenced));
+            }
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth == 1
+            && let Some((alarm, silenced)) = open.as_mut()
+        {
+            match line.name().as_str() {
+                "TRIGGER" => *alarm = trigger_of(line),
+                "ACTION" => *silenced = line.value().trim().eq_ignore_ascii_case("NONE"),
+                _ => {}
+            }
         }
     }
+    out
+}
 
+/// One `TRIGGER` line as an [`Alarm`].
+///
+/// All three forms are kept. An absolute trigger and one anchored to the end
+/// were once skipped, which left an event whose only alarm was one of those
+/// looking as if it had none — and an application's default reminder fired
+/// in its place (Slate audit F-09).
+fn trigger_of(line: &crate::patch::ContentLine<'_>) -> Option<Alarm> {
+    let value = line.value().trim();
+    if let Some(offset) = parse_iso_duration(value) {
+        let related_to_end = line.params().split(';').any(|param| {
+            param.split_once('=').is_some_and(|(key, related)| {
+                key.trim().eq_ignore_ascii_case("RELATED")
+                    && related.trim().trim_matches('"').eq_ignore_ascii_case("END")
+            })
+        });
+        return Some(if related_to_end {
+            Alarm::End(offset)
+        } else {
+            Alarm::Start(offset)
+        });
+    }
+    // An absolute trigger is always in UTC (RFC 5545 section 3.8.6.3).
+    let utc = value.strip_suffix(['Z', 'z'])?;
+    NaiveDateTime::parse_from_str(utc, "%Y%m%dT%H%M%S")
+        .ok()
+        .map(|instant| Alarm::At(instant.and_utc()))
+}
+
+/// The start-relative alarms, as the offsets [`Event::alarms`] holds.
+fn start_offsets(alarms: &[Alarm]) -> Vec<chrono::Duration> {
+    let mut out: Vec<chrono::Duration> = alarms
+        .iter()
+        .filter_map(|alarm| match alarm {
+            Alarm::Start(offset) => Some(*offset),
+            Alarm::End(_) | Alarm::At(_) => None,
+        })
+        .collect();
     out.sort();
     out.dedup();
     out
+}
+
+/// Every alarm of one event in `text` — the VEVENT with this `uid` and
+/// `recurrence_id` (`None` for a one-off event or a series master).
+///
+/// The full picture behind [`Event::alarms`]: alarms relative to the end and
+/// alarms at a fixed time are here too. An override carries its own alarms;
+/// ask for the master's when it has none. Empty when the document holds no
+/// such event.
+#[must_use]
+pub fn event_alarms(text: &str, uid: &str, recurrence_id: Option<EventTime>) -> Vec<Alarm> {
+    let lines = crate::patch::logical_lines(text);
+    let components = top_level_components(&lines);
+    components
+        .iter()
+        .filter(|component| component.name == "VEVENT")
+        .zip(vevent_identities(text, "", ""))
+        .find(|(_, identity)| {
+            identity
+                .as_ref()
+                .is_some_and(|(u, r)| u == uid && *r == recurrence_id)
+        })
+        .map(|(component, _)| alarms_between(&lines, component.start, component.end))
+        .unwrap_or_default()
+}
+
+/// Every alarm of the task `uid` in `text`. See [`event_alarms`].
+#[must_use]
+pub fn todo_alarms(text: &str, uid: &str) -> Vec<Alarm> {
+    let lines = crate::patch::logical_lines(text);
+    top_level_components(&lines)
+        .iter()
+        .find(|component| {
+            component.name == "VTODO" && component_uid(&lines, component).as_deref() == Some(uid)
+        })
+        .map(|component| alarms_between(&lines, component.start, component.end))
+        .unwrap_or_default()
 }
 
 /* ------------------------------------------------------------------ */
@@ -663,13 +761,9 @@ pub fn parse_todos(text: &str, calendar_id: &str, file_name: &str) -> Vec<Todo> 
                 let resolver = ical.build_tz_resolver();
                 for component in &ical.components {
                     if component.component_type == ICalendarComponentType::VTodo {
-                        out.push(convert_todo(
-                            component,
-                            &ical,
-                            &resolver,
-                            calendar_id,
-                            file_name,
-                        ));
+                        let mut todo = convert_todo(component, &resolver, calendar_id, file_name);
+                        todo.alarms = start_offsets(&todo_alarms(text, &todo.uid));
+                        out.push(todo);
                     }
                 }
             }
@@ -685,7 +779,6 @@ pub fn parse_todos(text: &str, calendar_id: &str, file_name: &str) -> Vec<Todo> 
 
 fn convert_todo(
     component: &ICalendarComponent,
-    ical: &calcard::icalendar::ICalendar,
     resolver: &TzResolver<&str>,
     calendar_id: &str,
     file_name: &str,
@@ -725,7 +818,8 @@ fn convert_todo(
         percent_complete: percent,
         completed: utc_property(component, &ICalendarProperty::Completed),
         rrule: rrule_text(component),
-        alarms: extract_alarms(component, ical),
+        // Filled by `parse_todos`, from the text.
+        alarms: Vec::new(),
         related_to: text_property(component, &ICalendarProperty::RelatedTo),
         categories: categories(component),
         sequence: integer_property(component, &ICalendarProperty::Sequence).unwrap_or(0) as i32,
@@ -2330,16 +2424,67 @@ mod tests {
     }
 
     #[test]
-    fn an_alarm_anchored_to_the_end_is_skipped_rather_than_guessed_at() {
-        let event = one(&wrap(
+    fn an_alarm_anchored_to_the_end_is_not_an_offset_from_the_start() {
+        let ics = wrap(
             "DTSTART:20260804T090000Z\r\nSUMMARY:Standup\r\n\
              BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\n\
              TRIGGER;RELATED=END:-PT10M\r\nEND:VALARM",
-        ));
+        );
         assert!(
-            event.alarms.is_empty(),
+            one(&ics).alarms.is_empty(),
             "a RELATED=END trigger was treated as an offset from the start"
         );
+        // And it is not lost either.
+        assert_eq!(
+            event_alarms(&ics, "x@test", None),
+            vec![Alarm::End(chrono::Duration::minutes(-10))]
+        );
+    }
+
+    /// An event carrying one alarm of each kind, and Apple's "no alarm"
+    /// placeholder.
+    const EVERY_TRIGGER: &str = "DTSTART:20260804T090000Z\r\nDTEND:20260804T100000Z\r\n\
+        SUMMARY:Standup\r\n\
+        BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\n\
+        BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\n\
+        TRIGGER;RELATED=END:PT0S\r\nEND:VALARM\r\n\
+        BEGIN:VALARM\r\nACTION:EMAIL\r\nSUMMARY:x\r\nDESCRIPTION:x\r\n\
+        ATTENDEE:mailto:ada@example.com\r\n\
+        TRIGGER;VALUE=DATE-TIME:20260803T170000Z\r\nEND:VALARM\r\n\
+        BEGIN:VALARM\r\nX-APPLE-DEFAULT-ALARM:TRUE\r\nACTION:NONE\r\n\
+        TRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\nEND:VALARM";
+
+    #[test]
+    fn every_kind_of_trigger_is_read() {
+        // An event whose only alarm was absolute or end-relative used to
+        // read as having none, and an application's default reminder fired
+        // in its place.
+        use chrono::TimeZone as _;
+        let ics = wrap(EVERY_TRIGGER);
+        assert_eq!(
+            event_alarms(&ics, "x@test", None),
+            vec![
+                Alarm::Start(chrono::Duration::minutes(-10)),
+                Alarm::End(chrono::Duration::zero()),
+                Alarm::At(Utc.with_ymd_and_hms(2026, 8, 3, 17, 0, 0).unwrap()),
+            ],
+            "ACTION:NONE is Apple's way of writing \"no alarm\" and must not be one"
+        );
+        // The offsets the editors work with are the start-relative ones.
+        assert_eq!(one(&ics).alarms, vec![chrono::Duration::minutes(-10)]);
+        assert!(event_alarms(&ics, "someone-else@test", None).is_empty());
+    }
+
+    #[test]
+    fn each_kind_of_alarm_fires_where_its_trigger_says() {
+        use chrono::TimeZone as _;
+        let start = Utc.with_ymd_and_hms(2026, 8, 4, 9, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 8, 4, 10, 0, 0).unwrap();
+        let fixed = Utc.with_ymd_and_hms(2026, 8, 3, 17, 0, 0).unwrap();
+        let ten = chrono::Duration::minutes(10);
+        assert_eq!(Alarm::Start(-ten).fires_at(start, end), start - ten);
+        assert_eq!(Alarm::End(-ten).fires_at(start, end), end - ten);
+        assert_eq!(Alarm::At(fixed).fires_at(start, end), fixed);
     }
 
     #[test]
@@ -3312,6 +3457,26 @@ mod todo_tests {
              BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\nTRIGGER:-PT30M\r\nEND:VALARM",
         ));
         assert_eq!(todo.alarms, vec![chrono::Duration::minutes(-30)]);
+    }
+
+    #[test]
+    fn a_task_alarm_at_a_fixed_time_is_read() {
+        // What task apps write for "remind me at": there may be no due date
+        // for an offset to be relative to.
+        use chrono::TimeZone as _;
+        let ics = wrap(
+            "SUMMARY:x\r\n\
+             BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:x\r\n\
+             TRIGGER;VALUE=DATE-TIME:20260804T063000Z\r\nEND:VALARM",
+        );
+        let todo = one(&ics);
+        assert!(todo.alarms.is_empty());
+        assert_eq!(
+            todo_alarms(&ics, &todo.uid),
+            vec![Alarm::At(
+                Utc.with_ymd_and_hms(2026, 8, 4, 6, 30, 0).unwrap()
+            )]
+        );
     }
 
     /* --- serialisation --- */
