@@ -45,4 +45,6 @@ pub use mail::{
     DrainReport, MailReport, MailboxReport, credentials_for, drain_outbox, sync_account_mail,
 };
 pub use provision::{Provisioned, provision_account};
-pub use writeback::{Saved, queue_delete, queue_save, queue_save_with_base, save_and_queue};
+pub use writeback::{
+    Saved, queue_delete, queue_save, queue_save_with_base, save_and_queue, save_and_queue_creating,
+};

@@ -36,9 +36,9 @@ pub struct Saved<T> {
     pub value: T,
     /// Whether the change was queued for upload.
     ///
-    /// `Ok(false)` is a collection with no server to upload to: a local
-    /// calendar, one marked local-only, or one the server made read-only.
-    /// `Err` means the change **is on disk and is not queued** — it stays on
+    /// `Ok(false)` is a collection with no server to upload to — a local
+    /// calendar, one marked local-only, or one the server made read-only —
+    /// or a write that changed none of its files. `Err` means the change **is on disk and is not queued** — it stays on
     /// this device until something queues it — and says why.
     pub queued: Result<bool>,
 }
@@ -49,9 +49,14 @@ pub struct Saved<T> {
 /// and `file_names` are the files of the collection it may touch. What each
 /// of them holds when `write` returns is what is queued: an upload for a file
 /// that is there, a deletion on the server for one that is gone and that the
-/// server knows. The bytes each held *before* `write` ran are captured as
-/// the base for an automatic three-way merge, so callers no longer read them
-/// themselves.
+/// server knows. A file the write left as it was — the same bytes, or absent
+/// before and after — is not queued, so a write that turns out to change
+/// nothing uploads nothing. The bytes each held *before* `write` ran are
+/// captured as the base for an automatic three-way merge, so callers no
+/// longer read them themselves.
+///
+/// A write that learns a file's name only by writing it — a new event whose
+/// name it picks, an import — goes through [`save_and_queue_creating`].
 ///
 /// # Why one step
 ///
@@ -84,9 +89,38 @@ pub fn save_and_queue<T, E>(
 where
     Error: From<E>,
 {
+    save_and_queue_creating(root, collection_id, file_names, || {
+        write().map(|value| (value, Vec::new()))
+    })
+}
+
+/// [`save_and_queue`], for a write that also creates files whose names it
+/// learns only by writing them.
+///
+/// `write` returns its value and the names of the files it created, and each
+/// of those is queued with the rest, under the same lock: an upload if it is
+/// there when `write` returns. Such a file has no bytes from before the write
+/// to merge against, so it is queued with no base. A file that may already
+/// exist belongs in `file_names`, where its pre-edit bytes are kept and an
+/// unchanged file is skipped; a name in both lists is queued once, as a
+/// `file_names` entry.
+///
+/// # Errors
+///
+/// As [`save_and_queue`].
+pub fn save_and_queue_creating<T, E>(
+    root: &Path,
+    collection_id: &str,
+    file_names: &[&str],
+    write: impl FnOnce() -> std::result::Result<(T, Vec<String>), E>,
+) -> Result<Saved<T>>
+where
+    Error: From<E>,
+{
     let Some(mut store) = syncing_store(root, collection_id)? else {
+        let (value, _created) = write()?;
         return Ok(Saved {
-            value: write()?,
+            value,
             queued: Ok(false),
         });
     };
@@ -97,23 +131,38 @@ where
         // What is on disk now, under the lock: the hrefs and etags the
         // enqueue below reads, as the last pass left them.
         store.reload()?;
-        let bases: Vec<Option<String>> = file_names
+        let before: Vec<std::io::Result<Vec<u8>>> = file_names
             .iter()
-            .map(|name| std::fs::read_to_string(dir.join(name)).ok())
+            .map(|name| std::fs::read(dir.join(name)))
             .collect();
 
-        let value = match write() {
-            Ok(value) => value,
+        let created = match write() {
+            Ok((value, created)) => {
+                written = Some(Ok(value));
+                created
+            }
             Err(why) => {
                 written = Some(Err(why));
                 return Ok(false);
             }
         };
-        written = Some(Ok(value));
 
         let mut queued = false;
-        for (name, base) in file_names.iter().zip(&bases) {
-            queued |= queue_what_is_there(store, &dir, name, base.as_deref())?;
+        for (name, before) in file_names.iter().zip(&before) {
+            if unchanged(before, &dir.join(name)) {
+                continue;
+            }
+            let base = before
+                .as_ref()
+                .ok()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok());
+            queued |= queue_what_is_there(store, &dir, name, base)?;
+        }
+        for name in created
+            .iter()
+            .filter(|name| !file_names.contains(&name.as_str()))
+        {
+            queued |= queue_what_is_there(store, &dir, name, None)?;
         }
         Ok(queued)
     });
@@ -130,6 +179,18 @@ where
                 "the collection's lock was taken but the write was not run",
             )
         }))),
+    }
+}
+
+/// Whether the file at `path` is as it was before a write: the same bytes, or
+/// absent both times. A file that could not be read either time counts as
+/// changed, so it is queued rather than skipped.
+fn unchanged(before: &std::io::Result<Vec<u8>>, path: &Path) -> bool {
+    use std::io::ErrorKind::NotFound;
+    match (before, std::fs::read(path)) {
+        (Ok(before), Ok(after)) => *before == after,
+        (Err(before), Err(after)) => before.kind() == NotFound && after.kind() == NotFound,
+        _ => false,
     }
 }
 
@@ -534,6 +595,55 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         assert!(
             matches!(&queue[0].op, cosmic_pim_caldav::push::PushOp::Delete { href, .. } if href == "/dav/cal/a.ics")
         );
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_queues_nothing() {
+        // A stale invitation, a save with nothing to save: every file is as
+        // it was, and queueing them uploaded a copy the server already has.
+        let (dir, id, file) = synced();
+        let untouched = save_and_queue(dir.path(), &id, &["a.ics", "never-synced.ics"], || {
+            Ok::<_, StoreError>(())
+        })
+        .unwrap();
+        assert!(!untouched.queued.unwrap(), "an untouched file was queued");
+
+        let same = save_and_queue(dir.path(), &id, &["a.ics"], || {
+            std::fs::write(&file, SERVER_V1).map_err(StoreError::from)
+        })
+        .unwrap();
+        assert!(!same.queued.unwrap(), "rewriting the same bytes was queued");
+        assert!(pending(dir.path(), &id).is_empty());
+    }
+
+    #[test]
+    fn a_file_the_write_creates_is_queued_with_it() {
+        let (dir, id, _file) = synced();
+        let path = crate::provision::open_collection(dir.path(), &id)
+            .unwrap()
+            .path;
+        let saved = save_and_queue_creating(dir.path(), &id, &["a.ics"], || {
+            // The name is the write's own choice, known only once it ran.
+            std::fs::write(path.join("b-1.ics"), LOCAL_EDIT)?;
+            Ok::<_, StoreError>(("made", vec!["b-1.ics".to_owned()]))
+        })
+        .unwrap();
+
+        assert_eq!(saved.value, "made");
+        assert!(saved.queued.unwrap());
+        assert_eq!(
+            pending(dir.path(), &id),
+            ["/dav/cal/b-1.ics"],
+            "the created file was not queued, or the unchanged one was"
+        );
+
+        // With no server, the write still runs and nothing is queued.
+        let (local, local_id) = collection(false);
+        let saved = save_and_queue_creating(local.path(), &local_id, &[], || {
+            Ok::<_, StoreError>(((), vec!["c.ics".to_owned()]))
+        })
+        .unwrap();
+        assert!(!saved.queued.unwrap());
     }
 
     #[test]

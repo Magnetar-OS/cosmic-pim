@@ -21,6 +21,21 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   recurrence_id)` and `ical::todo_triggers(text, uid)`. `Alarm`,
   `Alarm::fires_at` and the `alarms` readers are unchanged: their offsets
   stay exact (Slate audit F-09 follow-up).
+- `cosmic_pim_sync::save_and_queue_creating(root, collection_id, file_names,
+  write)`: `save_and_queue` for a write that also creates files whose names
+  it learns only by writing them (a new invitation, an import). `write`
+  returns `(value, created_names)`, and the created files are queued under
+  the same lock, with no merge base. Callers that queued such files in a
+  second step afterwards can go through it instead.
+
+### Changed
+
+- `save_and_queue` no longer queues a file the write left as it was (the
+  same bytes, or absent before and after). A write that changes nothing,
+  such as an invitation reply that turns out stale, uploads nothing, and
+  `Saved::queued` is `Ok(false)` for it. Re-saving identical bytes therefore
+  does not queue a change that failed to queue earlier; `queue_save` still
+  does.
 
 ### Fixed
 
