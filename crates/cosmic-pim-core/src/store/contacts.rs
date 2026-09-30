@@ -805,7 +805,11 @@ BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob@x\r\nFN:Bob\r\nEND:VCARD\r\n";
 
         let mut names: Vec<String> = store.contacts().iter().map(|c| c.label()).collect();
         names.sort();
-        assert_eq!(names, ["Ada Lovelace", "Bob"], "the import replaced the file");
+        assert_eq!(
+            names,
+            ["Ada Lovelace", "Bob"],
+            "the import replaced the file"
+        );
     }
 
     #[test]
