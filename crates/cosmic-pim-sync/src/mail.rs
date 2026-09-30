@@ -260,7 +260,13 @@ pub fn sync_account_mail(
             sync_over_imap(account, mail, credentials, mail_root, options, now_ms)
         }
         MailProtocol::Jmap => sync_over_jmap(account, mail, credentials, mail_root, now_ms),
-        MailProtocol::Pop3 => sync_over_pop3(account, mail, credentials, mail_root, now_ms),
+        MailProtocol::Pop3 => Ok(sync_over_pop3(
+            account,
+            mail,
+            credentials,
+            mail_root,
+            now_ms,
+        )),
         MailProtocol::Gmail => sync_over_gmail(account, credentials, mail_root, now_ms),
         MailProtocol::Graph => sync_over_graph(account, credentials, mail_root, now_ms),
     }
@@ -595,7 +601,7 @@ fn sync_over_pop3(
     credentials: &Credentials,
     mail_root: &Path,
     now_ms: i64,
-) -> Result<MailReport> {
+) -> MailReport {
     use cosmic_pim_mail::pop3;
 
     // POP3 has exactly one mailbox and no way to name another, so the maildir
@@ -632,37 +638,46 @@ fn sync_over_pop3(
         }
     };
 
-    let mut session = pop3::Session::connect(&endpoint, credentials).map_err(Error::Mail)?;
-
+    // A POP3 server that cannot be reached is this inbox failing, and is
+    // reported as such rather than returned: an error here would take the ids
+    // of what the drain just sent with it, and the caller could no longer
+    // settle the messages they answered or file their Sent copies.
     let path = mailbox_path(mail_root, &account.id, &folder);
-    let outcome = (|| {
-        let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
-        let mut state = pop3::Pop3State::load(&path);
-        // Leave everything on the server. Deleting is a decision only the user
-        // can make — the same mailbox is very often also read on a phone — and
-        // a default that removes mail is not one to arrive at by omission.
-        let result = pop3::sync_inbox(
-            &mut session,
-            &mut store,
-            &mut state,
-            pop3::Retention::LeaveOnServer,
-            now_ms,
-        );
-        let outcome = save_after(result, || state.save(&path))?;
-        Ok(SyncOutcome {
-            fetched: outcome.fetched,
-            ..Default::default()
-        })
-    })();
+    let outcome = pop3::Session::connect(&endpoint, credentials)
+        .map_err(Error::Mail)
+        .and_then(|mut session| {
+            let outcome = (|| {
+                let mut store = MaildirStore::open(&path).map_err(Error::Mail)?;
+                let mut state = pop3::Pop3State::load(&path);
+                // Leave everything on the server. Deleting is a decision only
+                // the user can make — the same mailbox is very often also read
+                // on a phone — and a default that removes mail is not one to
+                // arrive at by omission.
+                let result = pop3::sync_inbox(
+                    &mut session,
+                    &mut store,
+                    &mut state,
+                    pop3::Retention::LeaveOnServer,
+                    now_ms,
+                );
+                let outcome = save_after(result, || state.save(&path))?;
+                Ok(SyncOutcome {
+                    fetched: outcome.fetched,
+                    ..Default::default()
+                })
+            })();
 
-    // QUIT applies deletions; skipping it on the error path is deliberate.
-    if outcome.is_ok()
-        && let Err(why) = session.quit()
-    {
-        tracing::debug!(account = account.display_name, %why, "POP3 QUIT failed");
-    }
+            // QUIT applies deletions; skipping it on the error path is
+            // deliberate.
+            if outcome.is_ok()
+                && let Err(why) = session.quit()
+            {
+                tracing::debug!(account = account.display_name, %why, "POP3 QUIT failed");
+            }
+            outcome
+        });
 
-    Ok(MailReport {
+    MailReport {
         mailboxes: vec![MailboxReport {
             wire_name: folder.wire_name,
             display_name: folder.display_name,
@@ -671,7 +686,7 @@ fn sync_over_pop3(
         }],
         sent,
         given_up,
-    })
+    }
 }
 
 /// Saves an id-keyed engine's sidecar after a pass, whether or not the pass
@@ -959,6 +974,76 @@ mod tests {
         let queued = &outbox.list().unwrap()[0];
         assert_eq!(queued.attempts, 1, "the queued message was never attempted");
         assert!(queued.last_error.is_some());
+    }
+
+    /// A submission server on this machine that accepts every message.
+    /// Returns its port.
+    fn accepting_smtp() -> u16 {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut out = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let _ = write!(out, "220 scripted ESMTP\r\n");
+            let mut line = String::new();
+            let mut in_data = false;
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                let command = line.trim_end().to_ascii_uppercase();
+                line.clear();
+                let reply = if in_data {
+                    if command != "." {
+                        continue;
+                    }
+                    in_data = false;
+                    "250 2.0.0 queued"
+                } else if command.starts_with("EHLO") {
+                    // AUTH PLAIN, which the client may use without TLS.
+                    "250-scripted\r\n250 AUTH PLAIN LOGIN"
+                } else if command.starts_with("AUTH") {
+                    "235 2.7.0 ok"
+                } else if command == "DATA" {
+                    in_data = true;
+                    "354 go ahead"
+                } else if command == "QUIT" {
+                    let _ = write!(out, "221 bye\r\n");
+                    return;
+                } else {
+                    "250 ok"
+                };
+                let _ = write!(out, "{reply}\r\n");
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_pop3_pass_reports_what_it_sent_when_the_mailbox_server_is_down() {
+        // SMTP took the message, then POP3 could not be reached. The pass
+        // returned that error and the sent id with it, so the app could
+        // neither mark what the message answered nor file its Sent copy.
+        let mut account = account_with_mail();
+        refusing(&mut account, MailProtocol::Pop3);
+        account.mail.as_mut().unwrap().smtp_port = accepting_smtp();
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = queue_one(&account, dir.path());
+
+        let report = sync_account_mail(
+            &account,
+            &Credentials::Password("pw".into()),
+            dir.path(),
+            SyncOptions::default(),
+            1_000,
+        )
+        .expect("a pass that sent something must report it");
+
+        assert_eq!(report.sent, ["0000000000000001"]);
+        assert_eq!(outbox.count(), 0, "the message did not go");
+        assert_eq!(report.failed(), 1, "the unreachable inbox went unreported");
+        assert_eq!(report.mailboxes[0].wire_name, "INBOX");
     }
 
     #[test]

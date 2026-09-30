@@ -7,6 +7,15 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A POP3 sync pass whose POP3 server cannot be reached no longer returns an
+  error after its outbox drain has sent mail. The pass sends over SMTP before
+  it connects to POP3, and the error took the sent ids with it, so the caller
+  could neither mark the messages they answered nor file their Sent copies.
+  The connection failure is now the inbox's `MailboxReport::outcome` (counted
+  by `MailReport::failed`), and `MailReport::sent` keeps what went.
+
 ## [2.1.0] - 2026-09-30
 
 A minor version: every API change is an addition (new functions, types, a
