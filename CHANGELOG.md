@@ -18,6 +18,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - An index row whose recurrence-id cannot be read is an error, like every
   other column, instead of an override of the instance at 1970-01-01 (audit
   F-46).
+- The vdir watcher wakes its reader when the kernel's event queue overflowed
+  and the events were dropped (notify's "rescan" event), instead of ignoring
+  it and leaving the view stale after a large sync (audit F-46).
 
 ## [2.0.0] - 2026-09-29
 

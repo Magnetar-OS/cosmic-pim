@@ -110,6 +110,14 @@ fn is_interesting(event: &notify::Result<notify::Event>) -> bool {
         return false;
     };
 
+    // The kernel's event queue overflowed and whatever was in it is gone.
+    // The event names no path and has no kind worth matching, and it is the
+    // one that must not be dropped: a sync run rewriting a large collection
+    // is what overflows the queue (audit F-46).
+    if event.need_rescan() {
+        return true;
+    }
+
     if !matches!(
         event.kind,
         notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
@@ -218,6 +226,20 @@ mod tests {
     fn watches_address_book_items() {
         assert!(is_collection_path(Path::new("/c/contacts/ada.vcf")));
         assert!(!is_collection_path(Path::new("/c/contacts/.ada.vcf.tmp")));
+    }
+
+    #[test]
+    fn a_dropped_burst_still_wakes_the_reader() {
+        // When the kernel's queue overflows, the events in it are gone and
+        // notify says so with one event flagged "rescan", naming no path. A
+        // sync run rewriting a large collection is exactly what overflows
+        // it, and ignoring the flag left the view showing the old state.
+        let overflow =
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert!(is_interesting(&Ok(overflow)));
+        assert!(!is_interesting(&Ok(notify::Event::new(
+            notify::EventKind::Other
+        ))));
     }
 
     #[test]
