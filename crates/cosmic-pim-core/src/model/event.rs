@@ -177,6 +177,75 @@ impl Recurrence {
         Some(out)
     }
 
+    /// Renders like [`Self::to_rrule`], over the rule the series already
+    /// has.
+    ///
+    /// `original` is patched rather than replaced, the way every other save
+    /// in this crate works. A part whose meaning did not change is left
+    /// exactly as written, so a `UNTIL` another client spelled in UTC is not
+    /// re-rendered because the interval changed, and what this type does not
+    /// model — `WKST`, and the order of the parts — is kept. A rule this
+    /// type can parse therefore survives `parse` and this byte for byte.
+    ///
+    /// Rendering from the fields alone dropped `WKST` and re-spelled the
+    /// rest, which showed up as a changed rule on every server the event
+    /// synced to although nobody had changed it (Slate audit F-04).
+    ///
+    /// An `original` this type cannot parse is replaced outright: the caller
+    /// has chosen to overwrite a rule the editor could not show.
+    #[must_use]
+    pub fn to_rrule_keeping(self, start: EventTime, original: &str) -> Option<String> {
+        let freq = self.freq.as_ical()?;
+        let Some(was) = Self::parse(original, start) else {
+            return self.to_rrule(start);
+        };
+        let end = |parts: &mut Vec<String>| match self.end {
+            RepeatEnd::Never => {}
+            RepeatEnd::After(n) => parts.push(format!("COUNT={n}")),
+            RepeatEnd::On(d) => parts.push(format!("UNTIL={}", until_value(d, start))),
+        };
+
+        let mut parts: Vec<String> = Vec::new();
+        let (mut interval_seen, mut end_seen) = (false, false);
+        for part in original.trim().split(';').filter(|p| !p.is_empty()) {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            match key.trim().to_ascii_uppercase().as_str() {
+                "FREQ" if was.freq != self.freq => parts.push(format!("FREQ={freq}")),
+                "INTERVAL" => {
+                    interval_seen = true;
+                    if was.interval == self.interval {
+                        parts.push(part.to_owned());
+                    } else if self.interval > 1 {
+                        parts.push(format!("INTERVAL={}", self.interval));
+                    }
+                }
+                key @ ("COUNT" | "UNTIL") => {
+                    if end_seen {
+                        continue;
+                    }
+                    end_seen = true;
+                    // An unchanged end keeps its spelling — unless the series
+                    // changed kind under it (an all-day toggle), which leaves
+                    // an UNTIL in the wrong value type.
+                    let fits = key == "COUNT" || until_fits(value.trim(), start);
+                    if was.end == self.end && fits {
+                        parts.push(part.to_owned());
+                    } else {
+                        end(&mut parts);
+                    }
+                }
+                _ => parts.push(part.to_owned()),
+            }
+        }
+        if !interval_seen && self.interval > 1 {
+            parts.push(format!("INTERVAL={}", self.interval));
+        }
+        if !end_seen {
+            end(&mut parts);
+        }
+        Some(parts.join(";"))
+    }
+
     /// Parses an `RRULE` value of a series starting at `start`, returning
     /// `None` if it uses parts the editor cannot represent.
     ///
@@ -207,8 +276,10 @@ impl Recurrence {
                 "INTERVAL" => interval = value.trim().parse().ok()?,
                 "COUNT" => end = RepeatEnd::After(value.trim().parse().ok()?),
                 "UNTIL" => end = RepeatEnd::On(until_date(value.trim(), start)?),
-                // WKST only shifts week boundaries; harmless to drop for the
-                // frequencies we support.
+                // WKST only shifts week boundaries, which changes nothing
+                // for the frequencies this type supports, so it has no field
+                // here. It is not dropped on the way back out, though:
+                // `to_rrule_keeping` carries it.
                 "WKST" => {}
                 // Anything else (BYDAY, BYMONTHDAY, BYSETPOS, …) is beyond us.
                 _ => return None,
@@ -236,6 +307,18 @@ fn until_value(last_day: NaiveDate, start: EventTime) -> String {
             let last_second = resolve(next_midnight, tz) - chrono::Duration::seconds(1);
             last_second.format("%Y%m%dT%H%M%SZ").to_string()
         }
+    }
+}
+
+/// Whether an `UNTIL` value is in the value type a series starting at
+/// `start` requires (RFC 5545 section 3.3.10): a DATE for an all-day series,
+/// a floating time for a floating one, UTC for a zoned one.
+fn until_fits(value: &str, start: EventTime) -> bool {
+    let utc = value.ends_with(['Z', 'z']);
+    match start {
+        EventTime::Date(_) => value.len() == 8,
+        EventTime::Floating(_) => value.len() > 8 && !utc,
+        EventTime::Zoned(..) => utc,
     }
 }
 
@@ -601,6 +684,83 @@ mod tests {
                 interval: 1,
                 end: RepeatEnd::Never
             })
+        );
+    }
+
+    #[test]
+    fn a_rule_survives_a_parse_and_render_byte_for_byte() {
+        // What Google writes for "every day until 30 Sep" in Los Angeles,
+        // and a fortnightly rule with a Sunday week start. Rendering from
+        // the fields dropped WKST and re-spelled UNTIL.
+        let la = EventTime::Zoned(dt(2026, 8, 4, 18, 0), chrono_tz::America::Los_Angeles);
+        for rule in [
+            "FREQ=DAILY;UNTIL=20261001T065959Z;WKST=MO",
+            "FREQ=WEEKLY;WKST=SU;INTERVAL=2",
+            "freq=weekly;wkst=mo;interval=1",
+            "FREQ=MONTHLY;COUNT=12",
+        ] {
+            let parsed = Recurrence::parse(rule, la).expect("a rule the editor supports");
+            assert_eq!(parsed.to_rrule_keeping(la, rule).as_deref(), Some(rule));
+        }
+    }
+
+    #[test]
+    fn a_changed_part_is_rewritten_and_the_rest_of_the_rule_is_kept() {
+        let start = EventTime::Floating(dt(2026, 8, 4, 9, 0));
+        let rule = "FREQ=WEEKLY;WKST=SU;INTERVAL=2";
+        let mut edited = Recurrence::parse(rule, start).unwrap();
+
+        edited.interval = 3;
+        assert_eq!(
+            edited.to_rrule_keeping(start, rule).as_deref(),
+            Some("FREQ=WEEKLY;WKST=SU;INTERVAL=3")
+        );
+
+        edited.interval = 1;
+        edited.end = RepeatEnd::After(5);
+        assert_eq!(
+            edited.to_rrule_keeping(start, rule).as_deref(),
+            Some("FREQ=WEEKLY;WKST=SU;COUNT=5")
+        );
+
+        edited.freq = Freq::Daily;
+        edited.end = RepeatEnd::Never;
+        assert_eq!(
+            edited.to_rrule_keeping(start, rule).as_deref(),
+            Some("FREQ=DAILY;WKST=SU")
+        );
+
+        edited.freq = Freq::Never;
+        assert_eq!(edited.to_rrule_keeping(start, rule), None);
+    }
+
+    #[test]
+    fn an_unchanged_until_is_respelled_when_the_series_changes_kind() {
+        // The user made the series all-day: the end date is the same, but a
+        // UTC date-time UNTIL is no longer a legal value for it.
+        let rule = "FREQ=DAILY;UNTIL=20260930T205959Z;WKST=MO";
+        let athens = EventTime::Zoned(dt(2026, 8, 4, 1, 0), chrono_tz::Europe::Athens);
+        let all_day = EventTime::Date(NaiveDate::from_ymd_opt(2026, 8, 4).unwrap());
+        let ends = Recurrence::parse(rule, athens).unwrap();
+        assert_eq!(
+            ends.to_rrule_keeping(all_day, rule).as_deref(),
+            Some("FREQ=DAILY;UNTIL=20260930;WKST=MO")
+        );
+    }
+
+    #[test]
+    fn a_rule_the_editor_could_not_show_is_replaced_not_patched() {
+        let start = EventTime::Floating(dt(2026, 8, 4, 9, 0));
+        let weekly = Recurrence {
+            freq: Freq::Weekly,
+            interval: 1,
+            end: RepeatEnd::Never,
+        };
+        assert_eq!(
+            weekly
+                .to_rrule_keeping(start, "FREQ=MONTHLY;BYSETPOS=-1;BYDAY=FR")
+                .as_deref(),
+            Some("FREQ=WEEKLY")
         );
     }
 

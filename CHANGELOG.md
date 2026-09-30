@@ -17,6 +17,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   reading, so an event whose only alarm was one of those looked as if it had
   none. `Event::alarms` and `Todo::alarms` are unchanged: the start-relative
   offsets (Slate audit F-09).
+- `Recurrence::to_rrule_keeping(start, original)` renders a rule over the one
+  the series already has: `WKST`, the order of the parts and the spelling of
+  every part that did not change are kept, so a rule `Recurrence::parse`
+  accepts survives a parse and render byte for byte. `to_rrule` still renders
+  from the fields alone, for a series that had no rule (Slate audit F-04).
 
 ### Fixed
 
