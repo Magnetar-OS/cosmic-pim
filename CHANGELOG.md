@@ -102,6 +102,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   recipient instead of becoming two, and an address holding a line break,
   whitespace or `<>,;` is not an address, so it can no longer add a header of
   its own to the mirror copy (audit F-35).
+- Account discovery reads an autoconfig value that holds an entity or
+  character reference (`R&amp;D`, `&#46;`) whole, instead of keeping only the
+  last piece of it (audit F-46).
 
 ## [2.0.0] - 2026-09-29
 

@@ -336,6 +336,11 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
     let mut in_outgoing = false;
     let mut incoming_is_imap = false;
     let mut element = String::new();
+    // The element's text, gathered across events: quick-xml 0.38 and later
+    // hands `&amp;` and `&#46;` over as references of their own, between
+    // text events, so one value can arrive in several pieces (audit F-46,
+    // the same gap F-04 closed in the DAV parsers).
+    let mut value = String::new();
     let mut buffer = Vec::new();
 
     loop {
@@ -343,6 +348,7 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
             Ok(Event::Start(start)) => {
                 // quick-xml 0.42: names arrive as &str, already decoded.
                 element = start.local_name().as_ref().to_owned();
+                value.clear();
                 match element.as_str() {
                     "incomingServer" => {
                         in_incoming = true;
@@ -358,7 +364,31 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
                 }
             }
             Ok(Event::End(end)) => {
-                match end.local_name().as_ref() {
+                let ended = end.local_name();
+                let value = std::mem::take(&mut value);
+                let value = value.trim();
+                if ended.as_ref() == element && !value.is_empty() {
+                    let target = if in_incoming && incoming_is_imap {
+                        Some(&mut imap)
+                    } else if in_outgoing {
+                        Some(&mut smtp)
+                    } else {
+                        if element == "displayName" && display_name.is_empty() {
+                            display_name = value.to_owned();
+                        }
+                        None
+                    };
+                    if let Some(server) = target {
+                        match element.as_str() {
+                            "hostname" => server.host = value.to_owned(),
+                            "port" => server.port = value.parse().unwrap_or(0),
+                            "socketType" => server.security = socket_security(value),
+                            "username" => server.username = expand_username(value, email),
+                            _ => {}
+                        }
+                    }
+                }
+                match ended.as_ref() {
                     "incomingServer" => in_incoming = false,
                     "outgoingServer" => in_outgoing = false,
                     _ => {}
@@ -366,31 +396,23 @@ fn parse_autoconfig(xml: &str, email: &str) -> Option<Discovered> {
                 element.clear();
             }
             Ok(Event::Text(text)) => {
-                let value = quick_xml::escape::unescape(text.as_ref())
-                    .unwrap_or_else(|_| text.xml10_content())
-                    .trim()
-                    .to_string();
-                if value.is_empty() {
-                    continue;
-                }
-                let target = if in_incoming && incoming_is_imap {
-                    Some(&mut imap)
-                } else if in_outgoing {
-                    Some(&mut smtp)
+                value.push_str(
+                    &quick_xml::escape::unescape(text.as_ref())
+                        .unwrap_or_else(|_| text.xml10_content()),
+                );
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if let Ok(Some(ch)) = reference.resolve_char_ref() {
+                    value.push(ch);
+                } else if let Some(text) = quick_xml::escape::resolve_predefined_entity(&reference)
+                {
+                    value.push_str(text);
                 } else {
-                    if element == "displayName" && display_name.is_empty() {
-                        display_name = value.clone();
-                    }
-                    None
-                };
-                if let Some(server) = target {
-                    match element.as_str() {
-                        "hostname" => server.host = value,
-                        "port" => server.port = value.parse().unwrap_or(0),
-                        "socketType" => server.security = socket_security(&value),
-                        "username" => server.username = expand_username(&value, email),
-                        _ => {}
-                    }
+                    // An entity this document never defines: kept as written
+                    // rather than dropped.
+                    value.push('&');
+                    value.push_str(&reference);
+                    value.push(';');
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -687,6 +709,19 @@ mod tests {
                 "{address} was accepted for probing"
             );
         }
+    }
+
+    #[test]
+    fn an_escaped_value_in_an_autoconfig_document_is_read_whole() {
+        let xml = r#"<clientConfig><emailProvider>
+            <displayName>R&amp;D &#77;ail</displayName>
+            <incomingServer type="imap"><hostname>imap.example.com</hostname>
+              <username>staff&#92;%EMAILLOCALPART%</username></incomingServer>
+            <outgoingServer type="smtp"><hostname>smtp.example.com</hostname></outgoingServer>
+        </emailProvider></clientConfig>"#;
+        let found = parse_autoconfig(xml, "ada@example.com").expect("parsed");
+        assert_eq!(found.display_name, "R&D Mail");
+        assert_eq!(found.username, "staff\\ada");
     }
 
     #[test]
