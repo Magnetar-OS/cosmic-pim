@@ -320,9 +320,22 @@ impl Index {
             if indexed.get(name) == Some(&(*mtime, *size)) {
                 continue;
             }
+            // A file that cannot be read is not a file with no events. It is
+            // left as the index last knew it, and not recorded under its new
+            // size and mtime, so the next sync reads it again. Recording it
+            // cached "no events" until something else changed the file
+            // (audit F-22).
+            let text = match std::fs::read_to_string(meta.path.join(name)) {
+                Ok(text) => text,
+                Err(why) => {
+                    tracing::warn!(
+                        calendar = %meta.id, file = %name, %why,
+                        "cannot read an event file; leaving its index rows as they were"
+                    );
+                    continue;
+                }
+            };
             changed = true;
-
-            let text = std::fs::read_to_string(meta.path.join(name)).unwrap_or_default();
             let events = super::vdir::parse_ics(&text, &meta.id, name);
 
             tx.execute(
@@ -1112,6 +1125,43 @@ mod tests {
 
         index.prune_missing_calendars(&[]).unwrap();
         assert_eq!(index.event_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_file_that_could_not_be_read_is_read_again_not_remembered_as_empty() {
+        // A read that fails — a permission glitch, an I/O error, bytes that
+        // are not UTF-8 mid-write — used to be indexed as "this file holds no
+        // events" under the file's size and mtime, so the events stayed
+        // missing until something else changed the file.
+        let (_root, cal, mut index) = setup();
+        let event = write(&cal, "Standup", 4, None);
+        let path = cal.path.join(&event.file_name);
+        let good = std::fs::read(&path).unwrap();
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Unreadable as text, same length, same mtime.
+        std::fs::write(&path, vec![0xff_u8; good.len()]).unwrap();
+        let set_stamp = || {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        };
+        set_stamp();
+        index.sync_calendar(&cal).unwrap();
+        assert_eq!(index.event_count().unwrap(), 0);
+
+        // Readable again, and nothing about the file's size or mtime says so.
+        std::fs::write(&path, &good).unwrap();
+        set_stamp();
+        index.sync_calendar(&cal).unwrap();
+        assert_eq!(
+            index.event_count().unwrap(),
+            1,
+            "a failed read was cached as an empty file"
+        );
     }
 
     #[test]
