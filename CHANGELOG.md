@@ -54,6 +54,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   alarm is a nested component, so the edit was accepted and then dropped.
   Alarms the edit did not touch — another client's e-mail alarm, an alarm
   relative to the end or at a fixed time — are left exactly as written.
+- `Store::move_to_calendar` moves the whole event: a series arrives in the
+  other calendar with its changed occurrences, its timezones and everything
+  the model does not carry, as written. It used to save the master alone and
+  then remove every component with that UID from the old file, which deleted
+  the changed occurrences. A read-only calendar at either end is refused
+  before anything is written.
 
 ## [2.0.0] - 2026-09-29
 

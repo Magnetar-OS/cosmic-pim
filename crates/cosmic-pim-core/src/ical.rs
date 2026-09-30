@@ -1967,6 +1967,34 @@ pub fn remove_by_uid(text: &str, component: &str, uid: &str) -> Removal {
     without_components(&lines, &components, &drop)
 }
 
+/// `text` reduced to one event: the calendar wrapper, its timezones, and
+/// every VEVENT carrying `uid` — a master and its overrides — byte for byte.
+/// The other records in the document are left out. `None` when the document
+/// holds no such event.
+///
+/// What a move to another calendar carries across. Writing the event there
+/// from the model instead took the master alone and re-serialised it.
+pub(crate) fn only_event(text: &str, uid: &str) -> Option<String> {
+    let lines = crate::patch::logical_lines(text);
+    let components = top_level_components(&lines);
+    let is_record = |c: &ComponentRange| c.name == "VEVENT" || c.name == "VTODO";
+    let mine =
+        |c: &ComponentRange| c.name == "VEVENT" && component_uid(&lines, c).as_deref() == Some(uid);
+    if !components.iter().any(mine) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        let someone_elses = components
+            .iter()
+            .any(|c| is_record(c) && !mine(c) && i >= c.start && i <= c.end);
+        if !someone_elses {
+            out.push_str(line.raw());
+        }
+    }
+    Some(out)
+}
+
 /// Removes the one VEVENT with this `uid` and `RECURRENCE-ID` from a document.
 ///
 /// Matched by identity — UID *and* recurrence-id, resolved the way the

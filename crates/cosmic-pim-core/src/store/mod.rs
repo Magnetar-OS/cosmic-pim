@@ -745,6 +745,15 @@ impl Store {
     }
 
     /// Moves an event to a different calendar, preserving its UID.
+    ///
+    /// The whole event moves: for a series, the master and every changed
+    /// occurrence, with its timezones and everything the model does not
+    /// carry, as written. `event` is then saved over its own component in
+    /// the new calendar, so an edit made alongside the move lands too.
+    ///
+    /// Saving `event` alone and then removing its UID from the old file —
+    /// what this once did — moved a series' master and deleted its changed
+    /// occurrences.
     pub fn move_to_calendar(&mut self, event: &Event, to: &str) -> Result<Event, StoreError> {
         if event.calendar_id == to {
             return Ok(event.clone());
@@ -753,6 +762,39 @@ impl Store {
             .calendar(&event.calendar_id)
             .ok_or_else(|| StoreError::UnknownCalendar(event.calendar_id.clone()))?
             .clone();
+        let to_meta = self
+            .calendar(to)
+            .ok_or_else(|| StoreError::UnknownCalendar(to.to_owned()))?
+            .clone();
+        // Both ends, before anything is written: a move that wrote the new
+        // copy and then could not remove the old one leaves two.
+        for meta in [&from_meta, &to_meta] {
+            if meta.read_only {
+                return Err(StoreError::ReadOnly(meta.name.clone()));
+            }
+        }
+
+        let source = from_meta.path.join(&event.file_name);
+        let text = std::fs::read_to_string(&source)?;
+        let series = crate::ical::only_event(&text, &event.uid).ok_or_else(|| {
+            StoreError::RecordNotFound {
+                uid: event.uid.clone(),
+                file: source,
+            }
+        })?;
+
+        let target = to_meta.path.join(&event.file_name);
+        if vdir::existing_document(&target)?.is_none() {
+            crate::atomic::write(&target, &series, None)?;
+        } else {
+            // The name is taken there — by this event from an earlier move,
+            // or by another record. Each component is added to that file by
+            // identity rather than the file being replaced.
+            for mut component in vdir::parse_ics(&series, to, &event.file_name) {
+                component.calendar_id = to.to_owned();
+                vdir::write_event(&to_meta, &component)?;
+            }
+        }
 
         let mut moved = event.clone();
         moved.calendar_id = to.to_owned();
@@ -1043,6 +1085,96 @@ mod tests {
             restored.iter().all(|o| o.summary == "Renamed"),
             "the generated instance should be back: {restored:?}"
         );
+    }
+
+    #[test]
+    fn moving_a_series_to_another_calendar_takes_its_changed_occurrences_along() {
+        // The move saved the master alone and then removed every component
+        // with its UID from the old file: the series arrived without the
+        // occurrences the user had changed, and they were gone for good.
+        let (_dir, mut store) = store();
+        let home = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        let work = store.create_calendar("Work", Rgb(3, 2, 1)).unwrap();
+        std::fs::write(
+            home.path.join("s.ics"),
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Other//EN\r\n\
+BEGIN:VTIMEZONE\r\nTZID:Europe/Athens\r\nBEGIN:STANDARD\r\n\
+DTSTART:19701025T040000\r\nTZOFFSETFROM:+0300\r\nTZOFFSETTO:+0200\r\n\
+END:STANDARD\r\nEND:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\nUID:s@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART;TZID=Europe/Athens:20260804T090000\r\n\
+DTEND;TZID=Europe/Athens:20260804T100000\r\nRRULE:FREQ=WEEKLY\r\n\
+SUMMARY;LANGUAGE=en:Standup\r\nX-KEPT:master\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:s@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+RECURRENCE-ID;TZID=Europe/Athens:20260811T090000\r\n\
+DTSTART;TZID=Europe/Athens:20260811T140000\r\n\
+DTEND;TZID=Europe/Athens:20260811T150000\r\n\
+SUMMARY:Standup (moved)\r\nX-KEPT:override\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:other@example.com\r\nDTSTAMP:20260801T000000Z\r\n\
+DTSTART:20260805T090000Z\r\nSUMMARY:Shares the file\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n",
+        )
+        .unwrap();
+        store.refresh().unwrap();
+        let master = store.event(&home.id, "s@example.com").unwrap().unwrap();
+
+        let moved = store.move_to_calendar(&master, &work.id).unwrap();
+        assert_eq!(moved.calendar_id, work.id);
+
+        let there = store
+            .index
+            .events_with_uid(&work.id, "s@example.com")
+            .unwrap();
+        assert_eq!(there.len(), 2, "the changed occurrence did not move");
+        assert_eq!(there[1].summary, "Standup (moved)");
+        let text = std::fs::read_to_string(work.path.join("s.ics")).unwrap();
+        for kept in [
+            "X-KEPT:master",
+            "X-KEPT:override",
+            "BEGIN:VTIMEZONE",
+            "SUMMARY;LANGUAGE=en:Standup",
+        ] {
+            assert!(text.contains(kept), "{kept} was lost in the move:\n{text}");
+        }
+        assert!(!text.contains("other@example.com"), "a stranger moved too");
+
+        // Gone from the old calendar, and the event that shared its file is not.
+        assert!(store.event(&home.id, "s@example.com").unwrap().is_none());
+        assert!(
+            store
+                .event(&home.id, "other@example.com")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_move_into_a_file_that_already_exists_adds_to_it() {
+        let (_dir, mut store) = store();
+        let home = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        let work = store.create_calendar("Work", Rgb(3, 2, 1)).unwrap();
+        let mut resident = Event::draft(
+            &work.id,
+            day(2026, 8, 4).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        );
+        resident.summary = "Already here".into();
+        resident.file_name = "shared.ics".into();
+        store.save(&resident).unwrap();
+        let mut arriving = Event::draft(
+            &home.id,
+            day(2026, 8, 5).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        );
+        arriving.summary = "Arriving".into();
+        arriving.file_name = "shared.ics".into();
+        store.save(&arriving).unwrap();
+
+        store.move_to_calendar(&arriving, &work.id).unwrap();
+
+        assert!(store.event(&work.id, &resident.uid).unwrap().is_some());
+        assert!(store.event(&work.id, &arriving.uid).unwrap().is_some());
+        assert!(store.event(&home.id, &arriving.uid).unwrap().is_none());
     }
 
     #[test]

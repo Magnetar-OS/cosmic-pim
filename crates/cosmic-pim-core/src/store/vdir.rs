@@ -245,7 +245,7 @@ pub fn write_todo(meta: &CalendarMeta, todo: &Todo) -> Result<(), StoreError> {
 /// Reading it as nothing wrote a fresh single-record document over a file
 /// that merely could not be read — bytes that are not UTF-8, a permission
 /// change — and whatever else the file held was gone.
-fn existing_document(target: &Path) -> Result<Option<String>, StoreError> {
+pub(super) fn existing_document(target: &Path) -> Result<Option<String>, StoreError> {
     match std::fs::read_to_string(target) {
         Ok(existing) if existing.trim().is_empty() => Ok(None),
         Ok(existing) => Ok(Some(existing)),
