@@ -486,6 +486,95 @@ pub fn patch_nth_component(
     Some(out)
 }
 
+/// One grouped property on a vCard, named the way the card names it:
+/// `item1.ADR` is `GroupedEntry { property: "ADR", group: "item1" }`.
+///
+/// [`crate::model::Contact::grouped_entries`] lists a contact's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupedEntry {
+    /// The property, as the card names it without its group: `EMAIL`,
+    /// `TEL`, `URL`, `ADR`. Compared without regard to case.
+    pub property: String,
+    /// The group prefix. Compared without regard to case.
+    pub group: String,
+}
+
+/// The lines that annotate a grouped value and mean nothing without it.
+const ANNOTATIONS: &[&str] = &["X-ABLABEL", "X-ABADR"];
+
+/// `raw` without the given grouped entries of the card carrying `uid`, and
+/// without the label lines they leave labelling nothing.
+///
+/// An Apple-style card attaches a custom label to a value by giving the lines
+/// one group prefix:
+///
+/// ```text
+/// item1.ADR;type=HOME:;;1 Main St;Athens;;10431;GR
+/// item1.X-ABLabel:Summer house
+/// item1.X-ABADR:gr
+/// ```
+///
+/// [`patch_vcard`](crate::vcard::patch_vcard) edits a grouped value in place
+/// and never removes one: dropping it from the model leaves the line on the
+/// card, and the value is back on the next read. Taking the value line out
+/// alone would be worse — the label would stay, labelling nothing. So the
+/// entry goes as the group it is: its own line, and the `X-ABLabel` and
+/// `X-ABADR` lines beside it once nothing else in the group needs them. A
+/// group that still holds another value, or a property this crate does not
+/// know, keeps those lines: nothing unmodelled is deleted on a guess.
+///
+/// Every line kept is written back byte for byte, folding and terminators
+/// included, and no other card is touched — the same group name in the next
+/// card is that card's own. `None` when `raw` holds several cards and none of
+/// them carries `uid`, as the other card patchers answer.
+#[must_use]
+pub fn remove_grouped(raw: &str, uid: &str, removed: &[GroupedEntry]) -> Option<String> {
+    let target = crate::vcard::vcard_index_of(raw, uid)?;
+    let lines = logical_lines(raw);
+    let own = own_lines(&lines, "VCARD", target);
+
+    let in_group = |index: usize, group: &str| {
+        own[index]
+            && lines[index]
+                .group()
+                .is_some_and(|g| g.eq_ignore_ascii_case(group))
+    };
+
+    let mut drop = vec![false; lines.len()];
+    for entry in removed {
+        for (index, line) in lines.iter().enumerate() {
+            if in_group(index, &entry.group) && line.name().eq_ignore_ascii_case(&entry.property) {
+                drop[index] = true;
+            }
+        }
+    }
+    // A group left holding nothing but annotations has lost what they
+    // annotated, so they go too. Decided once every entry is marked: two
+    // entries removed from one group must not each see the other as staying.
+    for entry in removed {
+        let rest: Vec<usize> = (0..lines.len())
+            .filter(|&index| in_group(index, &entry.group) && !drop[index])
+            .collect();
+        if rest
+            .iter()
+            .all(|&index| ANNOTATIONS.contains(&lines[index].name().as_str()))
+        {
+            for index in rest {
+                drop[index] = true;
+            }
+        }
+    }
+
+    Some(
+        lines
+            .iter()
+            .zip(drop)
+            .filter(|(_, dropped)| !dropped)
+            .map(|(line, _)| line.raw())
+            .collect(),
+    )
+}
+
 /// Sets the values of the `property` lines in `group`, inside the `index`-th
 /// `component`, in document order: the i-th such line takes `values[i]`,
 /// keeping its group prefix and every parameter.
@@ -560,6 +649,167 @@ fn own_lines(lines: &[ContentLine<'_>], component: &str, index: usize) -> Vec<bo
         }
     }
     own
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    use super::*;
+
+    fn entry(property: &str, group: &str) -> GroupedEntry {
+        GroupedEntry {
+            property: property.to_owned(),
+            group: group.to_owned(),
+        }
+    }
+
+    const APPLE: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ada\r\nFN:Ada Lovelace\r\n\
+EMAIL;type=WORK:ada@work.example\r\n\
+item1.EMAIL;type=INTERNET:ada@home.example\r\nitem1.X-ABLabel:Summer house\r\n\
+item2.TEL;type=pref:+30 210 1234567\r\nitem2.X-ABLabel:Boat\r\n\
+item3.ADR;type=HOME:;;1 Main St;Athens;;10431;GR\r\nitem3.X-ABLabel:Winter\r\n\
+item3.X-ABADR:gr\r\n\
+item4.URL:https://ada.example\r\nitem4.X-ABLabel:_$!<HomePage>!$_\r\n\
+PHOTO;ENCODING=b:AAAABBBB\r\nX-ABShowAs:COMPANY\r\nEND:VCARD\r\n";
+
+    /// Each of the four kinds goes with its label, and nothing else on the
+    /// card moves.
+    #[test]
+    fn a_grouped_entry_goes_with_its_label_whatever_kind_it_is() {
+        for (property, group, gone) in [
+            (
+                "EMAIL",
+                "item1",
+                "item1.EMAIL;type=INTERNET:ada@home.example\r\nitem1.X-ABLabel:Summer house\r\n",
+            ),
+            (
+                "TEL",
+                "item2",
+                "item2.TEL;type=pref:+30 210 1234567\r\nitem2.X-ABLabel:Boat\r\n",
+            ),
+            (
+                "ADR",
+                "item3",
+                "item3.ADR;type=HOME:;;1 Main St;Athens;;10431;GR\r\nitem3.X-ABLabel:Winter\r\n\
+item3.X-ABADR:gr\r\n",
+            ),
+            (
+                "URL",
+                "item4",
+                "item4.URL:https://ada.example\r\nitem4.X-ABLabel:_$!<HomePage>!$_\r\n",
+            ),
+        ] {
+            let out = remove_grouped(APPLE, "ada", &[entry(property, group)]).unwrap();
+            assert_eq!(
+                out,
+                APPLE.replace(gone, ""),
+                "removing {group}.{property} changed something else, or left its label behind"
+            );
+        }
+    }
+
+    #[test]
+    fn several_entries_go_in_one_pass() {
+        let out = remove_grouped(
+            APPLE,
+            "ada",
+            &[entry("EMAIL", "item1"), entry("adr", "ITEM3")],
+        )
+        .unwrap();
+        assert!(!out.contains("item1."), "{out}");
+        assert!(!out.contains("item3."), "{out}");
+        assert!(out.contains("item2.TEL"), "{out}");
+        assert!(out.contains("item4.URL"), "{out}");
+    }
+
+    /// One label over two values: taking one out leaves the label with the
+    /// other, which it still labels; taking both takes the label.
+    #[test]
+    fn a_group_shared_with_another_value_keeps_its_label() {
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ada\r\nFN:Ada\r\n\
+item1.EMAIL:ada@boat.example\r\nitem1.TEL:+30 210 1234567\r\nitem1.X-ABLabel:Boat\r\n\
+END:VCARD\r\n";
+        let out = remove_grouped(card, "ada", &[entry("EMAIL", "item1")]).unwrap();
+        assert_eq!(out, card.replace("item1.EMAIL:ada@boat.example\r\n", ""));
+
+        let out = remove_grouped(
+            card,
+            "ada",
+            &[entry("EMAIL", "item1"), entry("TEL", "item1")],
+        )
+        .unwrap();
+        assert!(!out.contains("item1."), "{out}");
+    }
+
+    /// A property this crate does not know is not deleted on a guess.
+    #[test]
+    fn an_unknown_line_in_the_group_is_left_alone() {
+        let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ada\r\nFN:Ada\r\n\
+item1.ADR:;;1 Main St;Athens;;;GR\r\nitem1.X-ABLabel:Home\r\nitem1.X-VENDOR-PIN:42\r\n\
+END:VCARD\r\n";
+        let out = remove_grouped(card, "ada", &[entry("ADR", "item1")]).unwrap();
+        assert_eq!(
+            out,
+            card.replace("item1.ADR:;;1 Main St;Athens;;;GR\r\n", "")
+        );
+    }
+
+    /// Every export is one file of many cards, each starting its groups at
+    /// `item1`.
+    #[test]
+    fn the_same_group_name_in_another_card_is_that_cards_own() {
+        let two = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ada\r\nFN:Ada\r\n\
+item1.EMAIL:ada@home.example\r\nitem1.X-ABLabel:Home\r\nEND:VCARD\r\n\
+BEGIN:VCARD\r\nVERSION:3.0\r\nUID:bob\r\nFN:Bob\r\n\
+item1.EMAIL:bob@home.example\r\nitem1.X-ABLabel:Home\r\nEND:VCARD\r\n";
+
+        let out = remove_grouped(two, "bob", &[entry("EMAIL", "item1")]).unwrap();
+        assert!(out.contains("item1.EMAIL:ada@home.example\r\nitem1.X-ABLabel:Home\r\n"));
+        assert!(!out.contains("bob@home.example"), "{out}");
+        assert_eq!(out.matches("X-ABLabel").count(), 1, "{out}");
+
+        assert!(
+            remove_grouped(two, "nobody", &[entry("EMAIL", "item1")]).is_none(),
+            "a card that is not in the file was treated as one that is"
+        );
+    }
+
+    /// `item1` is not `item10`, and a label folded over two lines is one
+    /// line to remove.
+    #[test]
+    fn group_names_match_whole_and_folded_lines_go_whole() {
+        let card = "BEGIN:VCARD\nVERSION:3.0\nUID:ada\nFN:Ada\n\
+item1.EMAIL:ada@home.example\nitem1.X-ABLabel:A label long enough that the \n server folded it\n\
+item10.EMAIL:ada@other.example\nitem10.X-ABLabel:Other\nEND:VCARD\n";
+        let out = remove_grouped(card, "ada", &[entry("EMAIL", "item1")]).unwrap();
+        assert_eq!(
+            out,
+            "BEGIN:VCARD\nVERSION:3.0\nUID:ada\nFN:Ada\n\
+item10.EMAIL:ada@other.example\nitem10.X-ABLabel:Other\nEND:VCARD\n"
+        );
+    }
+
+    #[test]
+    fn a_card_with_nothing_to_remove_is_returned_unchanged() {
+        assert_eq!(remove_grouped(APPLE, "ada", &[]).unwrap(), APPLE);
+        assert_eq!(
+            remove_grouped(APPLE, "ada", &[entry("EMAIL", "item9")]).unwrap(),
+            APPLE
+        );
+    }
+
+    #[test]
+    fn the_grouped_entries_of_a_contact_are_read_off_all_four_lists() {
+        let contact = crate::vcard::parse_vcards(APPLE, "personal", "ada.vcf").remove(0);
+        assert_eq!(
+            contact.grouped_entries(),
+            [
+                entry("EMAIL", "item1"),
+                entry("TEL", "item2"),
+                entry("URL", "item4"),
+                entry("ADR", "item3"),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

@@ -275,6 +275,35 @@ impl Contact {
         }
     }
 
+    /// Every grouped email, phone, website and address on this contact —
+    /// the entries [`crate::patch::remove_grouped`] takes out of a card.
+    ///
+    /// In that order, and within each kind in the card's order.
+    #[must_use]
+    pub fn grouped_entries(&self) -> Vec<crate::patch::GroupedEntry> {
+        let typed = [
+            ("EMAIL", &self.emails),
+            ("TEL", &self.phones),
+            ("URL", &self.urls),
+        ];
+        let mut out = Vec::new();
+        for (property, values) in typed {
+            for group in values.iter().filter_map(|value| value.group.clone()) {
+                out.push(crate::patch::GroupedEntry {
+                    property: property.to_owned(),
+                    group,
+                });
+            }
+        }
+        for group in self.addresses.iter().filter_map(|a| a.group.clone()) {
+            out.push(crate::patch::GroupedEntry {
+                property: "ADR".to_owned(),
+                group,
+            });
+        }
+        out
+    }
+
     /// The best available name for display.
     ///
     /// `FN` is required by the RFC and routinely absent anyway, so this falls

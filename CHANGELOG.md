@@ -45,6 +45,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   Gmail; `sendMail` for Graph) and files the Sent copy where that pass would,
   connecting to IMAP or JMAP only when something went. `DrainReport { sent,
   given_up }` carries the outbox ids that went, like `MailReport::sent`.
+- `patch::remove_grouped(raw, uid, &[GroupedEntry])` takes grouped entries
+  out of a card together with the `X-ABLabel` and `X-ABADR` lines they leave
+  labelling nothing, byte for byte otherwise; `patch::GroupedEntry { property,
+  group }` names one, and `Contact::grouped_entries()` lists a contact's. The
+  patcher edits grouped values but never removed one, so a grouped address
+  deleted in an editor came back on the next read (Circle audit S-05).
 
 ### Changed
 
