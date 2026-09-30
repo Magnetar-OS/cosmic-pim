@@ -105,6 +105,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - Account discovery reads an autoconfig value that holds an entity or
   character reference (`R&amp;D`, `&#46;`) whole, instead of keeping only the
   last piece of it (audit F-46).
+- Account discovery refuses `localhost.` and names under `.localhost`, which
+  resolvers answer with loopback, and judges an IPv4 address carried in an
+  IPv6 one (`::ffff:127.0.0.1`) as the IPv4 address it is, so neither can
+  point a probe at this machine (audit F-46).
 
 ## [2.0.0] - 2026-09-29
 

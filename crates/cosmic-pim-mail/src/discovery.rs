@@ -554,7 +554,7 @@ pub fn domain_of(email: &str) -> Result<String> {
     }) {
         return Err(Error::Discovery("that domain cannot be looked up".into()));
     }
-    if !domain.contains('.') {
+    if !domain.contains('.') || names_this_machine(domain) {
         return Err(Error::Discovery("that domain cannot be looked up".into()));
     }
     // All-numeric hosts are refused whatever they resolve to. `Ipv4Addr` parses
@@ -576,7 +576,7 @@ pub fn domain_of(email: &str) -> Result<String> {
 /// one naming `localhost` must not widen the probe surface past what the
 /// primary guard would have admitted.
 fn is_probe_host(host: &str) -> bool {
-    if host.is_empty() || !host.contains('.') {
+    if host.is_empty() || !host.contains('.') || names_this_machine(host) {
         return false;
     }
     if host.bytes().any(|b| {
@@ -594,9 +594,23 @@ fn is_probe_host(host: &str) -> bool {
     }
 }
 
+/// Whether `host` is `localhost` or a name under it — `localhost.`, which
+/// the dot check alone admits, and `anything.localhost`, which RFC 6761
+/// reserves for loopback and which resolvers answer with 127.0.0.1 (audit
+/// F-46).
+fn names_this_machine(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
 fn is_public(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => is_public_v4(v4),
+        // `::ffff:127.0.0.1` is 127.0.0.1 on a dual-stack socket, whatever
+        // the v6 ranges below say about it (audit F-46).
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => {
+            v6.to_ipv4_mapped().is_some_and(is_public_v4)
+        }
         std::net::IpAddr::V6(v6) => {
             !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast())
                 // fc00::/7, unique local — the v6 equivalent of RFC 1918.
@@ -709,6 +723,31 @@ mod tests {
                 "{address} was accepted for probing"
             );
         }
+    }
+
+    #[test]
+    fn names_under_localhost_are_this_machine() {
+        // The dot check admitted `localhost.`, and resolvers answer every
+        // name under `.localhost` with loopback (RFC 6761).
+        for address in [
+            "evil@localhost.",
+            "evil@anything.localhost",
+            "evil@anything.LOCALHOST.",
+        ] {
+            assert!(domain_of(address).is_err(), "{address} was accepted");
+        }
+        assert!(!is_probe_host("imap.localhost"));
+        assert!(!is_probe_host("localhost."));
+        assert!(domain_of("a@localhosts.example").is_ok());
+    }
+
+    #[test]
+    fn a_v4_address_inside_a_v6_one_is_judged_as_the_v4_one() {
+        let mapped =
+            |v4: &str| std::net::IpAddr::V6(v4.parse::<Ipv4Addr>().unwrap().to_ipv6_mapped());
+        assert!(!is_public(mapped("127.0.0.1")));
+        assert!(!is_public(mapped("192.168.1.10")));
+        assert!(is_public(mapped("8.8.8.8")));
     }
 
     #[test]
