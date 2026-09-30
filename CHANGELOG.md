@@ -113,6 +113,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `\Seen` was added whatever the caller said, so an mbox import of unread mail
   arrived read. The drafts mirror asks for `\Seen` itself, as before (audit
   F-46).
+- POP3: a message line longer than 64 KiB (an unwrapped base64 part, an HTML
+  body on one line) is stored whole. It was stored as several lines with
+  breaks inserted, and a piece that began with `.` was un-stuffed or taken
+  for the end of the message (audit F-46).
 
 ## [2.0.0] - 2026-09-29
 

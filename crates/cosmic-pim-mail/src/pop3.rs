@@ -361,33 +361,44 @@ impl Session {
     /// beginning with a full stop — rare enough to survive testing, common
     /// enough to happen to a real person, and it breaks the DKIM signature of
     /// every message it touches.
+    ///
+    /// A line longer than [`MAX_LINE`] arrives in pieces. Only the piece that
+    /// ends in a line feed ends the line: treating each piece as a line put a
+    /// line break into the middle of it — an unwrapped base64 part, an HTML
+    /// body on one line — and a piece that happened to begin with `.` was
+    /// un-stuffed, or read as the end of the message (audit F-46).
     fn read_body(&mut self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        let mut line_start = true;
         loop {
-            let mut line = Vec::new();
+            let mut piece = Vec::new();
             let read = (&mut self.stream)
                 .take(MAX_LINE)
-                .read_until(b'\n', &mut line)
+                .read_until(b'\n', &mut piece)
                 .map_err(|why| Error::Pop3(why.to_string()))?;
             if read == 0 {
                 return Err(Error::Pop3(
                     "the server closed the connection mid-message".into(),
                 ));
             }
+            let complete = piece.last() == Some(&b'\n');
 
-            let trimmed = strip_crlf(&line);
-            if trimmed == b"." {
+            let trimmed = if complete { strip_crlf(&piece) } else { &piece };
+            if line_start && complete && trimmed == b"." {
                 return Ok(out);
             }
             // Un-stuff, then keep the line's own terminator as the server sent
             // it: these bytes are stored verbatim and signed over.
-            let body = if trimmed.first() == Some(&b'.') {
+            let body = if line_start && trimmed.first() == Some(&b'.') {
                 &trimmed[1..]
             } else {
                 trimmed
             };
             out.extend_from_slice(body);
-            out.extend_from_slice(b"\r\n");
+            if complete {
+                out.extend_from_slice(b"\r\n");
+            }
+            line_start = complete;
         }
     }
 }
@@ -771,6 +782,39 @@ mod tests {
             }
             Ok(out)
         }
+    }
+
+    #[test]
+    fn a_line_longer_than_one_read_comes_back_whole() {
+        // An unwrapped base64 part, or an HTML body on one line. The reader
+        // takes at most MAX_LINE bytes at a time, and each piece used to be
+        // stored as a line of its own.
+        let long = |first: u8| {
+            let mut line = vec![first];
+            line.extend(std::iter::repeat_n(b'x', (MAX_LINE as usize) * 2));
+            // A piece boundary lands on a full stop, which is not the start
+            // of a line and must not be un-stuffed or read as the end.
+            line[MAX_LINE as usize] = b'.';
+            line
+        };
+        let plain = long(b'a');
+        let stuffed = long(b'.');
+        let mut wire = b"+OK message follows\r\nSubject: long\r\n\r\n".to_vec();
+        wire.extend_from_slice(&plain);
+        wire.extend_from_slice(b"\r\n.");
+        wire.extend_from_slice(&stuffed);
+        wire.extend_from_slice(b"\r\n.\r\n");
+
+        let mut session = fake_session(&wire);
+        session.read_status().unwrap();
+        let body = session.read_body().unwrap();
+
+        let mut expected = b"Subject: long\r\n\r\n".to_vec();
+        expected.extend_from_slice(&plain);
+        expected.extend_from_slice(b"\r\n");
+        expected.extend_from_slice(&stuffed);
+        expected.extend_from_slice(b"\r\n");
+        assert!(body == expected, "the long lines were cut or un-stuffed");
     }
 
     #[test]
