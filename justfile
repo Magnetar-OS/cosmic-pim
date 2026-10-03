@@ -41,8 +41,13 @@ preflight-selftest:
 
 # Pedantic as warnings, not denials — the ecosystem standard. The workspace's
 # own clippy::all=warn lint table is what the build actually gates on.
-check *args: preflight preflight-selftest
+check *args: preflight preflight-selftest doc
     cargo clippy --workspace --all-targets --locked {{args}} -- -W clippy::pedantic
+
+# The public documentation, warnings denied as CI denies them. docs.rs builds
+# these crates, and a broken or private intra-doc link is a dead link there.
+doc *args:
+    RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked {{args}}
 
 test *args:
     cargo test --workspace --locked {{args}}

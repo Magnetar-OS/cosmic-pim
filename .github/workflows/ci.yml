@@ -47,6 +47,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked
 
+      # docs.rs builds these crates, so a link rustdoc cannot resolve, or one
+      # from public docs to a private item, is a dead link for every reader.
+      - name: Docs
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Tests
         run: cargo test --workspace --locked
 
