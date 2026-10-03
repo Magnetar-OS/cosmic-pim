@@ -1735,7 +1735,7 @@ impl CaldavClient {
     }
 
     /// Batch-fetch iCal payloads by href via calendar-multiget REPORT, in
-    /// batches of [`MULTIGET_BATCH_SIZE`]. Request hrefs are XML-escaped and
+    /// batches of `MULTIGET_BATCH_SIZE`. Request hrefs are XML-escaped and
     /// same-origin absolute hrefs are re-relativized to path form (strict-
     /// server compatibility); response hrefs are normalized with the SAME
     /// `resolve_url_against` the listing side uses, so the (href, etag) maps

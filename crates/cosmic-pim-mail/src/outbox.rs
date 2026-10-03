@@ -15,7 +15,7 @@
 //! inbox, and a queue that retried it would send it twice with no way to take
 //! either back. Those stay in the composer, in front of the person who can
 //! decide. This is the one place in the crate where the usual "retry until it
-//! works" posture is exactly wrong, and it is enforced by [`queue`] refusing
+//! works" posture is exactly wrong, and it is enforced by [`Outbox::queue`] refusing
 //! anything else.
 //!
 //! # Shape

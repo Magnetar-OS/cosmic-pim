@@ -31,7 +31,7 @@
 //! **The original serialisation form wins.** A `DTSTART;TZID=Europe/Athens`
 //! must not come back as UTC just because we happen to hold an instant. It
 //! would look identical today and drift by an hour at the next DST boundary the
-//! server's rules disagree with ours about. [`DateTimeForm`] carries the
+//! server's rules disagree with ours about. `DateTimeForm` carries the
 //! original form across the rewrite.
 //!
 //! **Line terminators are preserved.** Some servers emit LF-only despite the

@@ -15,7 +15,7 @@
 //! `>From ` unstuffing included — and does not try to outguess broken files:
 //! a `From ` line at column zero after a blank line is a separator, which is
 //! the mboxo/mboxrd convention Thunderbird, Gmail Takeout, and `formail` all
-//! follow. [`write`] emits the same dialect, so an archive this crate wrote
+//! follow. [`write()`] emits the same dialect, so an archive this crate wrote
 //! and read back is byte-identical to what went in.
 //!
 //! # The one place a message's bytes are modified

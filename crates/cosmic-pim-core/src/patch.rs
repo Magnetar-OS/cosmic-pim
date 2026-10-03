@@ -42,9 +42,9 @@
 //! there, now labelling nothing, or labelling a different address. This is the
 //! classic vCard data-loss site.
 //!
-//! So [`Edit::Set`] deliberately **only touches ungrouped lines**. Grouped ones
+//! So [`Edit::set`] deliberately **only touches ungrouped lines**. Grouped ones
 //! pass through byte-for-byte, and their values are edited by addressing them
-//! explicitly with [`Edit::SetInGroup`], which never changes the grouping. An
+//! explicitly with [`Edit::with_group`], which never changes the grouping. An
 //! editor can therefore show a grouped entry and change its value, but cannot
 //! accidentally restructure or orphan one.
 

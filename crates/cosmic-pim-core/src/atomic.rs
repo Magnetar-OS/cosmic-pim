@@ -197,7 +197,7 @@ pub fn write(
     write_bytes(target, contents.as_bytes(), expected)
 }
 
-/// [`write`] for content that is not text.
+/// [`write()`] for content that is not text.
 ///
 /// The iCalendar and vCard writers hand this a `&str` because their formats are
 /// defined over characters. A stored mail message is not: RFC 5322 is a byte
@@ -290,7 +290,7 @@ pub fn write_bytes(
 /// An exclusive, cross-process advisory lock over one file's
 /// read-modify-write cycle. Released when dropped.
 ///
-/// [`write`] makes each write whole; it cannot make a *read, change, write*
+/// [`write()`] makes each write whole; it cannot make a *read, change, write*
 /// sequence safe, and several of this suite's files are exactly that, shared
 /// between processes: a collection's sync sidecar (the app queues pushes while
 /// the daemon syncs), a maildir's sidecar, `accounts.toml` and the secret

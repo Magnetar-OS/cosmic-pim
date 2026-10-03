@@ -38,7 +38,7 @@
 //! # Filing the Sent copy
 //!
 //! Most servers do not file SMTP-sent mail into Sent — the client APPENDs it.
-//! [`Session::append`] does that, and the copy keeps its `Bcc` header while the
+//! [`crate::imap::Session::append`] does that, and the copy keeps its `Bcc` header while the
 //! copy that went to the server did not: the recipients must not learn who was
 //! blind-copied, and the sender must not lose the only record that they were.
 

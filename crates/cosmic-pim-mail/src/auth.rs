@@ -80,7 +80,7 @@ pub struct AuthHop {
 }
 
 /// Parse every `Authentication-Results` header of a message, in received
-/// order (topmost first = final hop first), capped at [`MAX_HEADERS`].
+/// order (topmost first = final hop first), capped at `MAX_HEADERS`.
 pub fn from_message(msg: &mail_parser::Message<'_>) -> Vec<AuthHop> {
     msg.header_values("Authentication-Results")
         .filter_map(mail_parser::HeaderValue::as_text)

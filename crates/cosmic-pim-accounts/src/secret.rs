@@ -93,7 +93,7 @@ impl SecretStore {
     /// `dir` holds the envelope fallback and the per-slot backend record;
     /// nothing secret is written there while the keychain works.
     ///
-    /// The probe is bounded by [`PROBE_TIMEOUT`] — a locked Secret Service
+    /// The probe is bounded by `PROBE_TIMEOUT` — a locked Secret Service
     /// provider blocks for minutes otherwise, and everything downstream of an
     /// app's init would stall behind it. `COSMIC_PIM_NO_KEYRING` skips the
     /// keychain outright.

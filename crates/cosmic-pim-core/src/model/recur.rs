@@ -192,7 +192,7 @@ pub fn with_count(rule: &str, count: u32) -> String {
 /// expansion produces its instants in.
 ///
 /// Zoned values resolve through their own zone; floating and date values
-/// through the viewer's, which is also the zone [`expand_rule`] iterates
+/// through the viewer's, which is also the zone [`expand`] iterates
 /// floating and all-day masters in — so a well-formed override (RFC 5545
 /// requires its value type to match the master's `DTSTART`) lands on exactly
 /// the instant the master would have generated.
