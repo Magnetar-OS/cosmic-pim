@@ -7,6 +7,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The minimum supported Rust version is 1.99.0, raised from 1.98.1. The pinned
+  toolchain and `rust-version` move together, so the six crates no longer
+  build on an older compiler.
+
 ## [2.2.0] - 2026-09-30
 
 A minor version: every API change is an addition (a new type, new readers
