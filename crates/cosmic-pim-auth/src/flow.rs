@@ -428,7 +428,7 @@ fn decode(value: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 #[cfg(test)]

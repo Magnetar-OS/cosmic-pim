@@ -1152,12 +1152,7 @@ mod tests {
         // Unreadable as text, same length, same mtime.
         std::fs::write(&path, vec![0xff_u8; good.len()]).unwrap();
         let set_stamp = || {
-            std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_modified(stamp)
-                .unwrap();
+            std::fs::set_times(&path, std::fs::FileTimes::new().set_modified(stamp)).unwrap();
         };
         set_stamp();
         index.sync_calendar(&cal).unwrap();
