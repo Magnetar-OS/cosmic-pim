@@ -1181,8 +1181,15 @@ mod tests {
     fn a_drain_sends_in_the_order_the_list_shows() {
         // The drain walked the directory as the filesystem listed it, so two
         // messages written a second apart could leave in either order.
+        //
+        // Queued in an order that is neither ascending nor descending:
+        // filesystems that list a directory oldest-first and ones that list
+        // it newest-first (tmpfs, where tests usually run) would each hide
+        // the defect from one of those two.
         let (_dir, outbox) = outbox();
-        let ids: Vec<String> = (0..40).map(|n| format!("{:016x}", 40 - n)).collect();
+        let ids: Vec<String> = (0..40_u32)
+            .map(|n| format!("{:016x}", (n * 17) % 40))
+            .collect();
         for id in &ids {
             outbox.submit(id, &draft(id), None, 0).unwrap();
         }
