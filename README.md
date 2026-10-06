@@ -92,6 +92,12 @@ id = "google"
 client_id = "…apps.googleusercontent.com"
 ```
 
+**A server on loopback is not asked for a real certificate.** Proton Mail
+Bridge serves IMAP and SMTP on `127.0.0.1` with a certificate it signed
+itself, as any local server must. For a host written as a loopback address
+the TLS handshake accepts it; for every other host, including the name
+`localhost`, the certificate is verified as usual.
+
 ## Using these
 
 On crates.io. Depend on the crates you need:

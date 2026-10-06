@@ -22,6 +22,7 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   open.
 - Built-in providers for Yahoo, AOL, Proton Mail (through Proton Mail Bridge),
   mailbox.org, Posteo and GMX, beside Google, Microsoft, Fastmail and iCloud.
+- `cosmic_pim_mail::imap::is_loopback`.
 - `Provider::app_password` and `Provider::app_password_account`: the password
   route of a provider whose own route is the browser. Google's manifest has
   one — an app password reaches Gmail over IMAP — and Microsoft's does not.
@@ -41,6 +42,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `Provider::account_for` leaves the account's `url` empty; the sync engine
   finds calendars and contacts from the provider's manifest by the account's
   provider id.
+- IMAP, SMTP and POP3 connections to a host written as a loopback address
+  (`127.0.0.1`, `::1`) no longer verify the server's certificate, so Proton
+  Mail Bridge and other local servers work over STARTTLS and TLS. Every other
+  host, including the name `localhost`, is verified as before.
 - Two manifests for one provider in the same directory are applied in file-name
   order. The order was whatever the filesystem listed.
 - An override manifest's `[oauth.extra_params]` adds to the built-in

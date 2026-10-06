@@ -87,6 +87,36 @@ pub enum Security {
     Plaintext,
 }
 
+/// Whether `host` is this machine's loopback interface, written as a literal
+/// address — `127.0.0.1`, `::1`.
+///
+/// Decides one thing: whether a TLS handshake checks the certificate. A
+/// server on loopback is a local program — Proton Mail Bridge is the one most
+/// people meet — and its certificate is self-signed by necessity, because no
+/// authority issues one for `127.0.0.1`. Checking it against the system roots
+/// fails every time, and the setting a user reaches for next is
+/// [`Security::Plaintext`], which is no better. The traffic never leaves the
+/// machine either way; what the certificate would prove, the address already
+/// does.
+///
+/// A literal only, and only as the socket layer itself reads one. Never
+/// `localhost`: a name is resolved, and a resolver can be made to answer with
+/// somewhere else. Never a bracketed or padded form either — `[::1]`,
+/// `[127.0.0.1]`, ` 127.0.0.1` — because none of those is an address to
+/// `connect`: it would hand the string to the resolver as a name, with the
+/// certificate check already switched off. The test is therefore the same
+/// parse `connect` makes, and nothing looser.
+///
+/// What it does not prove is *which* local program answered. The ports are
+/// above 1024, so on a machine with other users any of them can listen where
+/// Bridge would have; that is the trust a loopback server asks for with or
+/// without TLS, and a self-signed certificate nobody pinned never changed it.
+#[must_use]
+pub fn is_loopback(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
 /// Where and how to reach one account's IMAP server.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Endpoint {
@@ -149,6 +179,8 @@ impl Session {
                 Security::StartTls => imap::ConnectionMode::StartTls,
                 Security::Plaintext => imap::ConnectionMode::Plaintext,
             })
+            // A local server's certificate is self-signed; see `is_loopback`.
+            .danger_skip_tls_verify(is_loopback(&endpoint.host))
             .connect()
             .map_err(imap_error)?;
 

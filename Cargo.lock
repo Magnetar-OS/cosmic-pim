@@ -781,6 +781,7 @@ dependencies = [
  "lettre",
  "mail-parser",
  "native-tls",
+ "openssl",
  "pgp",
  "quick-xml",
  "rand 0.8.8",

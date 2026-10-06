@@ -248,8 +248,15 @@ fn connect(
     use lettre::transport::smtp::extension::ClientId;
 
     let hello = ClientId::default();
+    // A local server's certificate is self-signed and is not checked; see
+    // `imap::is_loopback`.
+    let tls = || {
+        TlsParameters::builder(endpoint.host.clone())
+            .dangerous_accept_invalid_certs(crate::imap::is_loopback(&endpoint.host))
+            .build_native()
+    };
     let wrapper = match endpoint.security {
-        Security::Tls => Some(TlsParameters::new(endpoint.host.clone())?),
+        Security::Tls => Some(tls()?),
         Security::StartTls | Security::Plaintext => None,
     };
     let mut connection = SmtpConnection::connect(
@@ -262,7 +269,7 @@ fn connect(
     if endpoint.security == Security::StartTls {
         // Required, not opportunistic: a server that stops advertising
         // STARTTLS must not be handed the password in the clear.
-        connection.starttls(&TlsParameters::new(endpoint.host.clone())?, &hello)?;
+        connection.starttls(&tls()?, &hello)?;
     }
     // Submission without encryption sends the password in the clear. It
     // exists for a server on `localhost` and for the test harness, and the UI

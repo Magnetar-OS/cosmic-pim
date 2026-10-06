@@ -412,7 +412,11 @@ fn strip_crlf(line: &[u8]) -> &[u8] {
 }
 
 fn tls(host: &str, tcp: TcpStream) -> Result<native_tls::TlsStream<TcpStream>> {
-    native_tls::TlsConnector::new()
+    native_tls::TlsConnector::builder()
+        // A local server's certificate is self-signed and is not checked; see
+        // `imap::is_loopback`.
+        .danger_accept_invalid_certs(crate::imap::is_loopback(host))
+        .build()
         .map_err(|why| Error::Pop3(format!("TLS: {why}")))?
         .connect(host, tcp)
         .map_err(|why| Error::Pop3(format!("TLS handshake with {host}: {why}")))

@@ -100,6 +100,10 @@ rand_pgp = { package = "rand", version = "0.8" }
 # plays for CalDAV. The IMAP and POP3 harnesses are hand-rolled because their
 # protocols are not HTTP.
 tiny_http = "0.12"
+# A self-signed certificate for the loopback TLS test, generated per run so no
+# private key is committed. Already in the graph: it is what native-tls is on
+# Linux.
+openssl = "0.10"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
