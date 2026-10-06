@@ -688,6 +688,33 @@ impl Outbox {
         self.write(&queued)
     }
 
+    /// Records, or clears, what a message already in the queue answers.
+    ///
+    /// For a record queued without it — by a version that kept the fact
+    /// somewhere else — so that it can be moved onto the record once and the
+    /// other place retired. A message queued now is given its [`Answers`]
+    /// when it is queued.
+    ///
+    /// `false` when the message is not waiting: it has gone, never existed,
+    /// or a drain is sending it right now. The record is taken the way a
+    /// drain takes it, by the same rename and lock, so the two cannot both
+    /// hold it and a send cannot go out with half an edit. The cost of that
+    /// is the drain's own failure mode: a process killed between the take
+    /// and the put-back leaves a claim, which the next drain settles as
+    /// [`SendFailure::Interrupted`]. Nothing is lost and nothing is sent
+    /// twice; the message waits for a person who will find it was not sent.
+    pub fn set_answers(&self, id: &str, answers: Option<Answers>) -> Result<bool> {
+        if !crate::drafts::is_valid_id(id) {
+            return Ok(false);
+        }
+        let Some((mut queued, claim)) = self.claim(id)? else {
+            return Ok(false);
+        };
+        queued.answers = answers;
+        self.release(&queued, &claim.path)?;
+        Ok(true)
+    }
+
     /// Attempts every message that is due, over SMTP.
     ///
     /// `now_ms` is a parameter rather than read from the clock so the backoff
@@ -1811,6 +1838,70 @@ mod tests {
         assert_eq!(drained.deferred, 1);
 
         assert_eq!(outbox.list().unwrap()[0].answers, Some(answers));
+    }
+
+    #[test]
+    fn what_a_waiting_message_answers_can_be_recorded_after_the_fact() {
+        // The move off a sidecar: the record was queued without it.
+        let (dir, outbox) = outbox();
+        outbox
+            .queue("0000000000000054", &draft("Re: hello"), None, &refused(), 0)
+            .unwrap();
+        let answers = Answers::to_message("original@example.com").found_at(origin());
+
+        assert!(
+            outbox
+                .set_answers("0000000000000054", Some(answers.clone()))
+                .unwrap()
+        );
+
+        let queued = &Outbox::open(dir.path()).unwrap().list().unwrap()[0];
+        assert_eq!(queued.answers, Some(answers));
+        // Nothing else about the record moved, and it is not left claimed.
+        assert_eq!(queued.attempts, 1);
+        assert!(queued.is_live() && !queued.sending);
+        assert!(
+            queued
+                .failure
+                .as_ref()
+                .is_some_and(SendFailure::is_transient)
+        );
+
+        assert!(outbox.set_answers("0000000000000054", None).unwrap());
+        assert_eq!(outbox.list().unwrap()[0].answers, None);
+    }
+
+    #[test]
+    fn what_a_message_answers_cannot_be_changed_once_it_is_going_or_gone() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .submit("0000000000000055", &draft("Re: hello"), None, 0)
+            .unwrap();
+        let answers = Answers::to_message("original@example.com");
+        let mut during = None;
+
+        let outcome = outbox.drain_with(
+            |_| {
+                during = Some(
+                    outbox
+                        .set_answers("0000000000000055", Some(answers.clone()))
+                        .unwrap(),
+                );
+                Outcome::Sent(Vec::new())
+            },
+            0,
+        );
+
+        assert_eq!(during, Some(false), "a record a drain held was edited");
+        assert_eq!(outcome.sent.len(), 1);
+        assert_eq!(outcome.sent[0].answers, None);
+        assert!(
+            !outbox
+                .set_answers("0000000000000055", Some(answers.clone()))
+                .unwrap()
+        );
+        assert!(!outbox.set_answers("../../evil", Some(answers)).unwrap());
+        assert_eq!(outbox.count(), 0, "an edit brought a sent message back");
     }
 
     #[test]

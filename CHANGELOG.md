@@ -103,6 +103,10 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   matches for the entry being typed after the last comma, word starts
   first; `accept(field, known)` writes the chosen one in. Moved from
   Envelope so Slate does not carry a second copy.
+- `Outbox::set_answers(id, answers) -> Result<bool>` records what an
+  already-queued message answers, for moving that fact onto the record from
+  wherever a caller kept it before. It takes the record the way a drain does,
+  so it cannot edit one that is being sent.
 - `cosmic_pim_mail::Index::locate(account, message_id) -> Vec<Located>`: every
   mailbox and UID a message is held under, by its `Message-ID`. The way back
   from a reference that survives a renumbering or a move to one a flag can
