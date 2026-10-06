@@ -108,6 +108,15 @@ pub fn default_path() -> PathBuf {
         .join("mail.sqlite")
 }
 
+/// Where a message is held: the mailbox, by the name it was indexed under,
+/// and its UID there. See [`Index::locate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Located {
+    pub mailbox: String,
+    pub uid: u32,
+}
+
 /// One message, as a list row needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
@@ -440,6 +449,49 @@ impl Index {
             )
             .map_err(sqlite)?;
         Ok(())
+    }
+
+    /// Every place the message with this `Message-ID` is held in `account`,
+    /// newest mailbox entry first.
+    ///
+    /// The way back from a reference that outlives a renumbering to one a
+    /// flag can be set on. A queued reply remembers the message it answers
+    /// by id ([`crate::outbox::Answers`]); by the time it goes, the mailbox
+    /// may have been renumbered or the message moved, and the `(mailbox,
+    /// uid)` it was read under names something else or nothing. This says
+    /// where it is now — as of the last [`Self::sync_mailbox`] of each
+    /// mailbox, so index the mailboxes first.
+    ///
+    /// More than one answer is ordinary: Gmail shows a message under every
+    /// label it carries. `message_id` is taken without angle brackets, as
+    /// the index stores it; an empty id finds nothing, since every message
+    /// without one would match.
+    pub fn locate(&self, account: &str, message_id: &str) -> Result<Vec<Located>> {
+        let message_id = message_id
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim();
+        if message_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT mailbox, uid FROM messages WHERE account=?1 AND message_id=?2
+                 ORDER BY date_ms DESC, mailbox, uid",
+            )
+            .map_err(sqlite)?;
+        statement
+            .query_map(params![account, message_id], |row| {
+                Ok(Located {
+                    mailbox: row.get(0)?,
+                    uid: row.get(1)?,
+                })
+            })
+            .map_err(sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite)
     }
 
     fn indexed_uids(&self, account: &str, mailbox: &str) -> Result<Vec<u32>> {
@@ -847,6 +899,100 @@ mod tests {
             "the snippet is not from the newest"
         );
         assert!(plan.unread);
+    }
+
+    #[test]
+    fn a_message_is_found_by_its_id_wherever_it_now_is() {
+        // What a reply queued before a renumbering needs: the UID it was
+        // read under is void, the Message-ID is not.
+        let mut index = Index::in_memory().unwrap();
+        let inbox = store(vec![
+            message(
+                41,
+                "original@example.com",
+                "",
+                "Hello",
+                "ada@example.com",
+                "x",
+            ),
+            message(42, "other@example.com", "", "Other", "ada@example.com", "x"),
+        ]);
+        index.sync_mailbox(ACCOUNT, MAILBOX, &inbox).unwrap();
+
+        assert_eq!(
+            index.locate(ACCOUNT, "<original@example.com>").unwrap(),
+            [Located {
+                mailbox: MAILBOX.into(),
+                uid: 41
+            }]
+        );
+
+        // Renumbered: the mailbox is forgotten and indexed again, and the
+        // same message is now UID 7.
+        index.forget(ACCOUNT, MAILBOX).unwrap();
+        let renumbered = store(vec![message(
+            7,
+            "original@example.com",
+            "",
+            "Hello",
+            "ada@example.com",
+            "x",
+        )]);
+        index.sync_mailbox(ACCOUNT, MAILBOX, &renumbered).unwrap();
+        // And a copy filed elsewhere is a second place it is held.
+        let archive = store(vec![message(
+            3,
+            "original@example.com",
+            "",
+            "Hello",
+            "ada@example.com",
+            "x",
+        )]);
+        index.sync_mailbox(ACCOUNT, "Archive", &archive).unwrap();
+
+        let mut found = index.locate(ACCOUNT, "original@example.com").unwrap();
+        found.sort_by(|a, b| a.mailbox.cmp(&b.mailbox));
+        assert_eq!(
+            found,
+            [
+                Located {
+                    mailbox: "Archive".into(),
+                    uid: 3
+                },
+                Located {
+                    mailbox: MAILBOX.into(),
+                    uid: 7
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn locating_looks_in_one_account_and_never_matches_an_empty_id() {
+        let mut index = Index::in_memory().unwrap();
+        let inbox = store(vec![message(
+            1,
+            "a@example.com",
+            "",
+            "s",
+            "f@example.com",
+            "x",
+        )]);
+        index.sync_mailbox(ACCOUNT, MAILBOX, &inbox).unwrap();
+        // A message with no Message-ID is stored with an empty one.
+        let bare = RemoteMessage {
+            uid: 2,
+            flags: Flags::default(),
+            raw: b"From: f@example.com\r\nSubject: bare\r\n\r\nx\r\n".to_vec(),
+            internal_date_ms: 2000,
+        };
+        let other = store(vec![bare]);
+        index.sync_mailbox(ACCOUNT, "Other", &other).unwrap();
+
+        assert_eq!(index.locate("someone-else", "a@example.com").unwrap(), []);
+        assert_eq!(index.locate(ACCOUNT, "").unwrap(), []);
+        assert_eq!(index.locate(ACCOUNT, " <> ").unwrap(), []);
+        assert_eq!(index.locate(ACCOUNT, "missing@example.com").unwrap(), []);
     }
 
     #[test]

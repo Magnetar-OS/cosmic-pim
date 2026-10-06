@@ -48,6 +48,10 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   `adopt_online_accounts` link GOA's accounts and remove the ones GOA no
   longer has — only ever from a listing that succeeded. `services_of` says
   what a stored account brings.
+- `cosmic_pim_mail::Index::locate(account, message_id) -> Vec<Located>`: every
+  mailbox and UID a message is held under, by its `Message-ID`. The way back
+  from a reference that survives a renumbering or a move to one a flag can
+  be set on.
 - `Provider::app_password` and `Provider::app_password_account`: the password
   route of a provider whose own route is the browser. Google's manifest has
   one — an app password reaches Gmail over IMAP — and Microsoft's does not.

@@ -115,7 +115,7 @@ pub use discovery::Discovered;
 pub use drafts::Drafts;
 pub use error::{Error, Result};
 pub use folder::{Folder, SpecialUse};
-pub use index::{Conversation, Hit, Index, Summary};
+pub use index::{Conversation, Hit, Index, Located, Summary};
 pub use model::{Flags, Mailbox, Message};
 pub use outbox::Outbox;
 pub use plan::{MailboxPlan, plan_fetch, plan_reconcile};
