@@ -426,7 +426,7 @@ mod tests {
         r.enabled = false;
         let plan = evaluate(&[r], &newsletter());
         assert!(plan.is_empty());
-        assert!(plan.matched.is_empty());
+        assert_eq!(plan.matched, [] as [String; 0]);
     }
 
     #[test]

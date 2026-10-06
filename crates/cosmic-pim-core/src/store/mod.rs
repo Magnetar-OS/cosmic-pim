@@ -1213,7 +1213,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n",
         store.refresh().unwrap();
 
         let event = store.event(&cal.id, "e@example.com").unwrap().unwrap();
-        assert!(event.alarms.is_empty());
+        assert_eq!(event.alarms, []);
         assert_eq!(
             store.alarms(&event).unwrap(),
             vec![crate::model::Alarm::End(Duration::minutes(-5))]
@@ -1955,7 +1955,7 @@ END:VCALENDAR\r\n";
             .unwrap();
 
         assert!(deleted_whole);
-        assert!(instants(&store).is_empty());
+        assert_eq!(instants(&store), []);
     }
 
     #[test]
@@ -2507,7 +2507,7 @@ X-VENDOR-THING:keep me\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         );
         assert!(!sanitise_file_stem("../../etc/passwd").contains(".."));
         // An entirely unusable UID still yields something writable.
-        assert!(!sanitise_file_stem("///").is_empty());
+        assert_ne!(sanitise_file_stem("///"), "");
     }
 
     #[test]
@@ -2604,7 +2604,7 @@ mod todo_tests {
         store.save_todo(&todo).unwrap();
 
         let hidden: HashSet<String> = [cal.id.clone()].into_iter().collect();
-        assert!(store.todos(&hidden).is_empty());
+        assert_eq!(store.todos(&hidden), []);
     }
 
     #[test]
@@ -2632,7 +2632,7 @@ mod todo_tests {
         store.save_todo(&todo).unwrap();
 
         store.delete_todo(&cal.id, &todo.uid).unwrap();
-        assert!(store.todos(&HashSet::new()).is_empty());
+        assert_eq!(store.todos(&HashSet::new()), []);
     }
 
     #[test]
@@ -2790,6 +2790,6 @@ END:VCALENDAR
         litter(&cal.path);
 
         assert!(store.refresh().is_ok());
-        assert!(store.todos(&HashSet::new()).is_empty());
+        assert_eq!(store.todos(&HashSet::new()), []);
     }
 }

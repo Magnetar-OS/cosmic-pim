@@ -171,7 +171,7 @@ mod tests {
         let authenticator = XOAuth2::new("ada@gmail.com", "ya29.token");
         let error_challenge = br#"{"status":"400","schemes":"Bearer"}"#;
 
-        assert!(authenticator.process(error_challenge).is_empty());
+        assert_eq!(authenticator.process(error_challenge), [] as [u8; 0]);
     }
 
     #[test]

@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(store.search("lovelace").len(), 1);
         assert_eq!(store.search("ada@example").len(), 1);
         assert_eq!(store.search("").len(), 2);
-        assert!(store.search("babbage").is_empty());
+        assert_eq!(store.search("babbage"), []);
     }
 
     #[test]
@@ -584,7 +584,7 @@ mod tests {
         store.save(&contact).unwrap();
 
         store.delete(&book.id, &contact.uid).unwrap();
-        assert!(store.contacts().is_empty());
+        assert_eq!(store.contacts(), []);
     }
 
     #[test]
@@ -627,7 +627,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(store.contacts().is_empty());
+        assert_eq!(store.contacts(), []);
     }
 
     #[test]
@@ -644,7 +644,7 @@ mod tests {
         let (_dir, store) = store();
         assert!(store.books().is_empty());
         assert!(store.default_book().is_none());
-        assert!(store.contacts().is_empty());
+        assert_eq!(store.contacts(), []);
     }
 }
 
@@ -973,7 +973,7 @@ mod group_store_tests {
 
         // And emptied again.
         store.set_group_members(&meta.id, &group.uid, &[]).unwrap();
-        assert!(store.groups().remove(0).members.is_empty());
+        assert_eq!(store.groups().remove(0).members, [] as [String; 0]);
     }
 
     #[test]

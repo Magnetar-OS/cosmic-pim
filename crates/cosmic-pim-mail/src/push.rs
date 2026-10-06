@@ -626,7 +626,7 @@ mod tests {
     fn a_message_another_client_expunged_is_not_an_error() {
         let mut server = FakeServer::default();
         assert!(!server.mark_unread(404).unwrap());
-        assert!(server.calls.is_empty());
+        assert_eq!(server.calls, []);
     }
 
     #[test]
@@ -800,7 +800,7 @@ mod tests {
         let outcome = drain(&mut server, &mut queue, 5_000);
 
         assert_eq!(outcome.skipped, 1);
-        assert!(server.calls.is_empty());
+        assert_eq!(server.calls, []);
         assert_eq!(
             queue.pending().unwrap()[0].attempts,
             1,
@@ -818,7 +818,7 @@ mod tests {
         let outcome = drain(&mut server, &mut queue, 0);
 
         assert_eq!(outcome.succeeded, 2);
-        assert!(queue.pending().unwrap().is_empty());
+        assert_eq!(queue.pending().unwrap(), []);
     }
 
     #[test]

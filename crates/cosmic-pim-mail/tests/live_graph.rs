@@ -723,7 +723,7 @@ fn a_refused_send_stays_queued_rather_than_vanishing() {
 
     let outcome = outbox.drain_with(|draft| session(&server).submit(draft), i64::MAX / 2);
 
-    assert!(outcome.sent.is_empty());
+    assert_eq!(outcome.sent, []);
     // A 400 is refused the same way on every attempt: it stops at once and
     // waits for a person, rather than burning twelve attempts over five hours.
     assert_eq!(
@@ -733,7 +733,7 @@ fn a_refused_send_stays_queued_rather_than_vanishing() {
     );
     assert_eq!(outcome.deferred, 0);
     assert_eq!(outbox.count(), 1, "a refused send vanished from the queue");
-    assert!(server.submitted().is_empty());
+    assert_eq!(server.submitted(), [] as [Vec<u8>; 0]);
 }
 
 #[test]

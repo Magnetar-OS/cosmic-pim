@@ -665,7 +665,7 @@ mod tests {
         let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
                    BEGIN:VEVENT\r\nUID:a@test\r\nDTSTART:20260804T090000Z\r\n\
                    SUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        assert!(parse_ics(ics, "personal", "a.ics")[0].alarms.is_empty());
+        assert_eq!(parse_ics(ics, "personal", "a.ics")[0].alarms, []);
     }
 
     #[test]

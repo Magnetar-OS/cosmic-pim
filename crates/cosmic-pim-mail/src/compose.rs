@@ -749,7 +749,7 @@ mod tests {
         let draft = Draft::reply(&incoming(), me(), false);
         assert_eq!(draft.to.len(), 1);
         assert_eq!(draft.to[0].address, "ada@example.com");
-        assert!(draft.cc.is_empty());
+        assert_eq!(draft.cc, []);
     }
 
     #[test]
@@ -988,7 +988,7 @@ mod tests {
         );
         let original = Message::parse(raw.as_bytes()).unwrap();
         assert_eq!(original.attachments.len(), 1);
-        assert!(Draft::reply(&original, me(), false).attachments.is_empty());
+        assert_eq!(Draft::reply(&original, me(), false).attachments, []);
     }
 
     #[test]

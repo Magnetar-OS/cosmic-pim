@@ -695,7 +695,7 @@ mod tests {
         // Microsoft takes no password for Outlook.com. An empty list is the
         // honest answer; a password field would fail every time.
         let alone = plan(&built_in(), "ada@outlook.com", false).unwrap();
-        assert!(alone.routes.is_empty());
+        assert_eq!(alone.routes, []);
 
         let with_goa = plan(&built_in(), "ada@outlook.com", true).unwrap();
         assert_eq!(routes(&with_goa), ["online-accounts"]);
@@ -804,7 +804,7 @@ mod tests {
         let error = add_with_password(&mut store, &registry, &plan, "", "wrong").unwrap_err();
 
         assert!(matches!(error, SetupError::Rejected(_)), "got {error}");
-        assert!(store.accounts().is_empty());
+        assert_eq!(store.accounts(), []);
     }
 
     #[test]
@@ -825,7 +825,7 @@ mod tests {
         let error = add_with_password(&mut store, &registry, &plan, "", "right").unwrap_err();
 
         assert!(matches!(error, SetupError::Unreachable(_)), "got {error}");
-        assert!(store.accounts().is_empty());
+        assert_eq!(store.accounts(), []);
     }
 
     #[test]
@@ -1089,8 +1089,8 @@ mod tests {
         let adopted = adopt_online_accounts(&mut store, &built_in(), &source).unwrap();
 
         assert_eq!(adopted.failed.len(), 3, "{adopted:?}");
-        assert!(adopted.linked.is_empty());
-        assert!(store.accounts().is_empty());
+        assert_eq!(adopted.linked, [] as [String; 0]);
+        assert_eq!(store.accounts(), []);
     }
 
     #[test]
@@ -1110,7 +1110,7 @@ mod tests {
         let adopted = adopt_online_accounts(&mut store, &built_in(), &source).unwrap();
 
         assert_eq!(adopted.failed.len(), 2, "{adopted:?}");
-        assert!(store.accounts().is_empty());
+        assert_eq!(store.accounts(), []);
     }
 
     #[test]
@@ -1125,6 +1125,6 @@ mod tests {
         let adopted = adopt_online_accounts(&mut store, &built_in(), &source).unwrap();
 
         assert_eq!(adopted.failed.len(), 1);
-        assert!(store.accounts().is_empty());
+        assert_eq!(store.accounts(), []);
     }
 }

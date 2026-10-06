@@ -161,7 +161,7 @@ mod tests {
             plan.to_remove.is_empty(),
             "a server hiccup deleted the mailbox"
         );
-        assert!(plan.to_fetch.is_empty());
+        assert_eq!(plan.to_fetch, [] as [u32; 0]);
     }
 
     #[test]

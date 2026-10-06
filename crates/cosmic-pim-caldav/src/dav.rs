@@ -2484,7 +2484,7 @@ END:VCALENDAR
                 etag: "\"e1\"".into(),
             }]
         );
-        assert!(result.failed_uris.is_empty());
+        assert_eq!(result.failed_uris, [] as [String; 0]);
     }
 
     #[test]
@@ -2648,7 +2648,7 @@ END:VCALENDAR</C:calendar-data></D:prop>
         // The same document must yield nothing to a CalDAV client: an address
         // book is not a calendar, and syncing one as the other would fill a
         // calendar with unparseable resources.
-        assert!(parse_propfind_calendars(xml, Flavor::CalDav).is_empty());
+        assert_eq!(parse_propfind_calendars(xml, Flavor::CalDav), []);
     }
 
     #[test]
@@ -2669,7 +2669,7 @@ END:VCARD</card:address-data>
 
         // And a CalDAV client sees no payload at all, rather than an empty one
         // it would then store over a real contact.
-        assert!(parse_multiget_report(xml, Flavor::CalDav).is_empty());
+        assert_eq!(parse_multiget_report(xml, Flavor::CalDav), []);
     }
 
     #[test]

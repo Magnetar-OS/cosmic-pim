@@ -687,7 +687,7 @@ mod tests {
             let provider: Provider = toml::from_str(text)
                 .unwrap_or_else(|why| panic!("built-in provider {id} does not parse: {why}"));
             assert_eq!(&provider.id, id, "manifest id does not match its file name");
-            assert!(!provider.name.trim().is_empty());
+            assert_ne!(provider.name.trim(), "");
         }
     }
 
@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(account.provider.as_deref(), Some("fastmail"));
         // The provider's id is what locates its calendars and address books;
         // see `account_for`.
-        assert!(account.url.is_empty());
+        assert_eq!(account.url, "");
         assert_eq!(
             fastmail.calendar_url(&account.username).as_deref(),
             Some("https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/")

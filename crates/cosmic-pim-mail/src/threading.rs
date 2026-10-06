@@ -358,7 +358,7 @@ mod tests {
             vec!["a@x", "b@x"],
             "unbracketed ids are common enough that dropping them loses threads"
         );
-        assert!(parse_references("   ").is_empty());
+        assert_eq!(parse_references("   "), [] as [String; 0]);
     }
 
     #[test]
@@ -498,7 +498,7 @@ mod tests {
             ACCOUNT,
             threadable(Some("a@x"), "<root@x>", "", "Re: X", "X"),
         );
-        assert!(msg.merged_from.is_empty());
+        assert_eq!(msg.merged_from, [] as [String; 0]);
     }
 
     #[test]

@@ -655,7 +655,7 @@ mod tests {
             .expect("a half-written draft must save");
         let loaded = drafts.load(&id, me()).unwrap().unwrap();
         assert_eq!(loaded.subject, "Thinking about it");
-        assert!(loaded.to.is_empty());
+        assert_eq!(loaded.to, []);
     }
 
     #[test]
@@ -686,7 +686,7 @@ mod tests {
     fn an_empty_store_lists_nothing_rather_than_failing() {
         let dir = tempfile::tempdir().unwrap();
         let drafts = Drafts::open(dir.path().join("never-used")).unwrap();
-        assert!(drafts.list().unwrap().is_empty());
+        assert_eq!(drafts.list().unwrap(), []);
         assert_eq!(drafts.count(), 0);
     }
 
@@ -712,7 +712,7 @@ mod tests {
         drafts
             .mark_mirrored(&id, "abc@example.com", Some((41, 9)), &draft())
             .unwrap();
-        assert!(drafts.dirty().unwrap().is_empty());
+        assert_eq!(drafts.dirty().unwrap(), [] as [String; 0]);
         let mirror = drafts.mirror(&id).unwrap().unwrap();
         assert_eq!(mirror.message_id.as_deref(), Some("abc@example.com"));
         assert_eq!(mirror.uid, Some(9));
@@ -775,7 +775,7 @@ mod tests {
             .adopt(&id, &draft(), "other@example.com", 41, 12, 10)
             .unwrap();
 
-        assert!(drafts.dirty().unwrap().is_empty());
+        assert_eq!(drafts.dirty().unwrap(), [] as [String; 0]);
         let mirror = drafts.mirror(&id).unwrap().unwrap();
         assert_eq!(mirror.uid, Some(12));
         assert!(drafts.load(&id, me()).unwrap().is_some());
@@ -841,10 +841,10 @@ mod tests {
             vec![(id.clone(), "m12@example.com".to_owned())]
         );
         assert_eq!(drafts.count(), 0, "the tombstone was counted as a draft");
-        assert!(drafts.list().unwrap().is_empty());
+        assert_eq!(drafts.list().unwrap(), []);
 
         drafts.clear_retraction(&id).unwrap();
-        assert!(drafts.pending_retractions().is_empty());
+        assert_eq!(drafts.pending_retractions(), []);
         drafts
             .clear_retraction(&id)
             .expect("clearing twice must not fail");

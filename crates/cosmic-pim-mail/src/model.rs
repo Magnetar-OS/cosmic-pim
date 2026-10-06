@@ -712,7 +712,7 @@ Body text.\r\n";
         // Not a hypothetical: servers store bodiless probes, and a client that
         // returns None here shows the user an empty mailbox.
         let msg = Message::parse(b"\r\n").unwrap();
-        assert!(msg.from.is_empty());
+        assert_eq!(msg.from, []);
         assert_eq!(msg.subject, "");
         assert!(msg.date.is_none());
     }
@@ -735,7 +735,7 @@ Subject: Weekly\r\n\r\nbody\r\n";
     #[test]
     fn ordinary_mail_offers_no_unsubscribe() {
         let msg = Message::parse(SIMPLE).unwrap();
-        assert!(msg.unsubscribe.is_empty());
+        assert_eq!(msg.unsubscribe, [] as [String; 0]);
         assert!(!msg.one_click_unsubscribe);
     }
 

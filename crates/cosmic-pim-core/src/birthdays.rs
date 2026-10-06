@@ -167,25 +167,25 @@ mod tests {
     #[test]
     fn contacts_without_birthdays_cost_nothing() {
         let none = contact("Nobody", None, None);
-        assert!(in_range(&[none], date(2026, 1, 1), date(2027, 1, 1)).is_empty());
+        assert_eq!(in_range(&[none], date(2026, 1, 1), date(2027, 1, 1)), []);
     }
 
     #[test]
     fn a_birthday_outside_the_range_is_absent() {
         let ada = contact("Ada", Some(date(1815, 12, 10)), None);
-        assert!(in_range(&[ada], date(2026, 1, 1), date(2026, 12, 1)).is_empty());
+        assert_eq!(in_range(&[ada], date(2026, 1, 1), date(2026, 12, 1)), []);
     }
 
     #[test]
     fn the_range_end_is_exclusive() {
         let ada = contact("Ada", Some(date(1815, 12, 10)), None);
-        assert!(
+        assert_eq!(
             in_range(
                 std::slice::from_ref(&ada),
                 date(2026, 12, 1),
                 date(2026, 12, 10)
-            )
-            .is_empty()
+            ),
+            []
         );
         assert_eq!(
             in_range(&[ada], date(2026, 12, 10), date(2026, 12, 11)).len(),
@@ -207,13 +207,13 @@ mod tests {
         // Browsing back past a child's birth year showed a birthday on which
         // they "turned -2".
         let child = contact("Child", Some(date(2024, 5, 1)), None);
-        assert!(
+        assert_eq!(
             in_range(
                 std::slice::from_ref(&child),
                 date(2022, 1, 1),
                 date(2024, 1, 1)
-            )
-            .is_empty()
+            ),
+            []
         );
         // The day itself is theirs.
         let born = in_range(&[child], date(2024, 1, 1), date(2025, 1, 1));

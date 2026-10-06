@@ -1896,7 +1896,7 @@ END:VCARD\r\n";
 
     #[test]
     fn garbage_yields_no_contacts_rather_than_an_error() {
-        assert!(parse_vcards("this is not a vCard", "default", "c.vcf").is_empty());
+        assert_eq!(parse_vcards("this is not a vCard", "default", "c.vcf"), []);
     }
 
     /* --- serialisation --- */
@@ -2133,7 +2133,7 @@ mod photo_tests {
         let raw = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:x\r\nFN:Ada\r\n\
 PHOTO;ENCODING=b;TYPE=JPEG:AAAABBBB\r\nEND:VCARD\r\n";
         match photo(raw) {
-            Some(Photo::Bytes { data, .. }) => assert!(!data.is_empty()),
+            Some(Photo::Bytes { data, .. }) => assert_ne!(data, [] as [u8; 0]),
             other => panic!("expected inline bytes, got {other:?}"),
         }
     }
@@ -2201,7 +2201,7 @@ BEGIN:VCARD\r\nUID:b\r\nFN:Bob\r\nEND:VCARD\r\n";
 
     #[test]
     fn empty_input_yields_nothing() {
-        assert!(split_vcards("").is_empty());
+        assert_eq!(split_vcards(""), [] as [String; 0]);
     }
 }
 
@@ -2515,7 +2515,7 @@ KIND:group\r\nMEMBER:urn:uuid:bob@server\r\nEND:VCARD\r\n";
         assert!(emptied.contains("KIND:group"), "{emptied}");
         let back = parse_vcards(&emptied, "d", "g.vcf").remove(0);
         assert!(back.is_group);
-        assert!(back.members.is_empty());
+        assert_eq!(back.members, [] as [String; 0]);
     }
 
     #[test]

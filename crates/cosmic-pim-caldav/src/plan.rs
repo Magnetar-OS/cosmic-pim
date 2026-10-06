@@ -128,8 +128,8 @@ mod tests {
             .collect();
         let plan = plan_sync(&listing, &local);
         assert!(plan.guard_tripped);
-        assert!(plan.to_delete.is_empty());
-        assert!(plan.to_fetch.is_empty());
+        assert_eq!(plan.to_delete, [] as [String; 0]);
+        assert_eq!(plan.to_fetch, [] as [String; 0]);
     }
 
     #[test]

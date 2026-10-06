@@ -698,13 +698,13 @@ END:VCALENDAR\r\n";
     fn a_component_without_a_uid_is_dropped_rather_than_invented_for() {
         // A fabricated identity makes every refresh a delete-and-recreate.
         let feed = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:No identity\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        assert!(split_by_uid(feed).is_empty());
+        assert_eq!(split_by_uid(feed), []);
     }
 
     #[test]
     fn garbage_yields_nothing_rather_than_a_panic() {
-        assert!(split_by_uid("").is_empty());
-        assert!(split_by_uid("not a calendar at all").is_empty());
+        assert_eq!(split_by_uid(""), []);
+        assert_eq!(split_by_uid("not a calendar at all"), []);
     }
 
     #[test]

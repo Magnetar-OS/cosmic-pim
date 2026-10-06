@@ -153,7 +153,7 @@ mod tests {
     fn bare_words_become_terms() {
         let query = parse("Ada invoice");
         assert_eq!(query.terms, ["ada", "invoice"]);
-        assert!(query.from.is_empty());
+        assert_eq!(query.from, [] as [String; 0]);
     }
 
     #[test]
@@ -161,7 +161,7 @@ mod tests {
         let query = parse("From:Ada SUBJECT:Invoice");
         assert_eq!(query.from, ["ada"]);
         assert_eq!(query.subject, ["invoice"]);
-        assert!(query.terms.is_empty());
+        assert_eq!(query.terms, [] as [String; 0]);
     }
 
     #[test]

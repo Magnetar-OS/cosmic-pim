@@ -1085,11 +1085,11 @@ mod tests {
         let mut index = Index::in_memory().unwrap();
         index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
         index.forget(ACCOUNT, MAILBOX).unwrap();
-        assert!(
+        assert_eq!(
             index
                 .conversations(ACCOUNT, MAILBOX, &flags(&store))
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            []
         );
 
         assert_eq!(index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap(), 1);
@@ -1359,7 +1359,10 @@ mod tests {
         let mut index = Index::in_memory().unwrap();
         index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
 
-        assert!(search(&index, "'; DROP TABLE messages; --").is_empty());
+        assert_eq!(
+            search(&index, "'; DROP TABLE messages; --"),
+            [] as [String; 0]
+        );
         assert_eq!(
             index
                 .conversations(ACCOUNT, MAILBOX, &flags(&store))
@@ -1376,8 +1379,8 @@ mod tests {
         let store = searchable();
         let mut index = Index::in_memory().unwrap();
         index.sync_mailbox(ACCOUNT, MAILBOX, &store).unwrap();
-        assert!(search(&index, "").is_empty());
-        assert!(search(&index, "   ").is_empty());
+        assert_eq!(search(&index, ""), [] as [String; 0]);
+        assert_eq!(search(&index, "   "), [] as [String; 0]);
     }
 
     #[test]
@@ -1392,11 +1395,11 @@ mod tests {
         assert_eq!(hits[0].mailbox, "Archive");
 
         // And can be narrowed to one.
-        assert!(
+        assert_eq!(
             index
                 .search(ACCOUNT, Some("INBOX"), &crate::search::parse("invoice"), 50)
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            []
         );
     }
 

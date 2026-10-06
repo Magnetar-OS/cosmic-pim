@@ -1204,7 +1204,7 @@ mod tests {
 
         let (add, remove) = label_delta(unread, read);
 
-        assert!(add.is_empty());
+        assert_eq!(add, [] as [&str; 0]);
         assert_eq!(remove, vec!["UNREAD"]);
     }
 
@@ -1226,7 +1226,7 @@ mod tests {
         // exists. A client that models it as a move to a folder either invents
         // a label or loses the change.
         let (add, remove) = move_delta("archive");
-        assert!(add.is_empty());
+        assert_eq!(add, [] as [&str; 0]);
         assert!(remove.contains(&"INBOX"));
     }
 
@@ -1286,7 +1286,7 @@ mod tests {
         fold_history(&records, &mut delta);
 
         assert_eq!(delta.touched, vec!["M1".to_owned(), "M2".to_owned()]);
-        assert!(delta.deleted.is_empty());
+        assert_eq!(delta.deleted, [] as [String; 0]);
     }
 
     #[test]
@@ -1301,7 +1301,7 @@ mod tests {
         let mut delta = HistoryDelta::default();
         fold_history(&records, &mut delta);
 
-        assert!(delta.touched.is_empty());
+        assert_eq!(delta.touched, [] as [String; 0]);
         assert_eq!(delta.deleted, vec!["M1".to_owned()]);
     }
 

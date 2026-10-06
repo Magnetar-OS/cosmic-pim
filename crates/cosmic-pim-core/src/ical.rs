@@ -2668,7 +2668,7 @@ mod tests {
         );
         // The offsets the editors work with are the start-relative ones.
         assert_eq!(one(&ics).alarms, vec![chrono::Duration::minutes(-10)]);
-        assert!(event_alarms(&ics, "someone-else@test", None).is_empty());
+        assert_eq!(event_alarms(&ics, "someone-else@test", None), []);
     }
 
     #[test]
@@ -3514,8 +3514,8 @@ END:VCALENDAR\r\n";
             .into_iter()
             .next()
             .unwrap();
-        assert!(event.other.is_empty());
-        assert!(event.attendees.is_empty());
+        assert_eq!(event.other, [] as [String; 0]);
+        assert_eq!(event.attendees, []);
         assert!(event.organizer.is_none());
     }
 }
@@ -3822,7 +3822,7 @@ mod todo_tests {
         let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
                    BEGIN:VEVENT\r\nUID:e@test\r\nDTSTART:20260804T090000Z\r\n\
                    SUMMARY:Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        assert!(parse_todos(ics, "personal", "e.ics").is_empty());
+        assert_eq!(parse_todos(ics, "personal", "e.ics"), []);
         // …and the converse, so a mixed collection cannot cross-contaminate.
         assert!(parse_ics(&wrap("SUMMARY:Buy milk"), "personal", "t.ics").is_empty());
     }
@@ -3920,7 +3920,7 @@ mod todo_tests {
              TRIGGER;VALUE=DATE-TIME:20260804T063000Z\r\nEND:VALARM",
         );
         let todo = one(&ics);
-        assert!(todo.alarms.is_empty());
+        assert_eq!(todo.alarms, []);
         assert_eq!(
             todo_alarms(&ics, &todo.uid),
             vec![Alarm::At(

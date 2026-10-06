@@ -1448,7 +1448,7 @@ mod push_queue_tests {
         store.resolve(&queued, None).unwrap();
 
         let meta = vdir::collections(dir.path()).remove(0);
-        assert!(VdirStore::open(meta).unwrap().pending().unwrap().is_empty());
+        assert_eq!(VdirStore::open(meta).unwrap().pending().unwrap(), []);
     }
 
     #[test]
@@ -1652,7 +1652,7 @@ mod conflict_tests {
             "a re-create must not carry an If-Match nothing can satisfy: {:?}",
             pending[0].op
         );
-        assert!(store.conflicts().is_empty());
+        assert_eq!(store.conflicts(), []);
     }
 
     #[test]
@@ -1663,7 +1663,7 @@ mod conflict_tests {
 
         assert!(!store.collection().path.join("a.ics").exists());
         assert!(store.entry_for(HREF).is_none());
-        assert!(store.pending().unwrap().is_empty());
+        assert_eq!(store.pending().unwrap(), []);
     }
 
     #[test]
@@ -1824,7 +1824,7 @@ mod conflict_tests {
             store.pending().unwrap().is_empty(),
             "a push survived the edit it carried"
         );
-        assert!(store.conflicts().is_empty());
+        assert_eq!(store.conflicts(), []);
     }
 
     #[test]
@@ -1835,7 +1835,7 @@ mod conflict_tests {
         assert!(store.resolve_conflict_keep_local(HREF, None).unwrap());
 
         assert_eq!(file(&store), LOCAL_EDIT, "the local copy was not kept");
-        assert!(store.conflicts().is_empty());
+        assert_eq!(store.conflicts(), []);
 
         let entry = &store.pending().unwrap()[0];
         assert!(!entry.blocked, "the resolved push stayed parked");
@@ -1886,7 +1886,7 @@ mod conflict_tests {
             })
             .unwrap();
 
-        assert!(store.pending().unwrap().is_empty());
+        assert_eq!(store.pending().unwrap(), []);
     }
 }
 

@@ -734,7 +734,7 @@ mod tests {
 
         assert_eq!(outcome.auto_merged, 1);
         assert_eq!(outcome.conflicts, 0, "a mergeable divergence was escalated");
-        assert!(store.conflicts.is_empty());
+        assert_eq!(store.conflicts, []);
 
         let merged = &store.events["/a.ics"].ics;
         assert!(

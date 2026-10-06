@@ -458,7 +458,7 @@ mod tests {
     fn stored_json_round_trips_and_corruption_degrades_quietly() {
         let hops = parse("mx.example; dkim=pass header.d=example.com");
         assert_eq!(from_json(&to_json(&hops)), hops);
-        assert!(from_json("{not json").is_empty());
-        assert!(from_json("").is_empty());
+        assert_eq!(from_json("{not json"), []);
+        assert_eq!(from_json(""), []);
     }
 }

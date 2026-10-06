@@ -676,7 +676,7 @@ mod tests {
         let outcome = drain(&client, &mut queue, 0);
 
         assert_eq!(outcome.rejected, 1);
-        assert!(queue.pending().unwrap().is_empty());
+        assert_eq!(queue.pending().unwrap(), []);
         assert_eq!(outcome.settled(), 1);
     }
 

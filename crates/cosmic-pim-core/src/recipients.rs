@@ -256,7 +256,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("contacts");
 
-        assert!(read_address_book_at(&root).is_empty());
+        assert_eq!(read_address_book_at(&root), []);
         assert!(!root.exists(), "reading the address book created it");
     }
 
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn an_address_typed_out_in_full_is_not_offered_back() {
-        assert!(complete(&book(), "Grace@Navy.example").is_empty());
+        assert_eq!(complete(&book(), "Grace@Navy.example"), []);
         // One letter short of it, it still is.
         assert_eq!(
             addresses(&complete(&book(), "grace@navy.exampl")),
@@ -315,8 +315,8 @@ mod tests {
 
     #[test]
     fn one_letter_offers_nothing() {
-        assert!(complete(&book(), "a").is_empty());
-        assert!(complete(&book(), "grace@navy.example, ").is_empty());
+        assert_eq!(complete(&book(), "a"), []);
+        assert_eq!(complete(&book(), "grace@navy.example, "), []);
     }
 
     #[test]

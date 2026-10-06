@@ -510,7 +510,7 @@ fn resolving_a_conflict_in_favour_of_the_server_leaves_a_clean_collection() {
     let events = vdir::read_collection(store.collection());
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].summary, "Moved to Thursday");
-    assert!(store.conflicts().is_empty());
+    assert_eq!(store.conflicts(), []);
     assert!(
         store.pending().unwrap().is_empty(),
         "the push carrying the discarded edit is still queued"
@@ -626,5 +626,5 @@ fn a_new_event_is_created_without_overwriting_and_its_etag_is_kept() {
         Some("\"fresh\""),
         "the ETag the server answered with was thrown away"
     );
-    assert!(store.pending().expect("queue").is_empty());
+    assert_eq!(store.pending().expect("queue"), []);
 }

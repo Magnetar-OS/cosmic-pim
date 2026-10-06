@@ -1862,7 +1862,7 @@ END:VCALENDAR\r\n";
         let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\n\
                    BEGIN:VFREEBUSY\r\nUID:x@y\r\nDTSTAMP:20270104T080000Z\r\n\
                    ATTENDEE:mailto:ada@example.com\r\nEND:VFREEBUSY\r\nEND:VCALENDAR\r\n";
-        assert!(parse_freebusy(ics).is_empty());
+        assert_eq!(parse_freebusy(ics), []);
     }
 
     #[test]

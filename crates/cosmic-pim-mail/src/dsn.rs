@@ -580,7 +580,7 @@ Subject: Spring news\r\n\
     #[test]
     fn successful_delivery_notifications_produce_no_records() {
         let raw = HARD_DSN.replace("Action: failed", "Action: delivered");
-        assert!(parse(&raw).is_empty());
+        assert_eq!(parse(&raw), []);
     }
 
     #[test]

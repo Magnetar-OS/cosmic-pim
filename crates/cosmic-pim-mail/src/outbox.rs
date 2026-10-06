@@ -1075,7 +1075,7 @@ mod tests {
                 .to_string()
                 .contains("may already have been delivered")
         );
-        assert!(outbox.list().unwrap().is_empty());
+        assert_eq!(outbox.list().unwrap(), []);
     }
 
     #[test]
@@ -1120,7 +1120,7 @@ mod tests {
 
         let outcome = outbox.drain(&unreachable(), &password(), MAX_DELAY_MS + 1);
         assert_eq!(outcome.deferred, 1);
-        assert!(outcome.sent.is_empty());
+        assert_eq!(outcome.sent, []);
         assert!(!outcome.needs_attention());
 
         let queued = &outbox.list().unwrap()[0];

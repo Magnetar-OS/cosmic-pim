@@ -355,8 +355,8 @@ Date: Mon, 3 Feb 2025 10:00:00 +0000\nSubject: Dated\n\nBody.\n";
 
     #[test]
     fn an_empty_archive_is_empty_rather_than_a_stray_separator() {
-        assert!(write(std::iter::empty()).is_empty());
-        assert!(messages(&write(std::iter::empty())).is_empty());
+        assert_eq!(write(std::iter::empty()), [] as [u8; 0]);
+        assert_eq!(messages(&write(std::iter::empty())), [] as [Vec<u8>; 0]);
     }
 
     /// The export → import path a person actually walks when they leave
@@ -415,7 +415,7 @@ Body two.\n";
     fn the_split_messages_parse_as_messages() {
         for raw in messages(TWO) {
             let message = crate::model::Message::parse(&raw).expect("parses");
-            assert!(!message.subject.is_empty());
+            assert_ne!(message.subject, "");
         }
     }
 
@@ -466,8 +466,8 @@ Other.\n";
 
     #[test]
     fn empty_and_rubbish_inputs_yield_nothing() {
-        assert!(messages(b"").is_empty());
-        assert!(messages(b"not an mbox at all\n").is_empty());
+        assert_eq!(messages(b""), [] as [Vec<u8>; 0]);
+        assert_eq!(messages(b"not an mbox at all\n"), [] as [Vec<u8>; 0]);
     }
 
     #[test]

@@ -312,7 +312,7 @@ mod tests {
     fn nothing_is_due_before_its_time() {
         let (_dir, mut schedule) = schedule();
         schedule.snooze(record("a@test", 10 * HOUR_MS)).unwrap();
-        assert!(schedule.due(9 * HOUR_MS).is_empty());
+        assert_eq!(schedule.due(9 * HOUR_MS), []);
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
         );
 
         assert!(schedule.woke("a@test").unwrap());
-        assert!(schedule.due(2 * HOUR_MS).is_empty());
+        assert_eq!(schedule.due(2 * HOUR_MS), []);
     }
 
     #[test]
@@ -384,7 +384,7 @@ mod tests {
             "two records for one message would wake it twice"
         );
         assert_eq!(schedule.get("a@test").unwrap().wake_at_ms, 20 * HOUR_MS);
-        assert!(schedule.due(2 * HOUR_MS).is_empty());
+        assert_eq!(schedule.due(2 * HOUR_MS), []);
     }
 
     /// Woken into the inbox, snoozed again from there: it must still come
@@ -412,7 +412,7 @@ mod tests {
         let (_dir, mut schedule) = schedule();
         let outcome = schedule.snooze(record("   ", HOUR_MS));
         assert!(outcome.is_err(), "a message with no identity was snoozed");
-        assert!(schedule.pending().is_empty());
+        assert_eq!(schedule.pending(), [] as [&crate::snooze::Snoozed; 0]);
     }
 
     #[test]
@@ -420,7 +420,7 @@ mod tests {
         let (_dir, mut schedule) = schedule();
         schedule.snooze(record("a@test", 99 * HOUR_MS)).unwrap();
         assert!(schedule.cancel("a@test").unwrap());
-        assert!(schedule.pending().is_empty());
+        assert_eq!(schedule.pending(), [] as [&crate::snooze::Snoozed; 0]);
     }
 
     #[test]

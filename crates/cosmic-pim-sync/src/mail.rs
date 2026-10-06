@@ -1222,7 +1222,7 @@ mod tests {
 
         let outbox = queue_one(&account, dir.path());
         let report = drain_outbox(&account, &password, dir.path(), 1_000).unwrap();
-        assert!(report.sent.is_empty());
+        assert_eq!(report.sent, []);
         assert_eq!(report.stopped, []);
         let queued = &outbox.list().unwrap()[0];
         assert_eq!(queued.attempts, 1, "the due message was not attempted");
@@ -1248,11 +1248,11 @@ mod tests {
         }
 
         let calendar_only = Account::new("Calendar only", "https://dav.example/", "ada");
-        assert!(
+        assert_eq!(
             drain_outbox(&calendar_only, &password, dir.path(), 1_000)
                 .unwrap()
-                .sent
-                .is_empty()
+                .sent,
+            []
         );
     }
 

@@ -175,7 +175,7 @@ mod tests {
         assert!(take_remote(dir.path(), &id, HREF).unwrap());
 
         assert_eq!(file(dir.path(), &id), SERVER_V2);
-        assert!(for_collection(dir.path(), &id).unwrap().is_empty());
+        assert_eq!(for_collection(dir.path(), &id).unwrap(), []);
     }
 
     #[test]
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn an_unknown_collection_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(for_collection(dir.path(), "nope").unwrap().is_empty());
+        assert_eq!(for_collection(dir.path(), "nope").unwrap(), []);
         assert!(!take_remote(dir.path(), "nope", HREF).unwrap());
         assert!(!keep_local(dir.path(), "nope", HREF, None).unwrap());
     }

@@ -803,7 +803,7 @@ mod tests {
         let id = store.accounts()[0].id.clone();
 
         store.remove(&id).unwrap();
-        assert!(store.accounts().is_empty());
+        assert_eq!(store.accounts(), []);
 
         // A later save must not bring it back from the copy still on disk.
         let mut another = account();
@@ -870,13 +870,13 @@ mod tests {
             imap_host = "imap.example.com"
         "#;
         let endpoint: MailEndpoint = toml::from_str(toml).expect("an old endpoint must load");
-        assert!(endpoint.aliases.is_empty());
+        assert_eq!(endpoint.aliases, []);
     }
 
     #[test]
     fn opening_a_missing_file_yields_an_empty_store() {
         let (_dir, store) = store();
-        assert!(store.accounts().is_empty());
+        assert_eq!(store.accounts(), []);
     }
 
     #[test]
@@ -933,7 +933,7 @@ mod tests {
 
         store.remove(&id).unwrap();
 
-        assert!(store.accounts().is_empty());
+        assert_eq!(store.accounts(), []);
         // Reach past the account to the raw slot: the account is gone, so
         // `password()` would just report UnknownAccount either way.
         let secrets = SecretStore::open_envelope_only("cosmic-pim-test", dir.path());

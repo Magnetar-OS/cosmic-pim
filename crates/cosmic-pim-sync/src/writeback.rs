@@ -377,7 +377,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     fn a_save_to_a_local_only_calendar_queues_nothing() {
         let (dir, id) = collection(false);
         assert!(!queue_save(dir.path(), &id, "a.ics").unwrap());
-        assert!(pending(dir.path(), &id).is_empty());
+        assert_eq!(pending(dir.path(), &id), [] as [String; 0]);
     }
 
     #[test]
@@ -577,7 +577,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
             Err::<(), _>(StoreError::from(std::io::Error::other("disk full")))
         });
         assert!(matches!(result, Err(Error::Store(_))), "{result:?}");
-        assert!(pending(dir.path(), &id).is_empty());
+        assert_eq!(pending(dir.path(), &id), [] as [String; 0]);
     }
 
     #[test]
@@ -613,7 +613,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         })
         .unwrap();
         assert!(!same.queued.unwrap(), "rewriting the same bytes was queued");
-        assert!(pending(dir.path(), &id).is_empty());
+        assert_eq!(pending(dir.path(), &id), [] as [String; 0]);
     }
 
     #[test]
@@ -684,7 +684,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
 
         assert!(!queue_save(dir.path(), &id, "a.ics").unwrap());
         assert!(!queue_delete(dir.path(), &id, "a.ics").unwrap());
-        assert!(pending(dir.path(), &id).is_empty());
+        assert_eq!(pending(dir.path(), &id), [] as [String; 0]);
 
         // Unmarking reconnects, with the binding intact.
         {
