@@ -59,6 +59,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One account GOA holds a sign-in for.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OnlineAccount {
     /// GOA's id for the account. Stable for as long as the account exists,
     /// and what an account backed by it is named after — see
@@ -79,6 +80,22 @@ pub struct OnlineAccount {
 }
 
 impl OnlineAccount {
+    /// An account as GOA would describe it, with nothing needing attention
+    /// and no service switched off — for a source of accounts other than the
+    /// daemon, and for tests.
+    #[must_use]
+    pub fn new(id: &str, provider_type: &str, identity: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            provider_type: provider_type.to_owned(),
+            identity: identity.to_owned(),
+            attention_needed: false,
+            mail_disabled: false,
+            calendar_disabled: false,
+            contacts_disabled: false,
+        }
+    }
+
     /// The account's address, when [`Self::identity`] has the shape of one.
     ///
     /// What GOA calls an identity is whatever its provider chose to show, and
@@ -545,15 +562,7 @@ mod tests {
 
     #[test]
     fn an_identity_is_an_address_only_when_it_is_exactly_one() {
-        let account = |identity: &str| OnlineAccount {
-            id: "account_1".to_owned(),
-            provider_type: "google".to_owned(),
-            identity: identity.to_owned(),
-            attention_needed: false,
-            mail_disabled: false,
-            calendar_disabled: false,
-            contacts_disabled: false,
-        };
+        let account = |identity: &str| OnlineAccount::new("account_1", "google", identity);
 
         assert_eq!(account(" ada@gmail.com ").address(), Some("ada@gmail.com"));
         for identity in [

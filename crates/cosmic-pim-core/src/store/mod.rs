@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StoreError {
     #[error("{0}")]
     Io(#[from] std::io::Error),

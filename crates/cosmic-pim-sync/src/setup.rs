@@ -53,6 +53,7 @@ impl OnlineAccountSource for OnlineAccounts {
 
 /// One way an address can sign in.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Route {
     /// The provider's own sign-in, in the user's browser.
     SignIn,
@@ -77,6 +78,7 @@ pub struct Services {
 
 /// What an address means, before anything is asked of the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Plan {
     /// The address, trimmed.
     pub address: String,
@@ -190,6 +192,7 @@ pub fn plan(registry: &Registry, address: &str, online_accounts: bool) -> Option
 
 /// Why an account could not be added.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SetupError {
     /// The server refused the password. The provider's hint, where it has
     /// one, is the most useful thing to show next to this.
@@ -505,6 +508,7 @@ pub fn link_online_account(
 
 /// What [`adopt_online_accounts`] changed.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct Adopted {
     /// Accounts linked for the first time, by id.
     pub linked: Vec<String>,
@@ -952,15 +956,7 @@ mod tests {
             Self {
                 accounts: accounts
                     .iter()
-                    .map(|(id, kind, identity)| OnlineAccount {
-                        id: (*id).to_owned(),
-                        provider_type: (*kind).to_owned(),
-                        identity: (*identity).to_owned(),
-                        attention_needed: false,
-                        mail_disabled: false,
-                        calendar_disabled: false,
-                        contacts_disabled: false,
-                    })
+                    .map(|(id, kind, identity)| OnlineAccount::new(id, kind, identity))
                     .collect(),
                 listing_fails: false,
                 refuses: Vec::new(),

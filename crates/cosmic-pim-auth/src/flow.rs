@@ -337,6 +337,7 @@ impl Pending {
 
 /// What a completed sign-in produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Grant {
     /// What to store, and what every later renewal starts from.
     pub credential: OAuthCredential,

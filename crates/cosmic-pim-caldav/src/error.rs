@@ -36,6 +36,7 @@ use std::fmt::Display;
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The server was unreachable, or answered with something unusable — a
     /// dropped connection, a TLS failure, XML that is not a multistatus, an

@@ -190,6 +190,7 @@ impl OAuth {
 /// What to tell someone signing in to an OAuth provider with an app password
 /// instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AppPassword {
     /// How to get one, and what it does not cover.
     pub hint: String,

@@ -6,6 +6,7 @@
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
     CalDav(#[from] cosmic_pim_caldav::Error),

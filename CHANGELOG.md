@@ -49,6 +49,15 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   `#[non_exhaustive]`, so the next field is not another major version.
   `outbox::MAX_ATTEMPTS` is public.
 
+- The error enums are `#[non_exhaustive]`: `cosmic_pim_core::StoreError`, and
+  `Error` in `cosmic-pim-caldav`, `-accounts`, `-auth`, `-mail` and `-sync`. A
+  `match` on one needs a wildcard arm. `cosmic_pim_core::atomic::Error` is
+  unchanged.
+- The types new in this release are `#[non_exhaustive]` too, so they can grow
+  in 3.x: `auth::Grant`, `auth::Identity`, `auth::OnlineAccount` (built with
+  `OnlineAccount::new`), `accounts::AppPassword`, `mail::Located`, and
+  `sync::setup::{Plan, Route, Adopted, SetupError}`.
+
 ### Added
 
 - Provider manifests are read from system directories as well as the user's:

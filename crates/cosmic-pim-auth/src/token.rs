@@ -87,6 +87,7 @@ fn bearer() -> String {
 /// Google accounts, signed in to the other one, gets an account labelled with
 /// one address holding a grant for the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Identity {
     /// The address the provider knows this user by, which is also the login
     /// for its IMAP, SMTP and DAV services.

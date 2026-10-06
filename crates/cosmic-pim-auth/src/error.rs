@@ -11,6 +11,7 @@
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// No OAuth client id is configured for this provider.
     ///
