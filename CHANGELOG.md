@@ -36,6 +36,15 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   by one, and `resolve` asks GOA for its token. The refresh token stays with
   GOA. An id from GOA that is not a plain token is refused, because an
   account's id names files.
+- `cosmic_pim_sync::setup`: from an address to a stored, working account.
+  `plan` says, with no network, which provider an address belongs to, what
+  the account would bring, and every way in that can work here, best first.
+  `add_with_password` finds the servers, tries the password, and stores the
+  account only if the server took it. `sign_in` runs the browser sign-in and
+  names the account after whoever signed in. `link_online_account` and
+  `adopt_online_accounts` link GOA's accounts and remove the ones GOA no
+  longer has — only ever from a listing that succeeded. `services_of` says
+  what a stored account brings.
 - `Provider::app_password` and `Provider::app_password_account`: the password
   route of a provider whose own route is the browser. Google's manifest has
   one — an app password reaches Gmail over IMAP — and Microsoft's does not.

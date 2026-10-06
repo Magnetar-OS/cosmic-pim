@@ -803,6 +803,7 @@ dependencies = [
 name = "cosmic-pim-sync"
 version = "2.2.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "cosmic-pim-accounts",
  "cosmic-pim-auth",
@@ -811,6 +812,7 @@ dependencies = [
  "cosmic-pim-mail",
  "tempfile",
  "thiserror",
+ "tiny_http",
  "tracing",
 ]
 

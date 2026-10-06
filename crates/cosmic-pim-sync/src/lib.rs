@@ -23,6 +23,8 @@
 //!   step.
 //! - [`conflict`] — what a pass could not decide on its own: both sides
 //!   changed the same resource, and a person has to choose.
+//! - [`setup`] — from an address to a stored, working account: which
+//!   provider, which ways to sign in, and the sign-in itself.
 //! - `mail` — the mail pass, behind the default `mail` feature. A contacts
 //!   or calendar app turns it off (`default-features = false`) and keeps the
 //!   mail and OpenPGP stack out of its build.
@@ -34,6 +36,7 @@ pub mod freebusy;
 #[cfg(feature = "mail")]
 pub mod mail;
 pub mod provision;
+pub mod setup;
 pub mod writeback;
 
 pub use conflict::all as conflicts;
