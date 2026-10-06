@@ -54,6 +54,10 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
 
 ### Fixed
 
+- Queued mail leaves in the order it was queued. A drain walked the outbox
+  directory in whatever order the filesystem listed it, so two messages
+  written moments apart could go out in either order; `Outbox::list` already
+  sorted them, and the drain now does too.
 - A provider account's address books are looked for at the provider's
   contacts address. `Provider::account_for` stored the calendar address as the
   account's own URL, and the sync engine then used it for both, so an account

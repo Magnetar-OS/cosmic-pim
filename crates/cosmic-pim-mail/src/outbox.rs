@@ -364,7 +364,12 @@ impl Outbox {
         let mut outcome = DrainOutcome::default();
         outcome.given_up += self.recover_interrupted()?;
 
-        for listed in self.entries(EXTENSION) {
+        // Oldest first, as `list` shows them: ids sort by when they were
+        // made, and a directory is listed in whatever order it likes.
+        let mut waiting = self.entries(EXTENSION);
+        waiting.sort_by(|a, b| a.id.cmp(&b.id));
+
+        for listed in waiting {
             if !listed.is_live() || listed.next_attempt_ms > now_ms {
                 outcome.skipped += 1;
                 continue;
@@ -774,6 +779,32 @@ mod tests {
             .map(|queued| queued.draft.subject)
             .collect();
         assert_eq!(subjects, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn a_drain_sends_in_the_order_the_list_shows() {
+        // The drain walked the directory as the filesystem listed it, so two
+        // messages written a second apart could leave in either order.
+        let (_dir, outbox) = outbox();
+        let ids: Vec<String> = (0..40).map(|n| format!("{:016x}", 40 - n)).collect();
+        for id in &ids {
+            outbox.submit(id, &draft(id), 0).unwrap();
+        }
+        let mut went = Vec::new();
+
+        outbox
+            .drain_with(
+                |draft| {
+                    went.push(draft.subject.clone());
+                    Outcome::Sent(Vec::new())
+                },
+                0,
+            )
+            .unwrap();
+
+        let mut expected = ids;
+        expected.sort();
+        assert_eq!(went, expected);
     }
 
     #[test]
