@@ -1,9 +1,18 @@
-# Google. OAuth only: Basic authentication was withdrawn for Gmail, Calendar
-# and Contacts, so an app password does not exist here — a client id must be
-# configured before this provider can be used at all.
+# Google. OAuth is its own route, and the only one for Calendar and Contacts:
+# a client id has to be configured before those can be reached at all.
+#
+# Mail alone has a second way in. An account with 2-Step Verification on can
+# make an app password, and Gmail still takes one over IMAP and SMTP — which
+# is what `[app_password]` below records, for an installation with no client
+# id.
 id = "google"
 name = "Google"
 hint = "Requires an OAuth client id from a Google Cloud project. See providers(5) in the docs."
+domains = ["gmail.com", "googlemail.com"]
+
+[app_password]
+hint = "Turn on 2-Step Verification for your Google account, then create an app password and use it here. This adds mail only — calendar and contacts need the browser sign-in."
+help_url = "https://myaccount.google.com/apppasswords"
 
 [oauth]
 auth_url = "https://accounts.google.com/o/oauth2/v2/auth"

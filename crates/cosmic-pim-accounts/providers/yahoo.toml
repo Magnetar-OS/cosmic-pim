@@ -1,0 +1,42 @@
+# Yahoo Mail. App-password only for a client without Yahoo's own OAuth
+# registration: the account password is refused over IMAP, SMTP and DAV, and
+# the refusal reads as a wrong password.
+#
+# The domain list is the one Yahoo publishes in its own autoconfig record,
+# minus the ISP it hosts mail for.
+id = "yahoo"
+name = "Yahoo"
+hint = "Create an app password in your Yahoo account under Security → Generate app password. Your Yahoo password will not work."
+help_url = "https://login.yahoo.com/myaccount/security"
+domains = [
+    "yahoo.com",
+    "ymail.com",
+    "myyahoo.com",
+    "rocketmail.com",
+    "yahoo.ca",
+    "yahoo.de",
+    "yahoo.it",
+    "yahoo.fr",
+    "yahoo.es",
+    "yahoo.se",
+    "yahoo.co.in",
+    "yahoo.co.uk",
+    "yahoo.co.nz",
+    "yahoo.com.au",
+    "yahoo.com.ar",
+    "yahoo.com.br",
+    "yahoo.com.mx",
+]
+
+[services]
+calendar = "https://caldav.calendar.yahoo.com/"
+contacts = "https://carddav.address.yahoo.com/"
+
+[services.mail]
+protocol = "imap"
+imap_host = "imap.mail.yahoo.com"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "smtp.mail.yahoo.com"
+smtp_port = 465
+smtp_transport = "tls"

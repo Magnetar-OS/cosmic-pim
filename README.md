@@ -68,15 +68,25 @@ the secret of the moment — a password, or an access token it renewed and
 re-stored on the way — and the CalDAV client sends `Basic` or `Bearer`, the
 IMAP session `LOGIN` or `AUTHENTICATE XOAUTH2`, without knowing which.
 
-**Providers are data.** Google, Microsoft, Fastmail and iCloud ship compiled
-in; a manifest dropped in `$XDG_CONFIG_HOME/cosmic-pim/providers/` adds one or
-overrides a field of one. **No OAuth client id is shipped** — one identifies
-the application asking, and there is none this project could publish that would
-be right for a downstream package — so Google and Microsoft need a two-line
-manifest before they can be used:
+**Providers are data.** Google, Microsoft, Fastmail, iCloud, Yahoo, AOL,
+Proton Mail (through Proton Mail Bridge), mailbox.org, Posteo and GMX ship
+compiled in, each with the mail domains that are its own, so an address is
+enough to find it. A manifest adds a provider or overrides a field of one, and
+is read from three places, each overlaying the one before:
+
+| Directory | Whose |
+|---|---|
+| `cosmic-pim/providers/` under each `$XDG_DATA_DIRS` entry (`/usr/share`) | the distribution's package |
+| `/etc/cosmic-pim/providers/` | the administrator's |
+| `$XDG_CONFIG_HOME/cosmic-pim/providers/` | the user's |
+
+**No OAuth client id is shipped** — one identifies the application asking, and
+there is none this project could publish that would be right for a downstream
+package — so Google and Microsoft need a two-line manifest before they can be
+used. A distribution ships it once for every user:
 
 ```toml
-# $XDG_CONFIG_HOME/cosmic-pim/providers/google.toml
+# /usr/share/cosmic-pim/providers/google.toml
 id = "google"
 [oauth]
 client_id = "…apps.googleusercontent.com"

@@ -732,11 +732,15 @@ path has two real implementations and this has one, but the backoff logic still
 needs testing without a disk.
 
 **Provider manifests** (`accounts::provider`) — a TOML file naming a provider's
-OAuth endpoints and its CalDAV, CardDAV and mail addresses. Built-ins are
-compiled in; a file in `$XDG_CONFIG_HOME/cosmic-pim/providers/` adds one or
-overrides a field of one. Adding a provider is not a code change, and no OAuth
-client id is shipped — one identifies the application asking, and there is none
-this project could publish that would be correct for a downstream package.
+OAuth endpoints, its CalDAV, CardDAV and mail addresses, and the mail domains
+that are its own. Built-ins are compiled in; a file adds one or overrides a
+field of one, read from `cosmic-pim/providers/` under each `$XDG_DATA_DIRS`
+entry (the distribution's), then `/etc/cosmic-pim/providers/` (the
+administrator's), then `$XDG_CONFIG_HOME/cosmic-pim/providers/` (the user's),
+each overlaying the one before. Adding a provider is not a code change, and no
+OAuth client id is shipped — one identifies the application asking, and there
+is none this project could publish that would be correct for a downstream
+package. The system directory is how a distribution supplies its own.
 
 **`Flavor`** (`caldav::dav`) — CalDAV and CardDAV are the same protocol with four
 substitutions: home-set property, resourcetype marker, multiget report name,

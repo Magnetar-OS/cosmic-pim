@@ -1,0 +1,34 @@
+# AOL Mail. The same platform as Yahoo Mail under a different name, with the
+# same rule: an app password, never the account password.
+id = "aol"
+name = "AOL"
+hint = "Create an app password in your AOL account under Security → Generate app password. Your AOL password will not work."
+help_url = "https://login.aol.com/myaccount/security"
+domains = [
+    "aol.com",
+    "aim.com",
+    "aol.de",
+    "aol.it",
+    "aol.fr",
+    "aol.es",
+    "aol.se",
+    "aol.co.uk",
+    "aol.co.nz",
+    "aol.com.au",
+    "aol.com.ar",
+    "aol.com.br",
+    "aol.com.mx",
+]
+
+[services]
+calendar = "https://caldav.aol.com/"
+contacts = "https://carddav.aol.com/"
+
+[services.mail]
+protocol = "imap"
+imap_host = "imap.aol.com"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "smtp.aol.com"
+smtp_port = 465
+smtp_transport = "tls"

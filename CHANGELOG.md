@@ -7,6 +7,25 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Provider manifests are read from system directories as well as the user's:
+  `cosmic-pim/providers/` under each `$XDG_DATA_DIRS` entry, then
+  `/etc/cosmic-pim/providers/`, then `$XDG_CONFIG_HOME/cosmic-pim/providers/`,
+  each overlaying the one before. A distribution can ship an OAuth client id
+  for every user in a package; it could only be set per user.
+  `Registry::load_from_dirs` and `provider::provider_dirs` are new.
+- `Provider::domains`: the mail domains that are a provider's own, in its
+  manifest. `Registry::for_email` reads them, so a drop-in manifest can be
+  recognised from an address. The domains were a list in the code.
+- `Provider::help_url`: the page a provider's hint is about, for a dialog to
+  open.
+- Built-in providers for Yahoo, AOL, Proton Mail (through Proton Mail Bridge),
+  mailbox.org, Posteo and GMX, beside Google, Microsoft, Fastmail and iCloud.
+- `Provider::app_password` and `Provider::app_password_account`: the password
+  route of a provider whose own route is the browser. Google's manifest has
+  one — an app password reaches Gmail over IMAP — and Microsoft's does not.
+
 ### Fixed
 
 - A provider account's address books are looked for at the provider's
@@ -22,6 +41,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `Provider::account_for` leaves the account's `url` empty; the sync engine
   finds calendars and contacts from the provider's manifest by the account's
   provider id.
+- Two manifests for one provider in the same directory are applied in file-name
+  order. The order was whatever the filesystem listed.
 - An override manifest's `[oauth.extra_params]` adds to the built-in
   parameters instead of replacing them, so an override adding one no longer
   drops Google's `access_type=offline` and with it the refresh token (audit

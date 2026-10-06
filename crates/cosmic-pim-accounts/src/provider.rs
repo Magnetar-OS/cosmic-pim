@@ -27,18 +27,31 @@
 //! for a downstream package, so the built-in manifests carry none, and a
 //! provider without one is reported as unconfigured rather than half-working.
 //!
-//! A packager supplies them by dropping a file in the config directory:
+//! A packager supplies them by shipping a file in a system directory:
 //!
 //! ```toml
-//! # $XDG_CONFIG_HOME/cosmic-pim/providers/google.toml
+//! # /usr/share/cosmic-pim/providers/google.toml
+//! id = "google"
+//!
 //! [oauth]
 //! client_id = "…apps.googleusercontent.com"
 //! client_secret = "…"          # omitted for a public client using PKCE
 //! ```
 //!
-//! Anything in a config-directory manifest overrides the built-in of the same
-//! id, so the same mechanism retargets a scope list or an endpoint without a
-//! patch.
+//! # Where manifests are read from
+//!
+//! Lowest precedence first, each layer overlaying the one before it field by
+//! field:
+//!
+//! 1. the built-ins compiled into this crate;
+//! 2. `cosmic-pim/providers/` under each `$XDG_DATA_DIRS` entry — what a
+//!    distribution's package installs, `/usr/share` by default;
+//! 3. `/etc/cosmic-pim/providers/` — what an administrator sets for a site;
+//! 4. `$XDG_CONFIG_HOME/cosmic-pim/providers/` — what one user sets.
+//!
+//! So a distribution's client id, a company's tenant-locked Microsoft
+//! endpoints and a user's own experiment are the same mechanism at three
+//! scopes, and none of them is a patch. See [`provider_dirs`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +67,12 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("microsoft", include_str!("../providers/microsoft.toml")),
     ("fastmail", include_str!("../providers/fastmail.toml")),
     ("icloud", include_str!("../providers/icloud.toml")),
+    ("yahoo", include_str!("../providers/yahoo.toml")),
+    ("aol", include_str!("../providers/aol.toml")),
+    ("proton", include_str!("../providers/proton.toml")),
+    ("mailbox-org", include_str!("../providers/mailbox-org.toml")),
+    ("posteo", include_str!("../providers/posteo.toml")),
+    ("gmx", include_str!("../providers/gmx.toml")),
 ];
 
 /// One provider, as declared by a manifest.
@@ -74,6 +93,27 @@ pub struct Provider {
     /// the two lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// The page [`Self::hint`] is about — where an app password is created,
+    /// most often — so a dialog can offer to open it rather than describe
+    /// where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help_url: Option<String>,
+    /// The mail domains that are this provider's own, lowercase — `gmail.com`
+    /// for Google. How [`Registry::for_email`] recognises an address.
+    ///
+    /// Only domains the provider itself hands out: a company with Google
+    /// Workspace on its own domain is not listed here and cannot be, and
+    /// falls through to autodiscovery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    /// The password route of a provider whose own route is the browser.
+    ///
+    /// Google still takes an app password over IMAP and SMTP; Microsoft takes
+    /// none. Where one exists it is what makes the provider usable on an
+    /// installation with no client id for it, so the manifest says so rather
+    /// than the code guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_password: Option<AppPassword>,
 }
 
 /// The four things an OAuth provider differs by.
@@ -145,6 +185,17 @@ impl OAuth {
             .as_ref()
             .is_some_and(|id| !id.trim().is_empty())
     }
+}
+
+/// What to tell someone signing in to an OAuth provider with an app password
+/// instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppPassword {
+    /// How to get one, and what it does not cover.
+    pub hint: String,
+    /// Where one is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help_url: Option<String>,
 }
 
 /// Where a provider's services live.
@@ -307,6 +358,34 @@ impl Provider {
     }
 }
 
+impl Provider {
+    /// A mail account for this provider that signs in with an app password,
+    /// for a provider whose own route is the browser.
+    ///
+    /// Mail over IMAP and SMTP, and nothing else: the engine the manifest
+    /// prefers — the Gmail API — takes a token and not a password, and so do
+    /// the provider's calendars and contacts. So the account names no
+    /// provider, which is what keeps the sync engine from knocking on DAV
+    /// endpoints that will refuse it on every pass.
+    ///
+    /// `None` when the provider has no such route, or no IMAP host to use it
+    /// against.
+    #[must_use]
+    pub fn app_password_account(&self, username: &str) -> Option<crate::Account> {
+        self.app_password.as_ref()?;
+        let mail = self.services.mail.as_ref()?;
+        if mail.imap_host.is_empty() {
+            return None;
+        }
+        let mut account = crate::Account::new(&self.name, "", username);
+        account.mail = Some(MailEndpoint {
+            protocol: MailProtocol::Imap,
+            ..mail.endpoint_for(username)
+        });
+        Some(account)
+    }
+}
+
 /// Every provider this installation knows about.
 ///
 /// Built-ins first, then anything in the config directory — which both adds
@@ -318,19 +397,26 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Loads built-ins, then overlays the config directory.
+    /// Loads built-ins, then overlays every directory in [`provider_dirs`].
     #[must_use]
     pub fn load() -> Self {
-        Self::load_from(&default_provider_dir())
+        Self::load_from_dirs(&provider_dirs())
     }
 
-    /// As [`Self::load`], reading overrides from `dir`.
+    /// As [`Self::load`], reading overrides from `dir` alone.
+    #[must_use]
+    pub fn load_from(dir: &Path) -> Self {
+        Self::load_from_dirs(&[dir.to_path_buf()])
+    }
+
+    /// Built-ins, then each of `dirs` in order — a later directory overlays an
+    /// earlier one.
     ///
     /// A manifest that will not parse is skipped with a warning rather than
     /// failing the load: one bad file in a drop-in directory must not take
     /// every account offline.
     #[must_use]
-    pub fn load_from(dir: &Path) -> Self {
+    pub fn load_from_dirs(dirs: &[PathBuf]) -> Self {
         let mut providers = BTreeMap::new();
 
         for (id, text) in BUILT_IN {
@@ -345,49 +431,8 @@ impl Registry {
             }
         }
 
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Self { providers };
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "toml") {
-                continue;
-            }
-
-            // The id first, and only the id. A file that overrides a built-in
-            // is usually two lines — a client id and nothing else — so parsing
-            // it as a whole `Provider` would reject it for the endpoints it
-            // deliberately does not restate.
-            let id = match read_id(&path) {
-                Ok(id) => id,
-                Err(why) => {
-                    tracing::warn!(
-                        path = %path.display(), %why,
-                        "ignoring a provider manifest with no readable id"
-                    );
-                    continue;
-                }
-            };
-
-            let loaded = match providers.get(&id) {
-                // Overriding a built-in: overlay field by field.
-                Some(base) => merge(base, &path),
-                // A provider nobody has heard of has to be complete.
-                None => read_manifest(&path),
-            };
-
-            match loaded {
-                Ok(provider) => {
-                    providers.insert(id, provider);
-                }
-                Err(why) => {
-                    tracing::warn!(
-                        path = %path.display(), %why,
-                        "ignoring an unusable provider manifest"
-                    );
-                }
-            }
+        for dir in dirs {
+            overlay_dir(&mut providers, dir);
         }
 
         Self { providers }
@@ -416,20 +461,71 @@ impl Registry {
 
     /// The provider an email address belongs to, by its domain.
     ///
-    /// Only exact, well-known domains — `gmail.com` is Google, but a company
-    /// with Google Workspace on its own domain is not detectable this way and
-    /// falls through to autodiscovery, which is the right answer for it.
+    /// Only the exact domains a manifest lists — `gmail.com` is Google, but a
+    /// company with Google Workspace on its own domain is not detectable this
+    /// way and falls through to autodiscovery, which is the right answer for
+    /// it.
     #[must_use]
     pub fn for_email(&self, email: &str) -> Option<&Provider> {
-        let domain = email.rsplit('@').next()?.trim().to_ascii_lowercase();
-        let id = match domain.as_str() {
-            "gmail.com" | "googlemail.com" => "google",
-            "outlook.com" | "hotmail.com" | "live.com" | "msn.com" => "microsoft",
-            "fastmail.com" | "fastmail.fm" => "fastmail",
-            "icloud.com" | "me.com" | "mac.com" => "icloud",
-            _ => return None,
+        let (_, domain) = email.trim().rsplit_once('@')?;
+        let domain = domain.to_ascii_lowercase();
+        self.providers
+            .values()
+            .find(|provider| provider.domains.contains(&domain))
+    }
+}
+
+/// Overlays every manifest in `dir` onto `providers`.
+///
+/// In file-name order, so two files naming the same id in one directory
+/// resolve the same way on every run rather than in whatever order the
+/// filesystem lists them.
+fn overlay_dir(providers: &mut BTreeMap<String, Provider>, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "toml"))
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        // The id first, and only the id. A file that overrides a built-in
+        // is usually two lines — a client id and nothing else — so parsing
+        // it as a whole `Provider` would reject it for the endpoints it
+        // deliberately does not restate.
+        let id = match read_id(&path) {
+            Ok(id) => id,
+            Err(why) => {
+                tracing::warn!(
+                    path = %path.display(), %why,
+                    "ignoring a provider manifest with no readable id"
+                );
+                continue;
+            }
         };
-        self.get(id)
+
+        let loaded = match providers.get(&id) {
+            // Overriding a built-in or an earlier layer: overlay field by
+            // field.
+            Some(base) => merge(base, &path),
+            // A provider nobody has heard of has to be complete.
+            None => read_manifest(&path),
+        };
+
+        match loaded {
+            Ok(provider) => {
+                providers.insert(id, provider);
+            }
+            Err(why) => {
+                tracing::warn!(
+                    path = %path.display(), %why,
+                    "ignoring an unusable provider manifest"
+                );
+            }
+        }
     }
 }
 
@@ -460,6 +556,9 @@ fn merge(base: &Provider, path: &Path) -> Result<Provider> {
     struct Overlay {
         name: Option<String>,
         hint: Option<String>,
+        help_url: Option<String>,
+        domains: Option<Vec<String>>,
+        app_password: Option<AppPassword>,
         oauth: Option<OAuthOverlay>,
         services: Option<Services>,
     }
@@ -485,6 +584,15 @@ fn merge(base: &Provider, path: &Path) -> Result<Provider> {
     }
     if let Some(hint) = overlay.hint {
         merged.hint = Some(hint);
+    }
+    if let Some(help_url) = overlay.help_url {
+        merged.help_url = Some(help_url);
+    }
+    if let Some(domains) = overlay.domains {
+        merged.domains = domains;
+    }
+    if let Some(app_password) = overlay.app_password {
+        merged.app_password = Some(app_password);
     }
     if let Some(services) = overlay.services {
         merged.services = services;
@@ -529,10 +637,41 @@ fn merge(base: &Provider, path: &Path) -> Result<Provider> {
     Ok(merged)
 }
 
-/// Where drop-in and override manifests live.
+/// Where one user's drop-in and override manifests live.
 #[must_use]
 pub fn default_provider_dir() -> PathBuf {
     crate::account::config_dir().join("providers")
+}
+
+/// Every directory manifests are read from, lowest precedence first: the
+/// system data directories, `/etc`, then the user's own.
+///
+/// With `COSMIC_PIM_CONFIG_DIR` set, that directory alone — the variable
+/// exists so tests and a sandboxed daemon see a closed world, and a client id
+/// leaking in from the host's `/usr/share` would open it.
+#[must_use]
+pub fn provider_dirs() -> Vec<PathBuf> {
+    if std::env::var_os("COSMIC_PIM_CONFIG_DIR").is_some() {
+        return vec![default_provider_dir()];
+    }
+
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|dirs| !dirs.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    layered_dirs(&data_dirs, &default_provider_dir())
+}
+
+/// `$XDG_DATA_DIRS` lists its most important directory first; overlaying
+/// wants the least important first, so it is walked in reverse.
+fn layered_dirs(data_dirs: &std::ffi::OsStr, user: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(data_dirs)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("cosmic-pim/providers"))
+        .collect();
+    dirs.reverse();
+    dirs.push(PathBuf::from("/etc/cosmic-pim/providers"));
+    dirs.push(user.to_path_buf());
+    dirs
 }
 
 #[cfg(test)]
@@ -775,6 +914,57 @@ mod tests {
     }
 
     #[test]
+    fn no_two_built_ins_claim_the_same_domain() {
+        // `for_email` takes the first match, so a domain listed twice would
+        // send an address to whichever provider sorts first — silently.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for provider in registry.all() {
+            for domain in &provider.domains {
+                assert_eq!(
+                    domain,
+                    &domain.to_ascii_lowercase(),
+                    "{} lists a domain that is not lowercase",
+                    provider.id
+                );
+                if let Some(other) = seen.insert(domain, &provider.id) {
+                    panic!("{domain} is claimed by both {other} and {}", provider.id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_system_manifest_and_a_user_manifest_both_apply() {
+        // The distribution ships the client id; a user retargets the scopes.
+        // Neither may erase the other, or the built-in endpoints under both.
+        let system = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        std::fs::write(
+            system.path().join("google.toml"),
+            "id = \"google\"\n\n[oauth]\nclient_id = \"distro.apps.googleusercontent.com\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            user.path().join("google.toml"),
+            "id = \"google\"\n\n[oauth]\nscopes = [\"openid\"]\n",
+        )
+        .unwrap();
+
+        let registry =
+            Registry::load_from_dirs(&[system.path().to_path_buf(), user.path().to_path_buf()]);
+        let oauth = registry.get("google").unwrap().oauth.as_ref().unwrap();
+
+        assert_eq!(
+            oauth.client_id.as_deref(),
+            Some("distro.apps.googleusercontent.com"),
+            "the user's manifest erased the distribution's client id"
+        );
+        assert_eq!(oauth.scopes, ["openid"]);
+        assert!(oauth.token_url.contains("oauth2"));
+    }
+
+    #[test]
     fn an_override_adding_a_parameter_keeps_the_built_in_ones() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -813,6 +1003,152 @@ mod tests {
         };
 
         assert!(!format!("{oauth:?}").contains("do-not-log-me"));
+    }
+
+    #[test]
+    fn a_later_directory_wins_over_an_earlier_one() {
+        let system = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        for (dir, id) in [(&system, "system-id"), (&user, "user-id")] {
+            std::fs::write(
+                dir.path().join("google.toml"),
+                format!("id = \"google\"\n\n[oauth]\nclient_id = \"{id}\"\n"),
+            )
+            .unwrap();
+        }
+
+        let registry =
+            Registry::load_from_dirs(&[system.path().to_path_buf(), user.path().to_path_buf()]);
+        let oauth = registry.get("google").unwrap().oauth.as_ref().unwrap();
+
+        assert_eq!(oauth.client_id.as_deref(), Some("user-id"));
+    }
+
+    #[test]
+    fn two_files_for_one_provider_resolve_in_file_name_order() {
+        // Directory listing order is whatever the filesystem says; without a
+        // sort the winner would differ between machines.
+        let dir = tempfile::tempdir().unwrap();
+        for (file, id) in [("20-site.toml", "second"), ("10-distro.toml", "first")] {
+            std::fs::write(
+                dir.path().join(file),
+                format!("id = \"google\"\n\n[oauth]\nclient_id = \"{id}\"\n"),
+            )
+            .unwrap();
+        }
+
+        let registry = Registry::load_from(dir.path());
+        let oauth = registry.get("google").unwrap().oauth.as_ref().unwrap();
+
+        assert_eq!(oauth.client_id.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn the_system_directories_are_read_before_the_users() {
+        let dirs = layered_dirs(
+            std::ffi::OsStr::new("/usr/local/share:/usr/share:relative"),
+            Path::new("/home/ada/.config/cosmic-pim/providers"),
+        );
+
+        assert_eq!(
+            dirs,
+            [
+                // `$XDG_DATA_DIRS` puts the most important first; an overlay
+                // wants it last among the data directories.
+                PathBuf::from("/usr/share/cosmic-pim/providers"),
+                PathBuf::from("/usr/local/share/cosmic-pim/providers"),
+                PathBuf::from("/etc/cosmic-pim/providers"),
+                PathBuf::from("/home/ada/.config/cosmic-pim/providers"),
+            ],
+            "a relative entry must be dropped, and the user's directory must come last"
+        );
+    }
+
+    #[test]
+    fn a_manifest_can_claim_a_domain() {
+        // What lets a university or a company be recognised from an address
+        // without a release of anything.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("uni.toml"),
+            "id = \"uni\"\nname = \"University\"\ndomains = [\"uni.example\"]\n",
+        )
+        .unwrap();
+
+        let registry = Registry::load_from(dir.path());
+
+        assert_eq!(
+            registry.for_email("Ada@Uni.Example").map(|p| p.id.as_str()),
+            Some("uni")
+        );
+    }
+
+    #[test]
+    fn proton_is_reached_through_bridge_on_loopback() {
+        // There is no Proton server a client can sign in to; an entry naming
+        // one would fail as a wrong password against a host that never
+        // answers IMAP.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let proton = registry.for_email("ada@proton.me").expect("recognised");
+        let account = proton.account_for("ada@proton.me");
+        let mail = account.mail.expect("mail endpoints");
+
+        assert_eq!(mail.imap_host, "127.0.0.1");
+        assert_eq!(mail.imap_port, 1143);
+        assert_eq!(mail.imap_transport, Transport::StartTls);
+        assert_eq!(mail.smtp_port, 1025);
+        assert_eq!(
+            proton.calendar_url("ada@proton.me"),
+            None,
+            "Bridge serves no calendar, and inventing one fails every sync"
+        );
+        assert!(proton.help_url.is_some());
+    }
+
+    #[test]
+    fn a_password_provider_with_dav_needs_no_further_questions() {
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let yahoo = registry.for_email("ada@ymail.com").expect("recognised");
+
+        assert!(yahoo.oauth.is_none());
+        assert_eq!(
+            yahoo.contacts_url("ada@ymail.com").as_deref(),
+            Some("https://carddav.address.yahoo.com/")
+        );
+        assert_eq!(
+            yahoo.calendar_url("ada@ymail.com").as_deref(),
+            Some("https://caldav.calendar.yahoo.com/")
+        );
+        let account = yahoo.account_for("ada@ymail.com");
+        assert_eq!(account.provider.as_deref(), Some("yahoo"));
+        assert_eq!(account.mail.expect("mail").imap_host, "imap.mail.yahoo.com");
+    }
+
+    #[test]
+    fn google_takes_an_app_password_for_mail_and_microsoft_takes_none() {
+        // On an installation with no client id this is the difference between
+        // "Gmail works" and "Gmail cannot be added", and for Outlook.com
+        // there is nothing to fall back to.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+
+        let google = registry.get("google").unwrap();
+        let account = google
+            .app_password_account("ada@gmail.com")
+            .expect("google has a password route");
+        let mail = account.mail.expect("mail endpoints");
+        assert_eq!(
+            mail.protocol,
+            MailProtocol::Imap,
+            "the Gmail engine takes a token, not a password"
+        );
+        assert_eq!(mail.imap_host, "imap.gmail.com");
+        assert_eq!(
+            account.provider, None,
+            "a provider here would send a password to Google's DAV endpoints"
+        );
+
+        let microsoft = registry.get("microsoft").unwrap();
+        assert!(microsoft.app_password_account("ada@outlook.com").is_none());
     }
 
     #[test]

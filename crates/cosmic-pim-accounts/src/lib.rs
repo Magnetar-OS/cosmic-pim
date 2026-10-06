@@ -36,5 +36,5 @@ pub mod secret;
 pub use account::{Account, AccountStore, Alias, AuthMethod, MailEndpoint, Transport};
 pub use credential::{OAuthCredential, Secret};
 pub use error::{Error, Result};
-pub use provider::{MailProtocol, MailService, OAuth, Provider, Registry};
+pub use provider::{AppPassword, MailProtocol, MailService, OAuth, Provider, Registry};
 pub use secret::{Backend, SecretStore};

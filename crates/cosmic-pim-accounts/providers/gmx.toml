@@ -1,0 +1,19 @@
+# GMX, the .net/.de family. Mail only: the entry exists for the note, because
+# GMX refuses IMAP until it is switched on in the mailbox's own settings and
+# the refusal reads as a wrong password.
+#
+# gmx.com and its siblings are a separate service on other hosts and are left
+# to autoconfig, which answers for them correctly.
+id = "gmx"
+name = "GMX"
+hint = "Switch on POP3 and IMAP access in your GMX mail settings first. Until then GMX refuses the password."
+domains = ["gmx.net", "gmx.de", "gmx.at", "gmx.ch"]
+
+[services.mail]
+protocol = "imap"
+imap_host = "imap.gmx.net"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "mail.gmx.net"
+smtp_port = 465
+smtp_transport = "tls"

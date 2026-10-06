@@ -5,6 +5,8 @@
 id = "fastmail"
 name = "Fastmail"
 hint = "Create an app password at fastmail.com under Settings → Privacy & Security → App passwords."
+help_url = "https://www.fastmail.help/hc/en-us/articles/360058752854-App-passwords"
+domains = ["fastmail.com", "fastmail.fm"]
 
 [services]
 calendar = "https://caldav.fastmail.com/dav/calendars/user/{username}/"

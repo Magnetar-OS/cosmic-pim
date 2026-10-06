@@ -1,0 +1,18 @@
+# mailbox.org. One DAV host for calendars and address books, found through its
+# own well-known redirects.
+id = "mailbox-org"
+name = "mailbox.org"
+domains = ["mailbox.org"]
+
+[services]
+calendar = "https://dav.mailbox.org/caldav/"
+contacts = "https://dav.mailbox.org/carddav/"
+
+[services.mail]
+protocol = "imap"
+imap_host = "imap.mailbox.org"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "smtp.mailbox.org"
+smtp_port = 465
+smtp_transport = "tls"

@@ -1,0 +1,25 @@
+# Proton Mail, through Proton Mail Bridge.
+#
+# Proton's mail is end-to-end encrypted and there is no server a third-party
+# client can sign in to. Bridge is Proton's own program: it runs on this
+# machine, signs in to Proton itself, and serves the decrypted mailbox to
+# local clients over IMAP and SMTP on the loopback interface. So this is a
+# provider whose "server" is 127.0.0.1, and whose password is the one Bridge
+# generates per client — never the Proton account password.
+#
+# The ports are Bridge's defaults. No calendar or contacts: Proton offers
+# neither CalDAV nor CardDAV, and Bridge serves mail only.
+id = "proton"
+name = "Proton Mail"
+hint = "Needs Proton Mail Bridge, which requires a paid Proton plan. Install and sign in to Bridge, then use the password Bridge shows for this address — not your Proton password."
+help_url = "https://proton.me/mail/bridge"
+domains = ["proton.me", "protonmail.com", "protonmail.ch", "pm.me"]
+
+[services.mail]
+protocol = "imap"
+imap_host = "127.0.0.1"
+imap_port = 1143
+imap_transport = "start-tls"
+smtp_host = "127.0.0.1"
+smtp_port = 1025
+smtp_transport = "start-tls"

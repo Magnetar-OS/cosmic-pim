@@ -9,6 +9,7 @@
 id = "microsoft"
 name = "Microsoft"
 hint = "Requires an OAuth client id from an Entra ID app registration."
+domains = ["outlook.com", "hotmail.com", "live.com", "msn.com"]
 
 [oauth]
 auth_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"

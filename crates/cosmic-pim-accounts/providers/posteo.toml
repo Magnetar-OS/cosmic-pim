@@ -1,0 +1,18 @@
+# Posteo. One host for everything; calendars and address books are on the DAV
+# port rather than 443.
+id = "posteo"
+name = "Posteo"
+domains = ["posteo.de", "posteo.net", "posteo.org", "posteo.eu", "posteo.com"]
+
+[services]
+calendar = "https://posteo.de:8443/"
+contacts = "https://posteo.de:8443/"
+
+[services.mail]
+protocol = "imap"
+imap_host = "posteo.de"
+imap_port = 993
+imap_transport = "tls"
+smtp_host = "posteo.de"
+smtp_port = 465
+smtp_transport = "tls"

@@ -5,6 +5,8 @@
 id = "icloud"
 name = "iCloud"
 hint = "Create an app-specific password at appleid.apple.com — your Apple ID password will not work."
+help_url = "https://support.apple.com/102654"
+domains = ["icloud.com", "me.com", "mac.com"]
 
 [services]
 calendar = "https://caldav.icloud.com/"
