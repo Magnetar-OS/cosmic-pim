@@ -11,6 +11,8 @@
 //! - [`ical`] — the one iCalendar parser/serialiser the whole suite uses.
 //! - [`vcard`] — the one vCard parser/serialiser the whole suite uses.
 //! - [`store`] — iCalendar files in a vdir, with a SQLite index in front.
+//! - [`recipients`] — completing a typed name or address from the address
+//!   book, for a mail composer's recipients and an event's attendees alike.
 //! - [`atomic`] — crash-safe file replacement, used by every writer.
 //!
 //! # Licence
@@ -26,6 +28,7 @@ pub mod ical;
 pub mod merge;
 pub mod model;
 pub mod patch;
+pub mod recipients;
 pub mod store;
 pub mod vcard;
 
