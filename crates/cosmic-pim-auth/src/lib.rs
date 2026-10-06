@@ -61,6 +61,7 @@
 
 pub mod error;
 pub mod flow;
+pub mod online_accounts;
 pub mod pkce;
 pub mod token;
 
@@ -68,6 +69,7 @@ use cosmic_pim_accounts::{AccountStore, AuthMethod, Registry, Secret};
 
 pub use error::{Error, Result};
 pub use flow::{Grant, Pending, begin, refresh};
+pub use online_accounts::{OnlineAccount, OnlineAccounts};
 pub use pkce::Pkce;
 pub use token::{Identity, TokenResponse};
 
@@ -88,6 +90,17 @@ pub fn resolve(
     registry: &Registry,
     account_id: &str,
 ) -> Result<Secret> {
+    resolve_on(accounts, registry, account_id, OnlineAccounts::connect)
+}
+
+/// [`resolve`], with the way to reach GNOME Online Accounts supplied — the
+/// session bus outside a test, a private one inside.
+fn resolve_on(
+    accounts: &mut AccountStore,
+    registry: &Registry,
+    account_id: &str,
+    online_accounts: impl FnOnce() -> Result<Option<OnlineAccounts>>,
+) -> Result<Secret> {
     let account = accounts
         .get(account_id)
         .ok_or_else(|| cosmic_pim_accounts::Error::UnknownAccount(account_id.to_owned()))?
@@ -101,6 +114,27 @@ pub fn resolve(
                     account.display_name,
                 ))?;
         return Ok(Secret::Password(password));
+    }
+
+    // Before the provider is consulted: an account backed by Online Accounts
+    // names one too, for its endpoints, but its grant is not this crate's to
+    // renew and the provider's client id may not even be configured here.
+    if let Some(online_id) = account.online_account() {
+        if let Some(stored) = accounts.credential(account_id)?
+            && !stored.is_expired()
+        {
+            return Ok(Secret::AccessToken(stored.access_token));
+        }
+        let service = online_accounts()?.ok_or_else(|| {
+            Error::Transport(
+                "this account signs in through Online Accounts, which is not running".to_owned(),
+            )
+        })?;
+        let fresh = service.access_token(online_id)?;
+        // Kept for the same reason a renewed grant is: the next pass, a few
+        // seconds from now, must not have to ask again.
+        accounts.set_credential(account_id, &fresh)?;
+        return Ok(Secret::AccessToken(fresh.access_token));
     }
 
     let provider_id = account
@@ -327,6 +361,77 @@ mod tests {
         );
         let stored = accounts_at(dir.path()).credential(&id).unwrap().unwrap();
         assert_eq!(stored.refresh_token.as_deref(), Some("rotated-1"));
+    }
+
+    fn online_account(accounts: &mut AccountStore, online_id: &str, stored: i64) -> String {
+        let account = Account::for_online_account("Google", "ada@gmail.com", "google", online_id)
+            .expect("a plain id");
+        let id = account.id.clone();
+        let credential = OAuthCredential {
+            refresh_token: None,
+            ..grant(stored)
+        };
+        accounts.add_oauth(account, "google", &credential).unwrap();
+        id
+    }
+
+    #[test]
+    fn an_online_account_with_a_live_token_does_not_touch_the_bus() {
+        // A sync pass every few seconds must not mean a bus call every few
+        // seconds — and must keep working through a daemon restart.
+        let dir = tempfile::tempdir().unwrap();
+        let mut accounts = accounts_at(dir.path());
+        let id = online_account(&mut accounts, "account_1", 3600);
+
+        let secret = resolve_on(&mut accounts, &Registry::load_from(dir.path()), &id, || {
+            panic!("the bus was asked for a token that was still good")
+        })
+        .unwrap();
+
+        assert_eq!(secret, Secret::AccessToken("stored-access-token".into()));
+    }
+
+    #[test]
+    fn an_online_accounts_expired_token_is_renewed_from_goa_and_kept() {
+        // No client id is configured for Google here, which is the whole
+        // point: the account works anyway, because the grant is GOA's.
+        use online_accounts::testing::{FakeAccount, PrivateBus};
+
+        let bus = PrivateBus::start();
+        let _daemon = bus.serve(vec![FakeAccount::google("account_1", "ada@gmail.com")]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut accounts = accounts_at(dir.path());
+        let id = online_account(&mut accounts, "account_1", -10);
+        let registry = Registry::load_from(dir.path());
+
+        let secret = resolve_on(&mut accounts, &registry, &id, || {
+            OnlineAccounts::on(bus.connect())
+        })
+        .unwrap();
+
+        assert_eq!(secret, Secret::AccessToken("token-for-account_1".into()));
+        // Kept, so the pass after this one does not ask again.
+        let again = resolve_on(&mut accounts, &registry, &id, || {
+            panic!("the renewed token was not stored")
+        })
+        .unwrap();
+        assert_eq!(again, Secret::AccessToken("token-for-account_1".into()));
+    }
+
+    #[test]
+    fn an_online_account_with_no_daemon_is_worth_retrying() {
+        // GOA not running yet at login is a wait, not a broken account.
+        let dir = tempfile::tempdir().unwrap();
+        let mut accounts = accounts_at(dir.path());
+        let id = online_account(&mut accounts, "account_1", -10);
+
+        let error = resolve_on(&mut accounts, &Registry::load_from(dir.path()), &id, || {
+            Ok(None)
+        })
+        .unwrap_err();
+
+        assert!(error.is_transient(), "got {error}");
+        assert!(!error.needs_sign_in());
     }
 
     #[test]

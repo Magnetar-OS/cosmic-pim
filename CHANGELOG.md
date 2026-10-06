@@ -29,6 +29,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   and names an address the provider does not mark unverified.
   `TokenResponse::id_token` is new, and is redacted in `{:?}`.
 - `cosmic_pim_mail::imap::is_loopback`.
+- GNOME Online Accounts as a second source of sign-ins, for an installation
+  with no OAuth client id of its own: `cosmic_pim_auth::OnlineAccounts` lists
+  the Google and Microsoft accounts GOA holds and fetches their access tokens
+  over the session bus; `Account::for_online_account` makes an account backed
+  by one, and `resolve` asks GOA for its token. The refresh token stays with
+  GOA. An id from GOA that is not a plain token is refused, because an
+  account's id names files.
 - `Provider::app_password` and `Provider::app_password_account`: the password
   route of a provider whose own route is the browser. Google's manifest has
   one — an app password reaches Gmail over IMAP — and Microsoft's does not.

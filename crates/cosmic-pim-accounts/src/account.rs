@@ -332,7 +332,60 @@ impl Account {
     pub fn is_oauth(&self) -> bool {
         self.auth == AuthMethod::OAuth
     }
+
+    /// An account whose sign-in is kept by GNOME Online Accounts, under the
+    /// id GOA gave it.
+    ///
+    /// It is an OAuth account of `provider_id` in every respect but one: its
+    /// token comes from GOA rather than from a grant stored here. That one
+    /// fact is carried in the account's own id, and the reason is
+    /// compatibility in both directions. A new field would be dropped the
+    /// first time an older application rewrote `accounts.toml`, turning the
+    /// account into one with no sign-in at all; a new [`AuthMethod`] would
+    /// stop an older application reading the file. An id is a string every
+    /// version already round-trips, and an older application sees an OAuth
+    /// account whose token it cannot renew, and says so.
+    ///
+    /// It also makes linking idempotent: the same GOA account is always the
+    /// same account here.
+    ///
+    /// `None` when `online_id` is not a plain token — letters, digits, `_`
+    /// and `-`, as GOA's own `account_1700000000_0` is. An account's id names
+    /// files: the lock beside `accounts.toml`, the directory its mail is kept
+    /// in. Every other id here is a UUID this crate made; this one arrives
+    /// over the session bus, and `../` in it would name somebody else's files.
+    #[must_use]
+    pub fn for_online_account(
+        display_name: &str,
+        username: &str,
+        provider_id: &str,
+        online_id: &str,
+    ) -> Option<Self> {
+        let plain = !online_id.is_empty()
+            && online_id.len() <= 128
+            && online_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        plain.then(|| Self {
+            id: format!("{ONLINE_ACCOUNT_PREFIX}{online_id}"),
+            auth: AuthMethod::OAuth,
+            provider: Some(provider_id.to_owned()),
+            ..Self::new(display_name, "", username)
+        })
+    }
+
+    /// GOA's id for this account, when its sign-in is kept there.
+    #[must_use]
+    pub fn online_account(&self) -> Option<&str> {
+        self.id
+            .strip_prefix(ONLINE_ACCOUNT_PREFIX)
+            .filter(|_| self.is_oauth())
+    }
 }
+
+/// What the id of an account backed by GNOME Online Accounts starts with. See
+/// [`Account::for_online_account`].
+const ONLINE_ACCOUNT_PREFIX: &str = "goa-";
 
 /// Where account metadata lives: `$XDG_CONFIG_HOME/cosmic-pim/accounts.toml`.
 ///

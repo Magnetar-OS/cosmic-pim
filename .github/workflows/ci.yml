@@ -39,6 +39,11 @@ jobs:
       - name: Preflight self-test
         run: ./scripts/preflight-selftest.sh
 
+      # For the tests, not the build: the Online Accounts tests start a
+      # private bus of their own.
+      - name: Install dbus-daemon
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus-daemon
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
