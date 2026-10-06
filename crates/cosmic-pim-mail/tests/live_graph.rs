@@ -675,6 +675,7 @@ fn queued_outbox(dir: &std::path::Path) -> cosmic_pim_mail::Outbox {
         .queue(
             "ab12cd",
             &draft(),
+            None,
             &cosmic_pim_mail::Outcome::NotSent(cosmic_pim_mail::Error::Smtp(
                 "first attempt failed".into(),
             )),
@@ -691,9 +692,7 @@ fn a_queued_send_leaves_through_send_mail_with_its_bcc_intact() {
     let dir = tempfile::tempdir().expect("tempdir");
     let outbox = queued_outbox(dir.path());
 
-    let outcome = outbox
-        .drain_with(|draft| session(&server).submit(draft), i64::MAX / 2)
-        .expect("drain");
+    let outcome = outbox.drain_with(|draft| session(&server).submit(draft), i64::MAX / 2);
 
     assert_eq!(outcome.sent.len(), 1);
     assert_eq!(outbox.count(), 0, "the queue entry outlived its send");
@@ -710,7 +709,7 @@ fn a_queued_send_leaves_through_send_mail_with_its_bcc_intact() {
         "the Bcc recipient was stripped from the submission: {text}"
     );
     assert_eq!(
-        submitted[0], outcome.sent[0].1,
+        submitted[0], outcome.sent[0].bytes,
         "the wire copy differs from the accepted one"
     );
 }
@@ -722,15 +721,14 @@ fn a_refused_send_stays_queued_rather_than_vanishing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let outbox = queued_outbox(dir.path());
 
-    let outcome = outbox
-        .drain_with(|draft| session(&server).submit(draft), i64::MAX / 2)
-        .expect("drain");
+    let outcome = outbox.drain_with(|draft| session(&server).submit(draft), i64::MAX / 2);
 
     assert!(outcome.sent.is_empty());
     // A 400 is refused the same way on every attempt: it stops at once and
     // waits for a person, rather than burning twelve attempts over five hours.
     assert_eq!(
-        outcome.given_up, 1,
+        outcome.stopped.len(),
+        1,
         "a request refused as malformed was retried"
     );
     assert_eq!(outcome.deferred, 0);

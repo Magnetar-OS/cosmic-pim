@@ -10,6 +10,45 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 The next release is 3.0.0: `Pending::exchange` returns a different type and
 `Provider` gained public fields. Consumers move from `"2"` to `"3"`.
 
+### Breaking
+
+- **A drain always returns what it did.** `Outbox::drain` and
+  `Outbox::drain_with` return `DrainOutcome` in place of
+  `Result<DrainOutcome>`. A local failure part-way through — a record that
+  cannot be rewritten, a full disk — is `DrainOutcome::error`, beside the
+  messages that had already gone. It was an `Err` that took the list of sent
+  messages with it, so a caller could neither mark what they answered nor
+  file their Sent copies. `cosmic_pim_sync::drain_outbox` likewise returns
+  `Err` only when nothing was sent, and reports a later local failure in
+  `DrainReport::error`.
+- **Why a send stopped is a type.** `Queued::last_error: Option<String>` is
+  replaced by `Queued::failure: Option<SendFailure>`: `Transient` (not
+  reached; retried), `Refused` (the server said no, with its reason;
+  permanent), `Unsendable` (the draft cannot be built), `Uncertain` (the
+  outcome was lost; it may have been delivered) and `Interrupted` (the drain
+  died mid-send; it may have been delivered). It is stored on the record, so
+  it survives a restart. `Queued::may_have_been_delivered` answers the one
+  question to settle before sending again. Records written by 2.x are still
+  read: one being retried as `Transient`, one that had stopped as
+  `Uncertain`, since its sentence cannot say which it was.
+- **A queued reply carries what it answers.** `Outbox::queue`, `submit` and
+  `schedule` take an `Option<Answers>`: the answered message's `Message-ID`,
+  and where it was (`Origin`: mailbox, UID, UIDVALIDITY). `Outbox::cancel`
+  returns the whole `Queued` record in place of the `Draft`, so a reply
+  taken back is still a reply. This replaces a sidecar file an application
+  had to keep beside the outbox.
+- **Reports name what was sent and what stopped.** `DrainOutcome::sent` is
+  `Vec<Sent>` (`id`, `message_id`, `answers`, `bytes`) in place of
+  `Vec<(String, Vec<u8>)>`. `MailReport::sent` and `DrainReport::sent` are
+  `Vec<SentMessage>` (`id`, `message_id`, `answers`) in place of
+  `Vec<String>`. `given_up: usize` is replaced by `stopped: Vec<Stopped>`
+  (`id`, `failure`) on all three. `MailReport::outbox_error` says when a
+  pass could not drain the outbox, or drained only part of it; that was
+  logged and dropped.
+- `Queued`, `DrainOutcome`, `MailReport` and `MailboxReport` are
+  `#[non_exhaustive]`, so the next field is not another major version.
+  `outbox::MAX_ATTEMPTS` is public.
+
 ### Added
 
 - Provider manifests are read from system directories as well as the user's:

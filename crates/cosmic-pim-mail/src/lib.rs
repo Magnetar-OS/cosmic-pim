@@ -117,7 +117,7 @@ pub use error::{Error, Result};
 pub use folder::{Folder, SpecialUse};
 pub use index::{Conversation, Hit, Index, Located, Summary};
 pub use model::{Flags, Mailbox, Message};
-pub use outbox::Outbox;
+pub use outbox::{Answers, Outbox, SendFailure};
 pub use plan::{MailboxPlan, plan_fetch, plan_reconcile};
 pub use sasl::Credentials;
 pub use search::Query;

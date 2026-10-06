@@ -45,7 +45,8 @@ pub use error::{Error, Result};
 pub use freebusy::{Answer, account_for_collection, availability};
 #[cfg(feature = "mail")]
 pub use mail::{
-    DrainReport, MailReport, MailboxReport, credentials_for, drain_outbox, sync_account_mail,
+    DrainReport, MailReport, MailboxReport, SentMessage, credentials_for, drain_outbox,
+    sync_account_mail,
 };
 pub use provision::{Provisioned, provision_account};
 pub use writeback::{

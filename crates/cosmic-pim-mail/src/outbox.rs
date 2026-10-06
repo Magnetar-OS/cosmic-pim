@@ -18,6 +18,26 @@
 //! works" posture is exactly wrong, and it is enforced by [`Outbox::queue`] refusing
 //! anything else.
 //!
+//! # Why a message stopped
+//!
+//! A message that is not going anywhere on its own says why, in a type
+//! ([`SendFailure`]) rather than a sentence to be parsed, because the three
+//! reasons need three different things said to the person who wrote it:
+//!
+//! - the server **refused** it — nothing was delivered, and it will be refused
+//!   again until something is changed;
+//! - the outcome is **uncertain** — it may be in the recipients' inboxes, so
+//!   the thing to do before sending it again is to look;
+//! - it **could not be reached** — nothing is wrong with the message.
+//!
+//! # What a reply answers
+//!
+//! A queued reply carries the message it answers ([`Answers`]), and a drain
+//! hands it back with the entry it reports sent ([`Sent`]). Marking the
+//! original `\Answered` is the caller's — the outbox does not own a mailbox —
+//! but the record that it is owed travels with the message, so it cannot be
+//! lost between a send queued today and a drain that runs tomorrow.
+//!
 //! # Shape
 //!
 //! One JSON file per message, holding the [`Draft`] and its retry state, in a
@@ -35,6 +55,7 @@ use crate::compose::Draft;
 use crate::error::{Error, Result};
 use crate::sasl::Credentials;
 use crate::smtp::{self, Outcome, SmtpEndpoint};
+use crate::store::MailboxState;
 
 /// Where queued messages live, beside the account's maildirs.
 const DIRECTORY: &str = ".outbox";
@@ -61,7 +82,7 @@ const MAX_DELAY_MS: i64 = 30 * 60_000;
 /// times over several hours is failing for a reason nobody is going to fix by
 /// waiting — and a message silently retrying for a week is worse than one that
 /// says it needs attention.
-const MAX_ATTEMPTS: u32 = 12;
+pub const MAX_ATTEMPTS: u32 = 12;
 
 #[must_use]
 pub fn retry_delay_ms(attempts: u32) -> i64 {
@@ -71,8 +92,199 @@ pub fn retry_delay_ms(attempts: u32) -> i64 {
         .min(MAX_DELAY_MS)
 }
 
+/// How the last attempt to send a queued message ended, when it did not go.
+///
+/// Kept on the record, so it is still there after a restart, and typed, so
+/// an application words each case itself instead of reading a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum SendFailure {
+    /// The server could not be reached, or asked to be tried later. Nothing
+    /// was delivered and nothing is wrong with the message; it is retried on
+    /// the backoff schedule until [`MAX_ATTEMPTS`].
+    Transient {
+        /// What went wrong, in the transport's words.
+        reason: String,
+    },
+    /// The server refused the message and would refuse it again: a login it
+    /// will not take, a recipient it rejects, a policy. Nothing was
+    /// delivered. Permanent — never retried automatically.
+    Refused {
+        /// The server's own reply.
+        reason: String,
+    },
+    /// The draft cannot be turned into a message at all — no recipient, an
+    /// address that is not one. Nothing was sent, and nothing will be until
+    /// the draft is changed.
+    Unsendable {
+        /// What is wrong with the draft.
+        reason: String,
+    },
+    /// The outcome is not known: the connection broke after the message was
+    /// handed over, or the reply could not be read. **It may have been
+    /// delivered.** Never retried automatically.
+    Uncertain {
+        /// What was seen before the outcome was lost.
+        reason: String,
+    },
+    /// The drain that was sending it died before it could record what
+    /// happened. **It may have been delivered.** Never retried automatically.
+    Interrupted,
+}
+
+impl SendFailure {
+    /// Reads a send's outcome as a failure. `None` for one that was sent.
+    #[must_use]
+    pub fn of(outcome: &Outcome) -> Option<Self> {
+        match outcome {
+            Outcome::Sent(_) => None,
+            Outcome::NotSent(why) => Some(Self::transient(why)),
+            Outcome::Rejected(why) => Some(Self::refusal(why)),
+            Outcome::Ambiguous(why) => Some(Self::uncertain(why)),
+        }
+    }
+
+    fn transient(why: &Error) -> Self {
+        Self::Transient {
+            reason: why.to_string(),
+        }
+    }
+
+    /// A refusal is the server's unless it is the draft's own: a message
+    /// that cannot be built never reached a server to be refused by.
+    fn refusal(why: &Error) -> Self {
+        match why {
+            Error::Draft(reason) => Self::Unsendable {
+                reason: reason.clone(),
+            },
+            other => Self::Refused {
+                reason: other.to_string(),
+            },
+        }
+    }
+
+    fn uncertain(why: &Error) -> Self {
+        Self::Uncertain {
+            reason: why.to_string(),
+        }
+    }
+
+    /// Whether the message may be in the recipients' inboxes already. The
+    /// one question to settle before anybody sends it again.
+    #[must_use]
+    pub fn may_have_been_delivered(&self) -> bool {
+        matches!(self, Self::Uncertain { .. } | Self::Interrupted)
+    }
+
+    /// Whether trying again unchanged could work.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transient { .. })
+    }
+
+    /// The words that came with the failure, where there were any.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Transient { reason }
+            | Self::Refused { reason }
+            | Self::Unsendable { reason }
+            | Self::Uncertain { reason } => Some(reason),
+            Self::Interrupted => None,
+        }
+    }
+}
+
+/// The message a queued reply answers.
+///
+/// Two references, because each fails where the other holds:
+///
+/// - [`Self::message_id`] is the stable one. It survives a renumbering, a
+///   move to another folder and a mailbox rebuilt from nothing, and
+///   [`crate::Index::locate`] turns it back into a place. A message with no
+///   `Message-ID` header has none.
+/// - [`Self::origin`] is where the message was when the reply was written.
+///   It is exact and costs nothing to use, for as long as
+///   [`Origin::still_names`] says the numbering it was taken under stands.
+///
+/// To set `\Answered` once the reply has gone: use the origin while it still
+/// names the message, and otherwise find the message by its id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct Answers {
+    /// The answered message's `Message-ID`, without angle brackets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Where the answered message was when the reply was queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+}
+
+impl Answers {
+    /// A reply to the message with this `Message-ID` (brackets and
+    /// surrounding space are dropped; an empty id is no id).
+    #[must_use]
+    pub fn to_message(message_id: &str) -> Self {
+        let id = message_id
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim();
+        Self {
+            message_id: (!id.is_empty()).then(|| id.to_owned()),
+            origin: None,
+        }
+    }
+
+    /// A reply to the message at `origin`, for one that has no `Message-ID`.
+    #[must_use]
+    pub fn at(origin: Origin) -> Self {
+        Self {
+            message_id: None,
+            origin: Some(origin),
+        }
+    }
+
+    /// Adds where the message was found.
+    #[must_use]
+    pub fn found_at(mut self, origin: Origin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+}
+
+/// A message's place in a mailbox, pinned to the numbering it was read under.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Origin {
+    /// The mailbox's name on the wire.
+    pub mailbox: String,
+    /// The server's hierarchy delimiter for it, which a maildir path needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<char>,
+    pub uid: u32,
+    /// A UID means nothing under another UIDVALIDITY: after a renumbering it
+    /// names a different message or none, and marking it would mark a
+    /// stranger's mail answered.
+    pub uid_validity: u32,
+}
+
+impl Origin {
+    /// Whether this still names the message it named when it was taken:
+    /// `mailbox` has not been renumbered since, and still holds the UID.
+    ///
+    /// `mailbox` is the current state of the mailbox [`Self::mailbox`] names.
+    /// When this is false the message has to be found again by its id.
+    #[must_use]
+    pub fn still_names(&self, mailbox: &MailboxState) -> bool {
+        mailbox.cursor.uid_validity == self.uid_validity && mailbox.entries.contains_key(&self.uid)
+    }
+}
+
 /// One message waiting to go.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "Stored")]
+#[non_exhaustive]
 pub struct Queued {
     pub id: String,
     pub draft: Draft,
@@ -81,13 +293,19 @@ pub struct Queued {
     /// Epoch milliseconds before which this must not be retried.
     #[serde(default)]
     pub next_attempt_ms: i64,
+    /// How the last attempt ended, when it did not send the message. `None`
+    /// for a message nothing has tried yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
+    pub failure: Option<SendFailure>,
     /// Set when this stopped being retried. It keeps its payload and its place
     /// — it is a pending message, not a discarded one — but nothing will
-    /// attempt it again until a person does.
+    /// attempt it again until a person does. [`Self::failure`] says why: a
+    /// [`SendFailure::Transient`] here is one that ran out of attempts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub given_up: bool,
+    /// The message this one answers, when it is a reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<Answers>,
     /// A drain has claimed this message and is talking to the server right
     /// now. It can be neither taken back nor discarded until that ends. Read
     /// from where the file is, never stored.
@@ -95,10 +313,71 @@ pub struct Queued {
     pub sending: bool,
 }
 
+/// A record as it is on disk, including the ones 2.x wrote.
+///
+/// Before 3.0 a record said why it had stopped in a sentence (`last_error`)
+/// and nothing else. Such a record is read as what can be known from it: one
+/// still being retried failed transiently, by construction; one that had
+/// stopped may have been refused, or may have been delivered, and the record
+/// cannot say which — so it is read as [`SendFailure::Uncertain`], the one
+/// that tells its author to look before sending again.
+#[derive(serde::Deserialize)]
+struct Stored {
+    id: String,
+    draft: Draft,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    next_attempt_ms: i64,
+    #[serde(default)]
+    failure: Option<SendFailure>,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
+    given_up: bool,
+    #[serde(default)]
+    answers: Option<Answers>,
+}
+
+impl From<Stored> for Queued {
+    fn from(stored: Stored) -> Self {
+        let failure = stored.failure.or_else(|| {
+            stored.last_error.map(|reason| {
+                if stored.given_up {
+                    SendFailure::Uncertain { reason }
+                } else {
+                    SendFailure::Transient { reason }
+                }
+            })
+        });
+        Self {
+            id: stored.id,
+            draft: stored.draft,
+            attempts: stored.attempts,
+            next_attempt_ms: stored.next_attempt_ms,
+            failure,
+            given_up: stored.given_up,
+            answers: stored.answers,
+            sending: false,
+        }
+    }
+}
+
 impl Queued {
     #[must_use]
     pub fn is_live(&self) -> bool {
         !self.given_up
+    }
+
+    /// Whether this stopped with its outcome unknown, so that it may already
+    /// be in the recipients' inboxes.
+    #[must_use]
+    pub fn may_have_been_delivered(&self) -> bool {
+        self.given_up
+            && self
+                .failure
+                .as_ref()
+                .is_some_and(SendFailure::may_have_been_delivered)
     }
 
     /// A one-line description for a list row.
@@ -123,25 +402,63 @@ pub struct Outbox {
     root: PathBuf,
 }
 
+/// One message a drain sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Sent {
+    /// Its id in the outbox.
+    pub id: String,
+    /// The `Message-ID` it went out under, without angle brackets.
+    pub message_id: Option<String>,
+    /// The message it answers, as it was queued with.
+    pub answers: Option<Answers>,
+    /// The bytes that were sent, with the `Bcc` header restored — what to
+    /// file in Sent.
+    pub bytes: Vec<u8>,
+}
+
+/// One message a drain stopped retrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stopped {
+    /// Its id in the outbox, where it still is.
+    pub id: String,
+    /// Why. A [`SendFailure::Transient`] here ran out of attempts.
+    pub failure: SendFailure,
+}
+
 /// What one drain did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Always returned whole. A drain that hits a local failure part-way — a
+/// record it cannot rewrite, a full disk — stops there and says so in
+/// [`Self::error`], and everything it had already done is still in the other
+/// fields: a caller cannot lose the list of what was sent by propagating the
+/// error, because the error is not in its way.
+#[derive(Debug, Default)]
+#[must_use = "a drain's outcome says what was sent and whether it stopped early"]
+#[non_exhaustive]
 pub struct DrainOutcome {
-    /// Sent. These are the bytes to file in Sent, in the order they went.
-    pub sent: Vec<(String, Vec<u8>)>,
+    /// Sent, in the order they went.
+    pub sent: Vec<Sent>,
     /// Failed again, and rescheduled.
     pub deferred: usize,
-    /// Stopped retrying — either it ran out of attempts, or the failure turned
-    /// out to be one nothing automatic should touch.
-    pub given_up: usize,
+    /// Stopped retrying — it ran out of attempts, or the failure was one
+    /// nothing automatic should touch. Each says which.
+    pub stopped: Vec<Stopped>,
     /// Not due yet, or already stopped.
     pub skipped: usize,
+    /// The local failure that ended the drain early, if one did. What is due
+    /// and was not reached stays queued for the next drain. A message whose
+    /// record could not be settled after its send is recovered by that drain
+    /// as [`SendFailure::Interrupted`] and is never sent twice.
+    pub error: Option<Error>,
 }
 
 impl DrainOutcome {
     /// Is there anything a person has to look at?
     #[must_use]
     pub fn needs_attention(&self) -> bool {
-        self.given_up > 0
+        !self.stopped.is_empty()
     }
 }
 
@@ -157,15 +474,28 @@ impl Outbox {
     /// `outcome` is taken rather than assumed so the invariant is checked
     /// rather than documented: an [`Outcome::Ambiguous`] is refused here, at
     /// the door, and cannot be queued by a caller that forgot.
-    pub fn queue(&self, id: &str, draft: &Draft, outcome: &Outcome, now_ms: i64) -> Result<()> {
+    ///
+    /// `answers` is the message this one replies to, if it is a reply; it
+    /// comes back with the entry when a drain reports it sent.
+    pub fn queue(
+        &self,
+        id: &str,
+        draft: &Draft,
+        answers: Option<Answers>,
+        outcome: &Outcome,
+        now_ms: i64,
+    ) -> Result<()> {
         match outcome {
             Outcome::NotSent(why) => self.write(&Queued {
                 id: id.to_owned(),
                 draft: with_message_id(draft, id),
                 attempts: 1,
                 next_attempt_ms: now_ms.saturating_add(retry_delay_ms(1)),
-                last_error: Some(why.to_string()),
+                failure: Some(SendFailure::Transient {
+                    reason: why.to_string(),
+                }),
                 given_up: false,
+                answers,
                 sending: false,
             }),
             Outcome::Sent(_) => Err(Error::Draft(
@@ -190,14 +520,21 @@ impl Outbox {
     /// drain makes the first attempt; from there the message is
     /// indistinguishable from one that failed once and was queued by
     /// [`Self::queue`].
-    pub fn submit(&self, id: &str, draft: &Draft, now_ms: i64) -> Result<()> {
+    pub fn submit(
+        &self,
+        id: &str,
+        draft: &Draft,
+        answers: Option<Answers>,
+        now_ms: i64,
+    ) -> Result<()> {
         self.write(&Queued {
             id: id.to_owned(),
             draft: with_message_id(draft, id),
             attempts: 0,
             next_attempt_ms: now_ms,
-            last_error: None,
+            failure: None,
             given_up: false,
+            answers,
             sending: false,
         })
     }
@@ -281,7 +618,13 @@ impl Outbox {
     /// Unlike [`Self::queue`] the draft has not failed anywhere, so it is
     /// checked *now*: a message that cannot build would otherwise fail at
     /// its send time, when nobody is looking at a composer any more.
-    pub fn schedule(&self, id: &str, draft: &Draft, not_before_ms: i64) -> Result<()> {
+    pub fn schedule(
+        &self,
+        id: &str,
+        draft: &Draft,
+        answers: Option<Answers>,
+        not_before_ms: i64,
+    ) -> Result<()> {
         if let Some(problem) = draft.problem() {
             return Err(Error::Draft(problem.to_owned()));
         }
@@ -290,14 +633,19 @@ impl Outbox {
             draft: with_message_id(draft, id),
             attempts: 0,
             next_attempt_ms: not_before_ms,
-            last_error: None,
+            failure: None,
             given_up: false,
+            answers,
             sending: false,
         })
     }
 
-    /// Takes a queued message back, returning its draft — the undo for a
+    /// Takes a queued message back, returning its record — the undo for a
     /// send that has not gone yet.
+    ///
+    /// The whole record, not the draft alone: what it answers comes back with
+    /// it, so a reply reopened in a composer is still a reply, and so does
+    /// why it had stopped, if it had.
     ///
     /// `None` means it already left, is being sent right now, or never
     /// existed, and the caller must say so rather than reopen a composer for a
@@ -305,7 +653,7 @@ impl Outbox {
     /// and so is the drain's claim before it sends, so the two cannot both
     /// win: whichever renames the file first has it, and the other finds it
     /// gone.
-    pub fn cancel(&self, id: &str) -> Result<Option<Draft>> {
+    pub fn cancel(&self, id: &str) -> Result<Option<Queued>> {
         if !crate::drafts::is_valid_id(id) {
             return Ok(None);
         }
@@ -320,13 +668,15 @@ impl Outbox {
         let queued: Queued = serde_json::from_str(&text).map_err(|why| {
             Error::Draft(format!("the cancelled message could not be read: {why}"))
         })?;
-        Ok(Some(queued.draft))
+        Ok(Some(queued))
     }
 
     /// Puts a given-up message back in the queue, due now.
     ///
     /// The explicit "try again" a stopped message needs — and the only way one
     /// resumes, because everything automatic has already concluded it will not.
+    /// It starts over: the record of why it stopped is cleared with the count
+    /// of attempts, since the next drain's outcome is the one that matters.
     pub fn retry(&self, id: &str) -> Result<()> {
         let Some(mut queued) = self.read(id)? else {
             return Ok(());
@@ -334,6 +684,7 @@ impl Outbox {
         queued.given_up = false;
         queued.attempts = 0;
         queued.next_attempt_ms = 0;
+        queued.failure = None;
         self.write(&queued)
     }
 
@@ -346,7 +697,7 @@ impl Outbox {
         endpoint: &SmtpEndpoint,
         credentials: &Credentials,
         now_ms: i64,
-    ) -> Result<DrainOutcome> {
+    ) -> DrainOutcome {
         self.drain_with(|draft| smtp::send(endpoint, credentials, draft), now_ms)
     }
 
@@ -356,13 +707,30 @@ impl Outbox {
     /// same never-retry-an-ambiguous-send rule, different wire. The
     /// classification into [`Outcome`] is the submitter's job because only it
     /// knows where its protocol's point of no return is.
+    ///
+    /// Not a `Result`: see [`DrainOutcome`]. A local failure is reported in
+    /// [`DrainOutcome::error`], beside what the drain did before it.
     pub fn drain_with(
         &self,
         mut send: impl FnMut(&crate::compose::Draft) -> Outcome,
         now_ms: i64,
-    ) -> Result<DrainOutcome> {
+    ) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
-        outcome.given_up += self.recover_interrupted()?;
+        if let Err(why) = self.drain_into(&mut outcome, &mut send, now_ms) {
+            outcome.error = Some(why);
+        }
+        outcome
+    }
+
+    /// The drain itself. Everything that happened is in `outcome` before any
+    /// step that can fail after it, so an early return loses nothing.
+    fn drain_into(
+        &self,
+        outcome: &mut DrainOutcome,
+        send: &mut impl FnMut(&crate::compose::Draft) -> Outcome,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.recover_interrupted(outcome)?;
 
         // Oldest first, as `list` shows them: ids sort by when they were
         // made, and a directory is listed in whatever order it likes.
@@ -389,34 +757,45 @@ impl Outbox {
             }
 
             match send(&queued.draft) {
-                Outcome::Sent(filed) => {
+                Outcome::Sent(bytes) => {
+                    // Recorded before the claim is removed: if the removal
+                    // fails, the message has still gone and the caller still
+                    // has to hear that it did.
+                    outcome.sent.push(Sent {
+                        id: queued.id,
+                        message_id: queued.draft.message_id,
+                        answers: queued.answers,
+                        bytes,
+                    });
                     remove_if_present(&claim.path)?;
-                    outcome.sent.push((queued.id, filed));
                 }
                 Outcome::NotSent(why) => {
+                    let failure = SendFailure::transient(&why);
                     queued.attempts = queued.attempts.saturating_add(1);
-                    queued.last_error = Some(why.to_string());
-                    if queued.attempts >= MAX_ATTEMPTS {
-                        // Several hours of failing the same way. Waiting longer
-                        // is not going to be what fixes it.
-                        queued.given_up = true;
-                        outcome.given_up += 1;
-                    } else {
+                    queued.failure = Some(failure.clone());
+                    // Several hours of failing the same way. Waiting longer
+                    // is not going to be what fixes it.
+                    queued.given_up = queued.attempts >= MAX_ATTEMPTS;
+                    if !queued.given_up {
                         queued.next_attempt_ms =
                             now_ms.saturating_add(retry_delay_ms(queued.attempts));
-                        outcome.deferred += 1;
                     }
                     self.release(&queued, &claim.path)?;
+                    if queued.given_up {
+                        outcome.stopped.push(Stopped {
+                            id: queued.id,
+                            failure,
+                        });
+                    } else {
+                        outcome.deferred += 1;
+                    }
                 }
                 Outcome::Rejected(why) => {
                     // Refused outright — a login the server will not take, a
                     // recipient it will not accept, a draft that cannot be
                     // built. Twelve more attempts over five hours would be
                     // refused identically; the message waits for a person.
-                    queued.given_up = true;
-                    queued.last_error = Some(why.to_string());
-                    self.release(&queued, &claim.path)?;
-                    outcome.given_up += 1;
+                    self.stop(queued, SendFailure::refusal(&why), &claim.path, outcome)?;
                 }
                 Outcome::Ambiguous(why) => {
                     // It may have been delivered. Nothing automatic touches it
@@ -427,16 +806,31 @@ impl Outbox {
                         %why,
                         "a queued send may have been delivered; not retrying it"
                     );
-                    queued.given_up = true;
-                    queued.last_error = Some(why.to_string());
-                    self.release(&queued, &claim.path)?;
-                    outcome.given_up += 1;
+                    self.stop(queued, SendFailure::uncertain(&why), &claim.path, outcome)?;
                 }
             }
             drop(claim);
         }
 
-        Ok(outcome)
+        Ok(())
+    }
+
+    /// Records that a claimed message will not be retried, and why.
+    fn stop(
+        &self,
+        mut queued: Queued,
+        failure: SendFailure,
+        claim: &Path,
+        outcome: &mut DrainOutcome,
+    ) -> Result<()> {
+        queued.given_up = true;
+        queued.failure = Some(failure.clone());
+        self.release(&queued, claim)?;
+        outcome.stopped.push(Stopped {
+            id: queued.id,
+            failure,
+        });
+        Ok(())
     }
 
     /// Takes a message for sending: renames it to its claimed name and locks
@@ -473,8 +867,7 @@ impl Outbox {
     /// may not have reached the server, which is exactly the ambiguous case:
     /// it is given up, never retried automatically. A claim still locked
     /// belongs to a drain that is running, and is left alone.
-    fn recover_interrupted(&self) -> Result<usize> {
-        let mut recovered = 0;
+    fn recover_interrupted(&self, outcome: &mut DrainOutcome) -> Result<()> {
         for claimed in self.entries(CLAIMED) {
             let path = self.claim_path(&claimed.id);
             let Ok(file) = fs::File::open(&path) else {
@@ -490,15 +883,9 @@ impl Outbox {
                 remove_if_present(&path)?;
                 continue;
             }
-            let mut queued = claimed;
-            queued.given_up = true;
-            queued.last_error = Some(
-                "sending was interrupted; it may have been delivered, so it was not retried".into(),
-            );
-            self.release(&queued, &path)?;
-            recovered += 1;
+            self.stop(claimed, SendFailure::Interrupted, &path, outcome)?;
         }
-        Ok(recovered)
+        Ok(())
     }
 
     fn claim_path(&self, id: &str) -> PathBuf {
@@ -609,17 +996,15 @@ mod tests {
         // no attempt yet — so the very next drain must try it, not back off.
         let (_dir, outbox) = outbox();
         outbox
-            .submit("0000feed", &draft("Re: standup"), 1_000)
+            .submit("0000feed", &draft("Re: standup"), None, 1_000)
             .unwrap();
 
         let queued = outbox.list().unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].attempts, 0);
-        assert!(queued[0].last_error.is_none());
+        assert_eq!(queued[0].failure, None);
 
-        let outcome = outbox
-            .drain_with(|_| Outcome::Sent(b"raw".to_vec()), 1_000)
-            .unwrap();
+        let outcome = outbox.drain_with(|_| Outcome::Sent(b"raw".to_vec()), 1_000);
         assert_eq!(outcome.sent.len(), 1);
         assert_eq!(outbox.count(), 0);
     }
@@ -632,7 +1017,7 @@ mod tests {
         {
             let outbox = Outbox::open(dir.path()).unwrap();
             outbox
-                .queue("00000001", &draft("On a train"), &refused(), 0)
+                .queue("00000001", &draft("On a train"), None, &refused(), 0)
                 .unwrap();
         }
         let outbox = Outbox::open(dir.path()).unwrap();
@@ -640,7 +1025,12 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].draft.subject, "On a train");
         assert_eq!(queued[0].attempts, 1);
-        assert!(queued[0].last_error.is_some());
+        assert!(
+            queued[0]
+                .failure
+                .as_ref()
+                .is_some_and(SendFailure::is_transient)
+        );
         assert!(queued[0].is_live());
     }
 
@@ -651,7 +1041,7 @@ mod tests {
         let (_dir, outbox) = outbox();
         let ambiguous = Outcome::Ambiguous(Error::Smtp("timed out".into()));
         let refused_error = outbox
-            .queue("00000001", &draft("Risky"), &ambiguous, 0)
+            .queue("00000001", &draft("Risky"), None, &ambiguous, 0)
             .expect_err("an ambiguous send must not be queueable");
         assert!(
             refused_error
@@ -666,7 +1056,13 @@ mod tests {
         let (_dir, outbox) = outbox();
         assert!(
             outbox
-                .queue("00000001", &draft("Gone"), &Outcome::Sent(Vec::new()), 0)
+                .queue(
+                    "00000001",
+                    &draft("Gone"),
+                    None,
+                    &Outcome::Sent(Vec::new()),
+                    0
+                )
                 .is_err()
         );
     }
@@ -675,10 +1071,10 @@ mod tests {
     fn an_entry_that_is_not_due_yet_is_skipped_rather_than_attempted() {
         let (_dir, outbox) = outbox();
         outbox
-            .queue("00000001", &draft("Later"), &refused(), 0)
+            .queue("00000001", &draft("Later"), None, &refused(), 0)
             .unwrap();
 
-        let outcome = outbox.drain(&unreachable(), &password(), 1_000).unwrap();
+        let outcome = outbox.drain(&unreachable(), &password(), 1_000);
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.deferred, 0);
         assert_eq!(
@@ -692,12 +1088,10 @@ mod tests {
     fn a_failing_drain_backs_off_and_keeps_the_message() {
         let (_dir, outbox) = outbox();
         outbox
-            .queue("00000001", &draft("Still offline"), &refused(), 0)
+            .queue("00000001", &draft("Still offline"), None, &refused(), 0)
             .unwrap();
 
-        let outcome = outbox
-            .drain(&unreachable(), &password(), MAX_DELAY_MS + 1)
-            .unwrap();
+        let outcome = outbox.drain(&unreachable(), &password(), MAX_DELAY_MS + 1);
         assert_eq!(outcome.deferred, 1);
         assert!(outcome.sent.is_empty());
         assert!(!outcome.needs_attention());
@@ -715,7 +1109,7 @@ mod tests {
     fn a_message_that_keeps_failing_stops_rather_than_retrying_for_a_week() {
         let (_dir, outbox) = outbox();
         outbox
-            .queue("00000001", &draft("Doomed"), &refused(), 0)
+            .queue("00000001", &draft("Doomed"), None, &refused(), 0)
             .unwrap();
 
         // The clock has to move past each backoff, or every drain after the
@@ -723,7 +1117,8 @@ mod tests {
         let mut now = 0_i64;
         for _ in 0..MAX_ATTEMPTS {
             now += MAX_DELAY_MS + 1;
-            outbox.drain(&unreachable(), &password(), now).unwrap();
+            let drained = outbox.drain(&unreachable(), &password(), now);
+            assert!(drained.error.is_none(), "{:?}", drained.error);
         }
 
         let queued = &outbox.list().unwrap()[0];
@@ -741,17 +1136,16 @@ mod tests {
     fn a_stopped_message_is_not_attempted_again_until_someone_says_so() {
         let (_dir, outbox) = outbox();
         outbox
-            .queue("00000001", &draft("Stopped"), &refused(), 0)
+            .queue("00000001", &draft("Stopped"), None, &refused(), 0)
             .unwrap();
         let mut now = 0_i64;
         for _ in 0..MAX_ATTEMPTS {
             now += MAX_DELAY_MS + 1;
-            outbox.drain(&unreachable(), &password(), now).unwrap();
+            let drained = outbox.drain(&unreachable(), &password(), now);
+            assert!(drained.error.is_none(), "{:?}", drained.error);
         }
 
-        let outcome = outbox
-            .drain(&unreachable(), &password(), now + MAX_DELAY_MS)
-            .unwrap();
+        let outcome = outbox.drain(&unreachable(), &password(), now + MAX_DELAY_MS);
         assert_eq!(outcome.skipped, 1);
         assert_eq!(outcome.deferred, 0);
 
@@ -770,7 +1164,9 @@ mod tests {
             ("00000001", "first"),
             ("00000002", "second"),
         ] {
-            outbox.queue(id, &draft(subject), &refused(), 0).unwrap();
+            outbox
+                .queue(id, &draft(subject), None, &refused(), 0)
+                .unwrap();
         }
         let subjects: Vec<String> = outbox
             .list()
@@ -788,20 +1184,19 @@ mod tests {
         let (_dir, outbox) = outbox();
         let ids: Vec<String> = (0..40).map(|n| format!("{:016x}", 40 - n)).collect();
         for id in &ids {
-            outbox.submit(id, &draft(id), 0).unwrap();
+            outbox.submit(id, &draft(id), None, 0).unwrap();
         }
         let mut went = Vec::new();
 
-        outbox
-            .drain_with(
-                |draft| {
-                    went.push(draft.subject.clone());
-                    Outcome::Sent(Vec::new())
-                },
-                0,
-            )
-            .unwrap();
+        let outcome = outbox.drain_with(
+            |draft| {
+                went.push(draft.subject.clone());
+                Outcome::Sent(Vec::new())
+            },
+            0,
+        );
 
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
         let mut expected = ids;
         expected.sort();
         assert_eq!(went, expected);
@@ -821,18 +1216,14 @@ mod tests {
     fn a_scheduled_send_waits_for_its_time_and_then_goes() {
         let (_dir, outbox) = outbox();
         outbox
-            .schedule("0000000000000001", &draft("later"), 10_000)
+            .schedule("0000000000000001", &draft("later"), None, 10_000)
             .unwrap();
 
         // Before the deadline: nothing is sent, nothing is attempted.
-        let early = outbox
-            .drain_with(|_| panic!("a not-yet-due message was submitted"), 9_999)
-            .unwrap();
+        let early = outbox.drain_with(|_| panic!("a not-yet-due message was submitted"), 9_999);
         assert_eq!(early.skipped, 1);
 
-        let due = outbox
-            .drain_with(|_| Outcome::Sent(b"bytes".to_vec()), 10_000)
-            .unwrap();
+        let due = outbox.drain_with(|_| Outcome::Sent(b"bytes".to_vec()), 10_000);
         assert_eq!(due.sent.len(), 1);
         assert_eq!(outbox.count(), 0);
     }
@@ -846,7 +1237,11 @@ mod tests {
             name: None,
             address: "me@example.com".into(),
         });
-        assert!(outbox.schedule("0000000000000002", &unfinished, 0).is_err());
+        assert!(
+            outbox
+                .schedule("0000000000000002", &unfinished, None, 0)
+                .is_err()
+        );
         assert_eq!(outbox.count(), 0);
     }
 
@@ -854,11 +1249,14 @@ mod tests {
     fn cancelling_hands_the_draft_back_exactly_once() {
         let (_dir, outbox) = outbox();
         outbox
-            .schedule("0000000000000003", &draft("regretted"), i64::MAX)
+            .schedule("0000000000000003", &draft("regretted"), None, i64::MAX)
             .unwrap();
 
         let taken = outbox.cancel("0000000000000003").unwrap();
-        assert_eq!(taken.expect("the draft came back").subject, "regretted");
+        assert_eq!(
+            taken.expect("the draft came back").draft.subject,
+            "regretted"
+        );
         assert_eq!(outbox.count(), 0);
 
         assert!(
@@ -878,7 +1276,9 @@ mod tests {
             mime_type: "text/csv".into(),
             bytes: b"a,b\n1,2\n".to_vec(),
         });
-        outbox.queue("00000001", &draft, &refused(), 0).unwrap();
+        outbox
+            .queue("00000001", &draft, None, &refused(), 0)
+            .unwrap();
 
         let queued = &outbox.list().unwrap()[0];
         assert_eq!(queued.draft.attachments[0].bytes, b"a,b\n1,2\n");
@@ -888,7 +1288,7 @@ mod tests {
     fn removing_a_message_that_is_already_gone_is_not_an_error() {
         let (_dir, outbox) = outbox();
         outbox
-            .queue("00000001", &draft("x"), &refused(), 0)
+            .queue("00000001", &draft("x"), None, &refused(), 0)
             .unwrap();
         outbox.remove("00000001").unwrap();
         outbox.remove("00000001").unwrap();
@@ -900,7 +1300,7 @@ mod tests {
         let (_dir, outbox) = outbox();
         assert!(
             outbox
-                .queue("../../evil", &draft("x"), &refused(), 0)
+                .queue("../../evil", &draft("x"), None, &refused(), 0)
                 .is_err()
         );
         assert_eq!(outbox.count(), 0);
@@ -910,20 +1310,29 @@ mod tests {
     fn a_refusal_that_will_repeat_stops_at_once_and_keeps_the_message() {
         let (_dir, outbox) = outbox();
         outbox
-            .submit("0000000000000009", &draft("bad login"), 0)
+            .submit("0000000000000009", &draft("bad login"), None, 0)
             .unwrap();
-        let outcome = outbox
-            .drain_with(
-                |_| Outcome::Rejected(Error::Smtp("535 bad credentials".into())),
-                0,
-            )
-            .unwrap();
-        assert_eq!(outcome.given_up, 1);
+        let outcome = outbox.drain_with(
+            |_| Outcome::Rejected(Error::Smtp("535 bad credentials".into())),
+            0,
+        );
+        let refusal = SendFailure::Refused {
+            reason: "SMTP: 535 bad credentials".into(),
+        };
+        assert_eq!(
+            outcome.stopped,
+            [Stopped {
+                id: "0000000000000009".into(),
+                failure: refusal.clone(),
+            }]
+        );
         let queued = &outbox.list().unwrap()[0];
         assert!(
             queued.given_up,
             "a refusal that will repeat was scheduled again"
         );
+        assert_eq!(queued.failure, Some(refusal));
+        assert!(!queued.may_have_been_delivered());
         assert_eq!(queued.draft.subject, "bad login");
     }
 
@@ -931,21 +1340,20 @@ mod tests {
     fn every_attempt_of_a_queued_message_carries_the_same_message_id() {
         let (_dir, outbox) = outbox();
         outbox
-            .queue("0000000000000010", &draft("x"), &refused(), 0)
+            .queue("0000000000000010", &draft("x"), None, &refused(), 0)
             .unwrap();
         let mut seen = Vec::new();
         let mut now = 0;
         for _ in 0..2 {
             now += MAX_DELAY_MS + 1;
-            outbox
-                .drain_with(
-                    |draft| {
-                        seen.push(draft.message_id.clone());
-                        refused()
-                    },
-                    now,
-                )
-                .unwrap();
+            let drained = outbox.drain_with(
+                |draft| {
+                    seen.push(draft.message_id.clone());
+                    refused()
+                },
+                now,
+            );
+            assert!(drained.error.is_none(), "{:?}", drained.error);
         }
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], seen[1]);
@@ -959,18 +1367,16 @@ mod tests {
         // of reopening a composer for a message the recipients are getting.
         let (_dir, outbox) = outbox();
         outbox
-            .schedule("0000000000000011", &draft("going"), 0)
+            .schedule("0000000000000011", &draft("going"), None, 0)
             .unwrap();
         let mut taken_back = None;
-        let outcome = outbox
-            .drain_with(
-                |_| {
-                    taken_back = Some(outbox.cancel("0000000000000011").unwrap());
-                    Outcome::Sent(b"bytes".to_vec())
-                },
-                0,
-            )
-            .unwrap();
+        let outcome = outbox.drain_with(
+            |_| {
+                taken_back = Some(outbox.cancel("0000000000000011").unwrap());
+                Outcome::Sent(b"bytes".to_vec())
+            },
+            0,
+        );
         assert_eq!(outcome.sent.len(), 1);
         assert_eq!(
             taken_back,
@@ -984,18 +1390,17 @@ mod tests {
     fn a_failed_send_that_was_being_undone_comes_back_once() {
         let (_dir, outbox) = outbox();
         outbox
-            .schedule("0000000000000012", &draft("offline"), 0)
+            .schedule("0000000000000012", &draft("offline"), None, 0)
             .unwrap();
         let mut taken_back = None;
-        outbox
-            .drain_with(
-                |_| {
-                    taken_back = Some(outbox.cancel("0000000000000012").unwrap());
-                    refused()
-                },
-                0,
-            )
-            .unwrap();
+        let drained = outbox.drain_with(
+            |_| {
+                taken_back = Some(outbox.cancel("0000000000000012").unwrap());
+                refused()
+            },
+            0,
+        );
+        assert!(drained.error.is_none(), "{:?}", drained.error);
         assert_eq!(taken_back, Some(None));
         let queued = outbox.list().unwrap();
         assert_eq!(queued.len(), 1, "the message was lost or duplicated");
@@ -1006,24 +1411,23 @@ mod tests {
     fn a_message_in_flight_is_listed_and_cannot_be_discarded() {
         let (_dir, outbox) = outbox();
         outbox
-            .schedule("0000000000000013", &draft("in flight"), 0)
+            .schedule("0000000000000013", &draft("in flight"), None, 0)
             .unwrap();
-        outbox
-            .drain_with(
-                |_| {
-                    let listed = outbox.list().unwrap();
-                    assert_eq!(
-                        listed.len(),
-                        1,
-                        "a message being sent vanished from the list"
-                    );
-                    assert!(listed[0].sending);
-                    assert!(outbox.remove("0000000000000013").is_err());
-                    refused()
-                },
-                0,
-            )
-            .unwrap();
+        let drained = outbox.drain_with(
+            |_| {
+                let listed = outbox.list().unwrap();
+                assert_eq!(
+                    listed.len(),
+                    1,
+                    "a message being sent vanished from the list"
+                );
+                assert!(listed[0].sending);
+                assert!(outbox.remove("0000000000000013").is_err());
+                refused()
+            },
+            0,
+        );
+        assert!(drained.error.is_none(), "{:?}", drained.error);
         assert!(!outbox.list().unwrap()[0].sending);
     }
 
@@ -1033,7 +1437,7 @@ mod tests {
         // have been delivered, so it waits for a person.
         let (dir, outbox) = outbox();
         outbox
-            .schedule("0000000000000014", &draft("crashed"), 0)
+            .schedule("0000000000000014", &draft("crashed"), None, 0)
             .unwrap();
         let root = dir.path().join(DIRECTORY);
         std::fs::rename(
@@ -1041,18 +1445,388 @@ mod tests {
             root.join("0000000000000014.sending.json"),
         )
         .unwrap();
-        let outcome = outbox
-            .drain_with(|_| panic!("an interrupted send was attempted again"), 0)
-            .unwrap();
-        assert_eq!(outcome.given_up, 1);
+        let outcome = outbox.drain_with(|_| panic!("an interrupted send was attempted again"), 0);
+        assert_eq!(
+            outcome.stopped,
+            [Stopped {
+                id: "0000000000000014".into(),
+                failure: SendFailure::Interrupted,
+            }]
+        );
         let queued = &outbox.list().unwrap()[0];
         assert!(queued.given_up && !queued.sending);
-        assert!(
-            queued
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("may have been delivered")
+        assert_eq!(queued.failure, Some(SendFailure::Interrupted));
+        assert!(queued.may_have_been_delivered());
+    }
+
+    #[test]
+    fn a_local_failure_part_way_keeps_the_list_of_what_was_sent() {
+        // The first message goes; then the outbox directory stops accepting
+        // changes, so its claim cannot be removed. The drain used to return
+        // that as `Err`, and the id of a message the recipients now have went
+        // with it — nothing could mark what it answered, or file its copy.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, outbox) = outbox();
+        let reply_to = Answers::to_message("<original@example.com>");
+        outbox
+            .submit(
+                "0000000000000021",
+                &draft("first"),
+                Some(reply_to.clone()),
+                0,
+            )
+            .unwrap();
+        outbox
+            .submit("0000000000000022", &draft("second"), None, 0)
+            .unwrap();
+        let root = dir.path().join(DIRECTORY);
+        let mut attempted = 0;
+
+        let outcome = outbox.drain_with(
+            |_| {
+                attempted += 1;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+                Outcome::Sent(b"bytes".to_vec())
+            },
+            0,
         );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(outcome.error.is_some(), "the local failure went unreported");
+        assert_eq!(attempted, 1, "the drain carried on past a failing disk");
+        assert_eq!(outcome.sent.len(), 1);
+        assert_eq!(outcome.sent[0].id, "0000000000000021");
+        assert_eq!(outcome.sent[0].answers, Some(reply_to));
+        assert_eq!(outcome.sent[0].bytes, b"bytes");
+
+        // Nothing is sent twice afterwards: the first message's leftover
+        // claim is settled as possibly delivered, and only the second goes.
+        let mut went = Vec::new();
+        let next = outbox.drain_with(
+            |draft| {
+                went.push(draft.subject.clone());
+                Outcome::Sent(Vec::new())
+            },
+            0,
+        );
+        assert!(next.error.is_none(), "{:?}", next.error);
+        assert_eq!(went, ["second"]);
+        assert_eq!(
+            next.stopped,
+            [Stopped {
+                id: "0000000000000021".into(),
+                failure: SendFailure::Interrupted,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_local_failure_before_anything_is_sent_is_reported_with_an_empty_list() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (dir, outbox) = outbox();
+        outbox
+            .submit("0000000000000023", &draft("stuck"), None, 0)
+            .unwrap();
+        let root = dir.path().join(DIRECTORY);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = outbox.drain_with(|_| panic!("a message nobody could claim was sent"), 0);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(outcome.error.is_some());
+        assert_eq!(outcome.sent, []);
+        assert_eq!(outbox.count(), 1, "the message was lost");
+    }
+
+    /// Drains one message with `outcome`, and returns its record as a fresh
+    /// `Outbox` on the same directory reads it — which is what "durably"
+    /// means.
+    fn stopped_by(outcome: fn() -> Outcome) -> (DrainOutcome, Queued) {
+        let (dir, outbox) = outbox();
+        outbox
+            .submit("0000000000000031", &draft("x"), None, 0)
+            .unwrap();
+        let drained = outbox.drain_with(|_| outcome(), 0);
+        assert!(drained.error.is_none(), "{:?}", drained.error);
+        let reopened = Outbox::open(dir.path()).unwrap();
+        let queued = reopened.list().unwrap().remove(0);
+        (drained, queued)
+    }
+
+    #[test]
+    fn a_server_refusal_is_recorded_as_one_with_the_servers_reason() {
+        let (drained, queued) =
+            stopped_by(|| Outcome::Rejected(Error::Smtp("550 5.1.1 no such user".into())));
+
+        let refusal = SendFailure::Refused {
+            reason: "SMTP: 550 5.1.1 no such user".into(),
+        };
+        assert_eq!(queued.failure, Some(refusal.clone()));
+        assert!(queued.given_up);
+        assert!(!queued.may_have_been_delivered());
+        assert_eq!(drained.stopped[0].failure, refusal);
+        assert_eq!(
+            queued.failure.unwrap().reason(),
+            Some("SMTP: 550 5.1.1 no such user")
+        );
+    }
+
+    #[test]
+    fn a_draft_that_cannot_be_built_is_not_blamed_on_the_server() {
+        let (_, queued) = stopped_by(|| Outcome::Rejected(Error::Draft("no recipients".into())));
+
+        assert_eq!(
+            queued.failure,
+            Some(SendFailure::Unsendable {
+                reason: "no recipients".into()
+            })
+        );
+        assert!(queued.given_up);
+    }
+
+    #[test]
+    fn an_ambiguous_send_is_recorded_as_possibly_delivered() {
+        let (drained, queued) =
+            stopped_by(|| Outcome::Ambiguous(Error::Smtp("timed out after DATA".into())));
+
+        assert_eq!(
+            queued.failure,
+            Some(SendFailure::Uncertain {
+                reason: "SMTP: timed out after DATA".into()
+            })
+        );
+        assert!(queued.given_up);
+        assert!(queued.may_have_been_delivered());
+        assert!(drained.needs_attention());
+    }
+
+    #[test]
+    fn a_transient_failure_is_recorded_as_one_and_keeps_being_retried() {
+        let (drained, queued) = stopped_by(refused);
+
+        assert_eq!(
+            queued.failure,
+            Some(SendFailure::Transient {
+                reason: "SMTP: connection refused".into()
+            })
+        );
+        assert!(queued.is_live());
+        assert!(!queued.may_have_been_delivered());
+        assert_eq!(drained.deferred, 1);
+        assert_eq!(drained.stopped, []);
+    }
+
+    #[test]
+    fn a_message_that_ran_out_of_attempts_says_it_was_transient_to_the_end() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .queue("00000001", &draft("Doomed"), None, &refused(), 0)
+            .unwrap();
+        let mut now = 0_i64;
+        let mut stopped = Vec::new();
+        for _ in 0..MAX_ATTEMPTS {
+            now += MAX_DELAY_MS + 1;
+            stopped.extend(outbox.drain_with(|_| refused(), now).stopped);
+        }
+
+        assert_eq!(stopped.len(), 1, "it stops once, and is reported once");
+        assert!(stopped[0].failure.is_transient());
+        let queued = &outbox.list().unwrap()[0];
+        assert!(queued.given_up);
+        assert!(!queued.may_have_been_delivered());
+    }
+
+    #[test]
+    fn trying_a_stopped_message_again_starts_it_over() {
+        let (_dir, outbox) = outbox();
+        outbox
+            .submit("0000000000000032", &draft("x"), None, 0)
+            .unwrap();
+        let drained = outbox.drain_with(|_| Outcome::Rejected(Error::Smtp("535".into())), 0);
+        assert_eq!(drained.stopped.len(), 1);
+
+        outbox.retry("0000000000000032").unwrap();
+
+        let queued = &outbox.list().unwrap()[0];
+        assert!(queued.is_live());
+        assert_eq!(
+            queued.failure, None,
+            "a message due now still says it was refused"
+        );
+    }
+
+    #[test]
+    fn a_record_written_before_failures_were_typed_is_still_read() {
+        // 2.x wrote a sentence. One still being retried was transient by
+        // construction; one that had stopped cannot say whether it was
+        // refused or delivered, and is read as the case that says "look
+        // first".
+        let (dir, outbox) = outbox();
+        outbox
+            .submit("0000000000000041", &draft("live"), None, 0)
+            .unwrap();
+        let root = dir.path().join(DIRECTORY);
+        let draft_json = serde_json::to_string(&draft("old")).unwrap();
+        for (id, extra) in [
+            (
+                "0000000000000042",
+                r#""attempts":3,"next_attempt_ms":99,"last_error":"SMTP: connection refused""#,
+            ),
+            (
+                "0000000000000043",
+                r#""attempts":1,"last_error":"SMTP: 550 no","given_up":true"#,
+            ),
+        ] {
+            fs::write(
+                root.join(format!("{id}{EXTENSION}")),
+                format!(r#"{{"id":"{id}","draft":{draft_json},{extra}}}"#),
+            )
+            .unwrap();
+        }
+
+        let listed = outbox.list().unwrap();
+
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].failure, None);
+        assert_eq!(
+            listed[1].failure,
+            Some(SendFailure::Transient {
+                reason: "SMTP: connection refused".into()
+            })
+        );
+        assert!(listed[1].is_live());
+        assert_eq!(listed[1].attempts, 3);
+        assert_eq!(listed[1].next_attempt_ms, 99);
+        assert_eq!(
+            listed[2].failure,
+            Some(SendFailure::Uncertain {
+                reason: "SMTP: 550 no".into()
+            })
+        );
+        assert!(listed[2].may_have_been_delivered());
+    }
+
+    #[test]
+    fn a_failure_is_stored_under_a_name_not_a_sentence() {
+        let (dir, outbox) = outbox();
+        outbox
+            .submit("0000000000000044", &draft("x"), None, 0)
+            .unwrap();
+        let drained = outbox.drain_with(|_| Outcome::Ambiguous(Error::Smtp("eof".into())), 0);
+        assert_eq!(drained.stopped.len(), 1);
+
+        let text = fs::read_to_string(
+            dir.path()
+                .join(DIRECTORY)
+                .join(format!("0000000000000044{EXTENSION}")),
+        )
+        .unwrap();
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(record["failure"]["kind"], "uncertain");
+        assert_eq!(record["failure"]["reason"], "SMTP: eof");
+        assert_eq!(record.get("last_error"), None);
+    }
+
+    fn origin() -> Origin {
+        Origin {
+            mailbox: "INBOX".into(),
+            delimiter: Some('/'),
+            uid: 41,
+            uid_validity: 7,
+        }
+    }
+
+    #[test]
+    fn a_reply_carries_what_it_answers_to_the_report_of_its_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let answers = Answers::to_message(" <original@example.com> ").found_at(origin());
+        assert_eq!(answers.message_id.as_deref(), Some("original@example.com"));
+        Outbox::open(dir.path())
+            .unwrap()
+            .schedule(
+                "0000000000000051",
+                &draft("Re: hello"),
+                Some(answers.clone()),
+                0,
+            )
+            .unwrap();
+
+        // Across a restart, which is the point of keeping it on the record.
+        let outbox = Outbox::open(dir.path()).unwrap();
+        assert_eq!(outbox.list().unwrap()[0].answers, Some(answers.clone()));
+        let outcome = outbox.drain_with(|_| Outcome::Sent(b"raw".to_vec()), 0);
+
+        assert_eq!(outcome.sent.len(), 1);
+        assert_eq!(outcome.sent[0].answers, Some(answers));
+        assert_eq!(
+            outcome.sent[0].message_id.as_deref(),
+            Some("0000000000000051@example.com"),
+            "the report names the message that went"
+        );
+    }
+
+    #[test]
+    fn a_reply_taken_back_is_still_a_reply() {
+        let (_dir, outbox) = outbox();
+        let answers = Answers::at(origin());
+        outbox
+            .schedule(
+                "0000000000000052",
+                &draft("Re: hello"),
+                Some(answers.clone()),
+                i64::MAX,
+            )
+            .unwrap();
+
+        let taken = outbox.cancel("0000000000000052").unwrap().unwrap();
+
+        assert_eq!(taken.answers, Some(answers));
+        assert_eq!(taken.draft.subject, "Re: hello");
+    }
+
+    #[test]
+    fn a_failed_reply_keeps_what_it_answers_through_every_retry() {
+        let (_dir, outbox) = outbox();
+        let answers = Answers::to_message("original@example.com");
+        outbox
+            .queue(
+                "0000000000000053",
+                &draft("Re: hello"),
+                Some(answers.clone()),
+                &refused(),
+                0,
+            )
+            .unwrap();
+        let drained = outbox.drain_with(|_| refused(), MAX_DELAY_MS + 1);
+        assert_eq!(drained.deferred, 1);
+
+        assert_eq!(outbox.list().unwrap()[0].answers, Some(answers));
+    }
+
+    #[test]
+    fn an_empty_message_id_is_no_reference() {
+        assert_eq!(Answers::to_message("").message_id, None);
+        assert_eq!(Answers::to_message(" <> ").message_id, None);
+    }
+
+    #[test]
+    fn an_origin_names_its_message_only_under_the_numbering_it_was_taken_in() {
+        let mut mailbox = MailboxState::default();
+        mailbox.cursor.uid_validity = 7;
+        mailbox.entries.insert(41, crate::model::Flags::default());
+
+        assert!(origin().still_names(&mailbox));
+
+        // Renumbered: UID 41 is now some other message.
+        mailbox.cursor.uid_validity = 8;
+        assert!(!origin().still_names(&mailbox));
+
+        // Same numbering, but the message has gone — moved, or expunged.
+        mailbox.cursor.uid_validity = 7;
+        mailbox.entries.clear();
+        assert!(!origin().still_names(&mailbox));
     }
 }

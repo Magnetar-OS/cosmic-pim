@@ -22,12 +22,14 @@ use cosmic_pim_accounts::{Account, MailEndpoint, MailProtocol, Secret};
 use cosmic_pim_mail::imap::SyncOutcome;
 use cosmic_pim_mail::imap::{Endpoint, Security, Session, SyncOptions};
 use cosmic_pim_mail::maildir::{MaildirStore, mailbox_path};
+use cosmic_pim_mail::outbox::{Answers, DrainOutcome, Sent, Stopped};
 use cosmic_pim_mail::{Credentials, Folder, SmtpEndpoint};
 
 use crate::error::{Error, Result};
 
 /// What happened to one mailbox.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct MailboxReport {
     pub wire_name: String,
     pub display_name: String,
@@ -49,17 +51,51 @@ impl MailboxReport {
     }
 }
 
+/// One message that left the outbox.
+///
+/// What an application settles a send by: the id it queued the message
+/// under, the `Message-ID` the message went out with, and the message it
+/// answered — which is the one to mark `\Answered`, by the two-step
+/// [`Answers`] describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SentMessage {
+    /// Its id in the outbox, where it no longer is.
+    pub id: String,
+    /// The `Message-ID` it went out under, without angle brackets.
+    pub message_id: Option<String>,
+    /// The message it answers, as it was queued with.
+    pub answers: Option<Answers>,
+}
+
+impl From<&Sent> for SentMessage {
+    fn from(sent: &Sent) -> Self {
+        Self {
+            id: sent.id.clone(),
+            message_id: sent.message_id.clone(),
+            answers: sent.answers.clone(),
+        }
+    }
+}
+
 /// What happened to one account's mail.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct MailReport {
     pub mailboxes: Vec<MailboxReport>,
-    /// The outbox ids of the messages that left this pass, in the order they
-    /// went — what an app keyed a queued message's follow-up on (marking the
-    /// message it answers, for one) can settle by. Complete even when a
-    /// mailbox failed after the drain: see [`sync_account_mail`]'s errors.
-    pub sent: Vec<String>,
-    /// Sends the outbox has given up on. These need a person.
-    pub given_up: usize,
+    /// The messages that left this pass, in the order they went — what an
+    /// app keyed a queued message's follow-up on (marking the message it
+    /// answers, for one) can settle by. Complete even when a mailbox failed
+    /// after the drain, and even when the drain itself stopped part-way: see
+    /// [`Self::outbox_error`] and [`sync_account_mail`]'s errors.
+    pub sent: Vec<SentMessage>,
+    /// Sends the outbox stopped retrying this pass, each with why. These
+    /// need a person.
+    pub stopped: Vec<Stopped>,
+    /// Why the outbox was not drained, or was drained only in part: its
+    /// directory could not be opened, or a local write failed part-way. The
+    /// pull still ran, and [`Self::sent`] holds whatever went before it.
+    pub outbox_error: Option<Error>,
 }
 
 impl MailReport {
@@ -73,17 +109,42 @@ impl MailReport {
     pub fn failed(&self) -> usize {
         self.mailboxes.iter().filter(|m| m.outcome.is_err()).count()
     }
+
+    /// Records what a drain did, and hands back what it sent for filing.
+    ///
+    /// A drain that could not start, or stopped early, is recorded rather
+    /// than returned: reading mail still works when sending does not, so the
+    /// pass goes on to the pull, and the caller reads why in
+    /// [`Self::outbox_error`].
+    fn record_drain(&mut self, drained: Result<DrainOutcome>) -> Vec<Sent> {
+        match drained {
+            Ok(outcome) => {
+                self.sent = outcome.sent.iter().map(SentMessage::from).collect();
+                self.stopped = outcome.stopped;
+                self.outbox_error = outcome.error.map(Error::Mail);
+                outcome.sent
+            }
+            Err(why) => {
+                self.outbox_error = Some(why);
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// What [`drain_outbox`] did.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct DrainReport {
-    /// The outbox ids of the messages that went, in the order they went —
-    /// the same ids [`MailReport::sent`] carries.
-    pub sent: Vec<String>,
-    /// Sends the outbox gave up on during this drain. These need a person.
-    pub given_up: usize,
+    /// The messages that went, in the order they went — as
+    /// [`MailReport::sent`] carries them.
+    pub sent: Vec<SentMessage>,
+    /// Sends the outbox stopped retrying during this drain, each with why.
+    /// These need a person.
+    pub stopped: Vec<Stopped>,
+    /// The local failure that ended the drain early, if one did. Whatever
+    /// went before it is in [`Self::sent`].
+    pub error: Option<Error>,
 }
 
 /// Sends what is due in one account's outbox, and does nothing else.
@@ -103,9 +164,12 @@ pub struct DrainReport {
 ///
 /// # Errors
 ///
-/// When the outbox cannot be read or written, or a Gmail or Graph session
-/// cannot be set up (a password where an OAuth token is needed). A message
-/// that fails to send is not an error: it stays queued, with its reason.
+/// Only from a step before anything is sent: the outbox directory cannot be
+/// opened, or a Gmail or Graph session cannot be set up (a password where an
+/// OAuth token is needed). So an error means nothing went. A local failure
+/// once the drain is under way is [`DrainReport::error`], beside the
+/// messages that had already gone. A message that fails to send is neither:
+/// it stays queued, with its reason on its record.
 pub fn drain_outbox(
     account: &Account,
     credentials: &Credentials,
@@ -119,11 +183,11 @@ pub fn drain_outbox(
     let drained = match mail.protocol {
         MailProtocol::Imap => {
             let drained = send_over_smtp(account, mail, credentials, mail_root, now_ms)?;
-            if !drained.accepted.is_empty() {
+            if !drained.sent.is_empty() {
                 let filed = Session::connect(&imap_endpoint(account, mail), credentials).and_then(
                     |mut session| {
                         let folders = session.folders()?;
-                        file_over_imap(account, &mut session, &folders, &drained.accepted);
+                        file_over_imap(account, &mut session, &folders, &drained.sent);
                         if let Err(why) = session.logout() {
                             tracing::debug!(account = account.display_name, %why, "IMAP logout failed");
                         }
@@ -141,7 +205,7 @@ pub fn drain_outbox(
         }
         MailProtocol::Jmap => {
             let drained = send_over_smtp(account, mail, credentials, mail_root, now_ms)?;
-            if !drained.accepted.is_empty() {
+            if !drained.sent.is_empty() {
                 let filed = mail
                     .jmap_session_url
                     .as_deref()
@@ -160,7 +224,7 @@ pub fn drain_outbox(
                     })
                     .and_then(|session| {
                         let mailboxes = session.mailboxes()?;
-                        file_over_jmap(account, &session, &mailboxes, &drained.accepted);
+                        file_over_jmap(account, &session, &mailboxes, &drained.sent);
                         Ok(())
                     });
                 if let Err(why) = filed {
@@ -186,8 +250,9 @@ pub fn drain_outbox(
     };
 
     Ok(DrainReport {
-        sent: drained.ids(),
-        given_up: drained.given_up,
+        sent: drained.sent.iter().map(SentMessage::from).collect(),
+        stopped: drained.stopped,
+        error: drained.error.map(Error::Mail),
     })
 }
 
@@ -301,18 +366,14 @@ fn sync_over_imap(
 
     // The outbox before the pull. Sends are the user's own words waiting to
     // leave; a pass that fetches first leaves them queued for another cycle.
-    match send_over_smtp(account, mail, credentials, mail_root, now_ms) {
-        Ok(drained) => {
-            file_over_imap(account, &mut session, &folders, &drained.accepted);
-            report.sent = drained.ids();
-            report.given_up = drained.given_up;
-        }
-        Err(why) => {
-            // A submission server being down must not stop the pull: reading
-            // mail still works when sending does not.
-            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
-        }
-    }
+    let accepted = report.record_drain(send_over_smtp(
+        account,
+        mail,
+        credentials,
+        mail_root,
+        now_ms,
+    ));
+    file_over_imap(account, &mut session, &folders, &accepted);
 
     for folder in folders {
         if folder.no_select {
@@ -343,32 +404,21 @@ fn sync_over_imap(
 /// The API engines send through here — Gmail's `messages.send`, Graph's
 /// `sendMail` — and both file their own Sent copy server-side, so unlike the
 /// SMTP path there is nothing to append afterwards. The accepted copies come
-/// back for the one caller (JMAP) whose server does not file for it.
-struct Drained {
-    given_up: usize,
-    /// `(queue id, accepted bytes)`, in the order they went.
-    accepted: Vec<(String, Vec<u8>)>,
-}
-
-impl Drained {
-    /// The queue ids that went, in order.
-    fn ids(&self) -> Vec<String> {
-        self.accepted.iter().map(|(id, _)| id.clone()).collect()
-    }
-}
-
+/// back in the outcome for the callers (IMAP, JMAP) whose server does not
+/// file for them.
+///
+/// # Errors
+///
+/// When the outbox directory cannot be opened, which is before anything is
+/// sent. Everything after that is in the outcome.
 fn drain_outbox_with(
     account: &Account,
     mail_root: &Path,
     now_ms: i64,
     submit: impl FnMut(&cosmic_pim_mail::Draft) -> cosmic_pim_mail::Outcome,
-) -> Result<Drained> {
+) -> Result<DrainOutcome> {
     let outbox = cosmic_pim_mail::Outbox::open(mail_root.join(&account.id)).map_err(Error::Mail)?;
-    let outcome = outbox.drain_with(submit, now_ms).map_err(Error::Mail)?;
-    Ok(Drained {
-        given_up: outcome.given_up,
-        accepted: outcome.sent,
-    })
+    Ok(outbox.drain_with(submit, now_ms))
 }
 
 /// How much of a Gmail label one bootstrap brings down.
@@ -397,17 +447,9 @@ fn sync_over_gmail(
 
     // The outbox before the pull, as everywhere else. Gmail files its own
     // Sent copy, so the accepted bytes are dropped rather than appended.
-    match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
-        Ok(drained) => {
-            report.sent = drained.accepted.into_iter().map(|(id, _)| id).collect();
-            report.given_up = drained.given_up;
-        }
-        Err(why) => {
-            // Submission being down must not stop the pull: reading mail
-            // still works when sending does not.
-            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
-        }
-    }
+    report.record_drain(drain_outbox_with(account, mail_root, now_ms, |draft| {
+        session.submit(draft)
+    }));
 
     for folder in gmail::folders() {
         let slug = folder.wire_name.clone();
@@ -478,15 +520,9 @@ fn sync_graph_session(
     // The outbox before the pull. `sendMail` is the path that still works
     // when a tenant has SMTP AUTH switched off, and Exchange files its own
     // Sent copy (`saveToSentItems` defaults true).
-    match drain_outbox_with(account, mail_root, now_ms, |draft| session.submit(draft)) {
-        Ok(drained) => {
-            report.sent = drained.accepted.into_iter().map(|(id, _)| id).collect();
-            report.given_up = drained.given_up;
-        }
-        Err(why) => {
-            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
-        }
-    }
+    report.record_drain(drain_outbox_with(account, mail_root, now_ms, |draft| {
+        session.submit(draft)
+    }));
 
     for remote in folders {
         let folder = graph::folder_for(&remote);
@@ -550,16 +586,14 @@ fn sync_over_jmap(
     // bytes as a blob, then Email/import them into the mailbox whose role is
     // `sent`. Filing failures warn rather than fail: the message is already
     // delivered, and a retry that re-sends it is the one wrong answer.
-    match send_over_smtp(account, mail, credentials, mail_root, now_ms) {
-        Ok(drained) => {
-            file_over_jmap(account, &session, &mailboxes, &drained.accepted);
-            report.sent = drained.ids();
-            report.given_up = drained.given_up;
-        }
-        Err(why) => {
-            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
-        }
-    }
+    let accepted = report.record_drain(send_over_smtp(
+        account,
+        mail,
+        credentials,
+        mail_root,
+        now_ms,
+    ));
+    file_over_jmap(account, &session, &mailboxes, &accepted);
 
     for mailbox in mailboxes {
         // JMAP has no wire/display distinction — a mailbox name is a name —
@@ -656,13 +690,14 @@ fn sync_over_pop3(
     // leaving. This pass once had no drain, so a send queued on a POP3
     // account — a failed attempt, Send later, Undo's grace — never went.
     // POP3 has no Sent folder to file the copy into.
-    let (sent, given_up) = match send_over_smtp(account, mail, credentials, mail_root, now_ms) {
-        Ok(drained) => (drained.ids(), drained.given_up),
-        Err(why) => {
-            tracing::warn!(account = account.display_name, %why, "could not drain the outbox");
-            (Vec::new(), 0)
-        }
-    };
+    let mut report = MailReport::default();
+    report.record_drain(send_over_smtp(
+        account,
+        mail,
+        credentials,
+        mail_root,
+        now_ms,
+    ));
 
     // A POP3 server that cannot be reached is this inbox failing, and is
     // reported as such rather than returned: an error here would take the ids
@@ -703,16 +738,13 @@ fn sync_over_pop3(
             outcome
         });
 
-    MailReport {
-        mailboxes: vec![MailboxReport {
-            wire_name: folder.wire_name,
-            display_name: folder.display_name,
-            folder: None,
-            outcome,
-        }],
-        sent,
-        given_up,
-    }
+    report.mailboxes.push(MailboxReport {
+        wire_name: folder.wire_name,
+        display_name: folder.display_name,
+        folder: None,
+        outcome,
+    });
+    report
 }
 
 /// Saves an id-keyed engine's sidecar after a pass, whether or not the pass
@@ -776,7 +808,7 @@ fn send_over_smtp(
     credentials: &Credentials,
     mail_root: &Path,
     now_ms: i64,
-) -> Result<Drained> {
+) -> Result<DrainOutcome> {
     let endpoint = smtp_endpoint(account, mail);
     drain_outbox_with(account, mail_root, now_ms, |draft| {
         cosmic_pim_mail::smtp::send(&endpoint, credentials, draft)
@@ -788,12 +820,7 @@ fn send_over_smtp(
 /// Filing is what makes a sent message visible on the user's phone. It is
 /// deliberately *not* fatal: the message has already been delivered, and
 /// failing the pass over the copy would invite a retry that sends it twice.
-fn file_over_imap(
-    account: &Account,
-    session: &mut Session,
-    folders: &[Folder],
-    accepted: &[(String, Vec<u8>)],
-) {
+fn file_over_imap(account: &Account, session: &mut Session, folders: &[Folder], accepted: &[Sent]) {
     // Filed as read: the sender wrote it, so presenting it as unread mail on
     // their phone would be noise.
     let flags = cosmic_pim_mail::Flags {
@@ -801,19 +828,19 @@ fn file_over_imap(
         ..Default::default()
     };
     let sent = sent_mailbox(folders);
-    for (id, filed) in accepted {
+    for message in accepted {
         match sent {
             Some(mailbox) => {
-                if let Err(why) = session.append(mailbox, filed, flags) {
+                if let Err(why) = session.append(mailbox, &message.bytes, flags) {
                     tracing::warn!(
-                        account = account.display_name, message = id, %why,
+                        account = account.display_name, message = message.id, %why,
                         "a message was sent but could not be filed to Sent"
                     );
                 }
             }
             None => tracing::warn!(
                 account = account.display_name,
-                message = id,
+                message = message.id,
                 "a message was sent, but the server has no Sent folder to file it in"
             ),
         }
@@ -827,13 +854,13 @@ fn file_over_jmap(
     account: &Account,
     session: &cosmic_pim_mail::jmap::Session,
     mailboxes: &[cosmic_pim_mail::jmap::JmapMailbox],
-    accepted: &[(String, Vec<u8>)],
+    accepted: &[Sent],
 ) {
     let sent_mailbox = mailboxes
         .iter()
         .find(|m| m.role.as_deref() == Some("sent"))
         .map(|m| m.id.clone());
-    for (id, bytes) in accepted {
+    for message in accepted {
         let Some(sent_id) = sent_mailbox.as_deref() else {
             tracing::warn!(
                 account = account.display_name,
@@ -842,11 +869,11 @@ fn file_over_jmap(
             break;
         };
         let outcome = session
-            .upload(bytes)
+            .upload(&message.bytes)
             .and_then(|blob_id| session.import(&blob_id, sent_id));
         if let Err(why) = outcome {
             tracing::warn!(
-                account = account.display_name, message = id, %why,
+                account = account.display_name, message = message.id, %why,
                 "a message was sent but could not be filed to Sent"
             );
         }
@@ -927,6 +954,7 @@ mod tests {
             .queue(
                 "0000000000000001",
                 &draft,
+                None,
                 &Outcome::NotSent(cosmic_pim_mail::Error::Imap("offline".into())),
                 0,
             )
@@ -940,7 +968,7 @@ mod tests {
         .expect("drain");
 
         assert_eq!(
-            drained.accepted.len(),
+            drained.sent.len(),
             1,
             "the drain did not see the message the app queued"
         );
@@ -962,7 +990,13 @@ mod tests {
         mail.smtp_transport = Transport::Plaintext;
     }
 
-    /// Queues one message, due now, the way the app does.
+    /// The message `queue_one`'s reply answers.
+    fn answered() -> Answers {
+        Answers::to_message("<original@example.net>")
+    }
+
+    /// Queues one message, due now, the way the app does: a reply, with the
+    /// message it answers.
     fn queue_one(account: &Account, root: &Path) -> cosmic_pim_mail::Outbox {
         use cosmic_pim_mail::compose::Draft;
         use cosmic_pim_mail::model::Mailbox;
@@ -976,7 +1010,9 @@ mod tests {
         });
         draft.subject = "waiting".into();
         let outbox = cosmic_pim_mail::Outbox::open(root.join(&account.id)).unwrap();
-        outbox.submit("0000000000000001", &draft, 0).unwrap();
+        outbox
+            .submit("0000000000000001", &draft, Some(answered()), 0)
+            .unwrap();
         outbox
     }
 
@@ -999,12 +1035,23 @@ mod tests {
 
         let queued = &outbox.list().unwrap()[0];
         assert_eq!(queued.attempts, 1, "the queued message was never attempted");
-        assert!(queued.last_error.is_some());
+        assert!(
+            queued
+                .failure
+                .as_ref()
+                .is_some_and(cosmic_pim_mail::SendFailure::is_transient)
+        );
     }
 
     /// A submission server on this machine that accepts every message.
     /// Returns its port.
     fn accepting_smtp() -> u16 {
+        accepting_smtp_then(|| {})
+    }
+
+    /// As [`accepting_smtp`], running `accepted` once the server has the
+    /// whole message and before it says so.
+    fn accepting_smtp_then(accepted: impl Fn() + Send + 'static) -> u16 {
         use std::io::{BufRead as _, BufReader, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1025,6 +1072,7 @@ mod tests {
                         continue;
                     }
                     in_data = false;
+                    accepted();
                     "250 2.0.0 queued"
                 } else if command.starts_with("EHLO") {
                     // AUTH PLAIN, which the client may use without TLS.
@@ -1066,7 +1114,16 @@ mod tests {
         )
         .expect("a pass that sent something must report it");
 
-        assert_eq!(report.sent, ["0000000000000001"]);
+        assert_eq!(
+            report.sent,
+            [SentMessage {
+                id: "0000000000000001".into(),
+                message_id: Some("0000000000000001@example.com".into()),
+                answers: Some(answered()),
+            }],
+            "the report names what went, and what it answered"
+        );
+        assert!(report.outbox_error.is_none(), "{:?}", report.outbox_error);
         assert_eq!(outbox.count(), 0, "the message did not go");
         assert_eq!(report.failed(), 1, "the unreachable inbox went unreported");
         assert_eq!(report.mailboxes[0].wire_name, "INBOX");
@@ -1160,12 +1217,13 @@ mod tests {
         let password = Credentials::Password("pw".into());
 
         let nothing = drain_outbox(&account, &password, dir.path(), 1_000).unwrap();
-        assert!(nothing.sent.is_empty() && nothing.given_up == 0);
+        assert!(nothing.sent.is_empty() && nothing.stopped.is_empty());
+        assert!(nothing.error.is_none());
 
         let outbox = queue_one(&account, dir.path());
         let report = drain_outbox(&account, &password, dir.path(), 1_000).unwrap();
         assert!(report.sent.is_empty());
-        assert_eq!(report.given_up, 0);
+        assert_eq!(report.stopped, []);
         let queued = &outbox.list().unwrap()[0];
         assert_eq!(queued.attempts, 1, "the due message was not attempted");
         assert!(queued.is_live(), "a refused connection gave the message up");
@@ -1196,6 +1254,78 @@ mod tests {
                 .sent
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_drain_stopped_by_a_local_failure_still_reports_what_it_sent() {
+        // SMTP takes the message; by the time it says so, the outbox
+        // directory no longer accepts changes, so the claim cannot be
+        // removed. `drain_outbox` returned that as `Err`, and the id of a
+        // delivered message went with it.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut account = account_with_mail();
+        refusing(&mut account, MailProtocol::Pop3);
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = queue_one(&account, dir.path());
+        let outbox_dir = dir.path().join(&account.id).join(".outbox");
+        let read_only = outbox_dir.clone();
+        account.mail.as_mut().unwrap().smtp_port = accepting_smtp_then(move || {
+            std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o555)).unwrap();
+        });
+
+        let report = drain_outbox(
+            &account,
+            &Credentials::Password("pw".into()),
+            dir.path(),
+            1_000,
+        );
+        std::fs::set_permissions(&outbox_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = report.expect("a local failure is in the report, not in its place");
+        assert!(report.error.is_some(), "the local failure went unreported");
+        assert_eq!(
+            report.sent.iter().map(|sent| &*sent.id).collect::<Vec<_>>(),
+            ["0000000000000001"]
+        );
+        assert_eq!(report.sent[0].answers, Some(answered()));
+
+        // The record it could not remove is settled by the next drain as
+        // possibly delivered, and is not sent again.
+        let again = drain_outbox(
+            &account,
+            &Credentials::Password("pw".into()),
+            dir.path(),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(again.sent, []);
+        assert_eq!(again.stopped.len(), 1);
+        assert!(again.stopped[0].failure.may_have_been_delivered());
+        assert!(outbox.list().unwrap()[0].given_up);
+    }
+
+    #[test]
+    fn a_sync_pass_reports_an_outbox_it_could_not_open() {
+        // It was logged and dropped: the pull ran, and nothing told the
+        // caller that the account's queued mail had not been looked at.
+        let mut account = account_with_mail();
+        refusing(&mut account, MailProtocol::Pop3);
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the account's directory would be.
+        std::fs::write(dir.path().join(&account.id), b"in the way").unwrap();
+
+        let report = sync_account_mail(
+            &account,
+            &Credentials::Password("pw".into()),
+            dir.path(),
+            SyncOptions::default(),
+            1_000,
+        )
+        .expect("the pull still runs");
+
+        assert!(report.outbox_error.is_some());
+        assert_eq!(report.sent, []);
     }
 
     #[test]
