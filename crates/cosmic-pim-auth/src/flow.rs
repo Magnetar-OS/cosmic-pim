@@ -39,7 +39,7 @@ use cosmic_pim_accounts::{OAuthCredential, provider::OAuth};
 
 use crate::error::{Error, Result};
 use crate::pkce::{Pkce, random_state};
-use crate::token::{self, TokenRequest};
+use crate::token::{self, Identity, TokenRequest};
 
 /// How long to wait for the user to finish signing in before giving up.
 ///
@@ -293,8 +293,15 @@ impl Pending {
         Ok(Some(code.clone()))
     }
 
-    /// Redeems the code for a grant.
-    pub fn exchange(&self, code: &str, provider: &OAuth) -> Result<OAuthCredential> {
+    /// Redeems the code for a grant, and for who it belongs to.
+    ///
+    /// # Errors
+    ///
+    /// As the token endpoint answered; [`Error::Protocol`] when it sent an ID
+    /// token that fails the checks on [`Identity`] — one issued to another
+    /// application, expired, or not a token at all; and
+    /// [`Error::NoRefreshToken`] when the grant could not be renewed.
+    pub fn exchange(&self, code: &str, provider: &OAuth) -> Result<Grant> {
         let mut form = vec![
             ("grant_type", "authorization_code".to_owned()),
             ("code", code.to_owned()),
@@ -307,7 +314,11 @@ impl Pending {
         }
 
         let response = token::post(&provider.token_url, &form)?;
-        let credential = response.into_credential(Utc::now());
+        let now = Utc::now();
+        // Before the grant is accepted: an ID token that must not be believed
+        // stops the sign-in rather than leaving a grant labelled by guesswork.
+        let identity = response.identity(provider.client_id.as_deref().unwrap_or_default(), now)?;
+        let credential = response.into_credential(now);
 
         if !credential.is_renewable() {
             // Worth refusing rather than storing: the account would work for an
@@ -317,8 +328,22 @@ impl Pending {
             return Err(Error::NoRefreshToken);
         }
 
-        Ok(credential)
+        Ok(Grant {
+            credential,
+            identity,
+        })
     }
+}
+
+/// What a completed sign-in produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    /// What to store, and what every later renewal starts from.
+    pub credential: OAuthCredential,
+    /// Who signed in — the address to create the account under. Absent when
+    /// the provider sent no ID token, which means `openid` was not among the
+    /// manifest's scopes; the caller then has to ask.
+    pub identity: Option<Identity>,
 }
 
 /// Exchanges a refresh token for a fresh grant.
@@ -601,6 +626,88 @@ mod tests {
         std::thread::spawn(move || redirect(port, &format!("code=abc123&state={state}")));
 
         assert_eq!(pending.wait().expect("wait"), "abc123");
+    }
+
+    /// A token endpoint that answers one request with `body`, on a port of
+    /// its own.
+    fn token_endpoint(body: String) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("token endpoint");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        std::thread::spawn(move || {
+            if let Ok(request) = server.recv() {
+                let header = "Content-Type: application/json"
+                    .parse::<tiny_http::Header>()
+                    .expect("header");
+                let _ = request.respond(tiny_http::Response::from_string(body).with_header(header));
+            }
+        });
+        format!("http://127.0.0.1:{port}/token")
+    }
+
+    /// A token response whose ID token carries `claims`, good for an hour.
+    fn response_naming(audience: &str, claims: &str) -> String {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"aud":"{audience}","exp":{},{claims}}}"#,
+            Utc::now().timestamp() + 3600
+        ));
+        format!(
+            r#"{{"access_token":"at","refresh_token":"rt","expires_in":3600,"id_token":"e30.{payload}.sig"}}"#
+        )
+    }
+
+    #[test]
+    fn the_exchange_says_who_signed_in() {
+        let provider = OAuth {
+            token_url: token_endpoint(response_naming(
+                "client-123",
+                r#""email":"ada@gmail.com","name":"Ada""#,
+            )),
+            ..provider(free_port())
+        };
+        let pending = begin(&provider).expect("begin");
+
+        let grant = pending.exchange("the-code", &provider).expect("exchange");
+
+        assert_eq!(grant.credential.access_token, "at");
+        let identity = grant.identity.expect("the ID token names the user");
+        assert_eq!(identity.email, "ada@gmail.com");
+        assert_eq!(identity.name.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn an_exchange_whose_id_token_is_for_another_application_fails() {
+        // The grant came back too, and it is thrown away with the token: an
+        // account stored from here would be labelled with the typed address,
+        // which is the guess this exists to replace.
+        let provider = OAuth {
+            token_url: token_endpoint(response_naming(
+                "some-other-client",
+                r#""email":"ada@gmail.com""#,
+            )),
+            ..provider(free_port())
+        };
+        let pending = begin(&provider).expect("begin");
+
+        let error = pending.exchange("the-code", &provider).unwrap_err();
+
+        assert!(matches!(error, Error::Protocol(_)), "got {error}");
+    }
+
+    #[test]
+    fn an_exchange_with_no_id_token_still_yields_the_grant() {
+        // A provider whose manifest does not ask for `openid` sends none. The
+        // grant is good; the caller asks for the address instead.
+        let provider = OAuth {
+            token_url: token_endpoint(r#"{"access_token":"at","refresh_token":"rt"}"#.to_owned()),
+            ..provider(free_port())
+        };
+        let pending = begin(&provider).expect("begin");
+
+        let grant = pending.exchange("the-code", &provider).expect("exchange");
+
+        assert!(grant.credential.is_renewable());
+        assert_eq!(grant.identity, None);
     }
 
     #[test]

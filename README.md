@@ -59,8 +59,10 @@ let oauth = provider.oauth.as_ref().expect("this provider uses OAuth");
 let pending = cosmic_pim_auth::begin(oauth)?;
 open_in_the_users_browser(pending.authorize_url());
 
-let credential = pending.exchange(&pending.wait()?, oauth)?;
-accounts.add_oauth(provider.account_for(&address), &provider.id, &credential)?;
+let grant = pending.exchange(&pending.wait()?, oauth)?;
+// The grant says whose it is, so nobody typed an address first.
+let address = grant.identity.expect("the manifest asks for `openid`").email;
+accounts.add_oauth(provider.account_for(&address), &provider.id, &grant.credential)?;
 ```
 
 From there nothing distinguishes the two. `cosmic_pim_auth::resolve` hands back

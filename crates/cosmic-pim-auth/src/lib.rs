@@ -36,7 +36,7 @@
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use cosmic_pim_accounts::{Account, AccountStore, Registry};
+//! use cosmic_pim_accounts::{AccountStore, Registry};
 //!
 //! let registry = Registry::load();
 //! let provider = registry.get("google").expect("built in");
@@ -47,11 +47,13 @@
 //! open_in_browser(pending.authorize_url());
 //!
 //! let code = pending.wait()?;
-//! let credential = pending.exchange(&code, oauth)?;
+//! let grant = pending.exchange(&code, oauth)?;
 //!
+//! // The grant says whose it is, so nobody had to type an address first.
+//! let identity = grant.identity.expect("the manifest asks for `openid`");
 //! let mut accounts = AccountStore::open_default()?;
-//! let account = Account::new("Google", "", "ada@gmail.com");
-//! accounts.add_oauth(account, &provider.id, &credential)?;
+//! let account = provider.account_for(&identity.email);
+//! accounts.add_oauth(account, &provider.id, &grant.credential)?;
 //! # fn open_in_browser(_: &str) {}
 //! # Ok(())
 //! # }
@@ -65,9 +67,9 @@ pub mod token;
 use cosmic_pim_accounts::{AccountStore, AuthMethod, Registry, Secret};
 
 pub use error::{Error, Result};
-pub use flow::{Pending, begin, refresh};
+pub use flow::{Grant, Pending, begin, refresh};
 pub use pkce::Pkce;
-pub use token::TokenResponse;
+pub use token::{Identity, TokenResponse};
 
 /// The secret to put on the wire for this account, right now.
 ///

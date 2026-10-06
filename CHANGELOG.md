@@ -22,6 +22,12 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   open.
 - Built-in providers for Yahoo, AOL, Proton Mail (through Proton Mail Bridge),
   mailbox.org, Posteo and GMX, beside Google, Microsoft, Fastmail and iCloud.
+- `cosmic_pim_auth::Identity`, read from the ID token that comes with a
+  sign-in: the address and name of whoever signed in, so a sign-in needs no
+  typed address. The token is taken only from the token endpoint's own TLS
+  response, and only when it was issued to this client id, has not expired,
+  and names an address the provider does not mark unverified.
+  `TokenResponse::id_token` is new, and is redacted in `{:?}`.
 - `cosmic_pim_mail::imap::is_loopback`.
 - `Provider::app_password` and `Provider::app_password_account`: the password
   route of a provider whose own route is the browser. Google's manifest has
@@ -42,6 +48,15 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `Provider::account_for` leaves the account's `url` empty; the sync engine
   finds calendars and contacts from the provider's manifest by the account's
   provider id.
+- `Pending::exchange` returns `Grant { credential, identity }` in place of the
+  bare `OAuthCredential`. Read `grant.credential` for what it returned before.
+  It fails when the provider sends an ID token that must not be relied on.
+- A token endpoint must be `https`. Plain `http` is taken only for a loopback
+  address written as a literal. The authorization code, the client secret and
+  every refresh token are posted there, and a manifest with a mistyped scheme
+  sent them in the clear.
+- A redirect from a token endpoint is not followed; following one repeated
+  the same form to a host the manifest never named.
 - IMAP, SMTP and POP3 connections to a host written as a loopback address
   (`127.0.0.1`, `::1`) no longer verify the server's certificate, so Proton
   Mail Bridge and other local servers work over STARTTLS and TLS. Every other
