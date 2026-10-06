@@ -13,7 +13,7 @@ on so that a sync bug is fixed once rather than three times.
 | [slate](https://github.com/Magnetar-OS/slate) | **Slate** | Calendar and tasks | Working — CalDAV sync in-app and in a background daemon, reminders, panel applet, launcher plugin |
 | [circle](https://github.com/Magnetar-OS/circle) | **Circle** | Contacts | Working — create and edit with photos and groups, CardDAV sync, GNOME Contacts parity closed |
 | [envelope](https://github.com/Magnetar-OS/envelope) | **Envelope** | Mail | Working — reads, threads and syncs over IMAP; composes and sends over SMTP with a durable outbox, drafts and attachments |
-| **cosmic-pim** | — | This substrate | 1276 tests |
+| **cosmic-pim** | — | This substrate | 1372 tests |
 
 Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 *Envelope* is the universal mail symbol as a word.
@@ -22,12 +22,12 @@ Names: *Slate* holds what's on your slate; *Circle* is your circle of people;
 
 | Crate | What it is |
 |---|---|
-| `cosmic-pim-core` | The model (events, tasks, contacts), the one iCalendar/vCard parser the suite shares, vdir storage, a SQLite index for calendar range queries, filesystem watching, and a crash-safe writer |
+| `cosmic-pim-core` | The model (events, tasks, contacts), the one iCalendar/vCard parser the suite shares, vdir storage, a SQLite index for calendar range queries, filesystem watching, a crash-safe writer, and recipient completion from the address book |
 | `cosmic-pim-caldav` | CalDAV **and** CardDAV — protocol, reconciliation, durable writeback queue, and a store trait implemented over the vdir |
 | `cosmic-pim-accounts` | Accounts and credentials: the OS keychain with an encrypted local fallback, and the provider manifests that say where a named service lives |
-| `cosmic-pim-auth` | OAuth 2.0 sign-in and token renewal — the only crate here that talks to a provider's login endpoint |
+| `cosmic-pim-auth` | OAuth 2.0 sign-in and token renewal — the only crate here that talks to a provider's login endpoint — and GNOME Online Accounts as a second source of sign-ins |
 | `cosmic-pim-mail` | Mail — the message model over verbatim RFC 5322 bytes, a maildir store, JWZ threading, HTML-to-visible-text extraction, and five engines (IMAP, JMAP, POP3, the Gmail API, Microsoft Graph) with durable writeback |
-| `cosmic-pim-sync` | The layer that joins `core`, `caldav`, and `accounts` — provisioning, one sync pass per account over calendars and address books, and the conflicts a pass could not resolve alone |
+| `cosmic-pim-sync` | The layer that joins `core`, `caldav`, and `accounts` — provisioning, one sync pass per account over calendars and address books, the conflicts a pass could not resolve alone, and `setup`: from a typed address to a stored, working account |
 
 Dependencies point downward only. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
 diagram, the invariants, and where new code belongs.
@@ -69,6 +69,36 @@ From there nothing distinguishes the two. `cosmic_pim_auth::resolve` hands back
 the secret of the moment — a password, or an access token it renewed and
 re-stored on the way — and the CalDAV client sends `Basic` or `Bearer`, the
 IMAP session `LOGIN` or `AUTHENTICATE XOAUTH2`, without knowing which.
+
+**Who signed in is read from the provider, not from a form.** The identity
+comes from the ID token in the token endpoint's own response, and is believed
+only when the endpoint is `https`, the token was issued to this application's
+client id, it has not expired, and the provider does not mark the address
+unverified. A token that fails one of those stops the sign-in.
+
+**An add-account window does not have to assemble any of this.**
+`cosmic_pim_sync::setup` takes a typed address and answers, with no network,
+which provider it belongs to and every way of signing in that can work on this
+installation, best first — the provider's own sign-in where a client id is
+configured, GNOME Online Accounts where it is running, a password otherwise.
+Then one call finishes the job and stores the account for every application
+in the suite:
+
+```rust
+use cosmic_pim_sync::setup::{self, Route};
+
+let plan = setup::plan(&registry, "ada@fastmail.com", online_accounts_running)
+    .expect("an address");
+let id = match plan.routes.first() {
+    // Finds the servers, tries the password, stores only what was accepted.
+    Some(Route::Password { .. }) => {
+        setup::add_with_password(&mut accounts, &registry, &plan, "Ada", &password)?
+    }
+    // The browser flow; the account is named after whoever signed in.
+    Some(Route::SignIn) => setup::sign_in(&mut accounts, &plan, open_in_the_users_browser)?,
+    _ => return Ok(()), // Online Accounts, or no way in on this installation
+};
+```
 
 **Providers are data.** Google, Microsoft, Fastmail, iCloud, Yahoo, AOL,
 Proton Mail (through Proton Mail Bridge), mailbox.org, Posteo and GMX ship
@@ -119,6 +149,24 @@ cosmic-pim-sync = "3"
 ```
 
 `CHANGELOG.md` lists every public API change, with what to call instead.
+
+## Sending
+
+A message that could not be sent waits in the account's outbox
+(`cosmic_pim_mail::Outbox`) and leaves on a later pass. Three things about it
+are deliberate:
+
+- **A drain reports what it did even when it stops early.** `drain` returns a
+  `DrainOutcome`, not a `Result`: a local failure part-way is a field beside
+  the messages already sent, so their ids cannot be lost with an error.
+- **Why a message stopped is a type.** `Queued::failure` is a `SendFailure` —
+  refused by the server (with its reason), possibly delivered, or simply not
+  reached — stored on the record, so an application words each case itself.
+  A send that may have been delivered is never retried automatically.
+- **A reply remembers what it answers.** `Answers` rides on the queued record
+  and comes back with the entry a drain reports sent: the `Message-ID`, which
+  survives a renumbering, and the mailbox and UID, which are exact while the
+  numbering stands. `Index::locate` turns the id back into a place.
 
 ## What you get for free
 

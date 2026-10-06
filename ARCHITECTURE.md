@@ -82,7 +82,9 @@ in one place and all three apps get it.
 | iTIP | `caldav::itip` | RFC 5546: what an invitation means, applied to a vdir. Shared by Slate and Envelope; RFC 6638 scheduling will use it, not replace it. |
 | Server quirks | `caldav::quirks` | The ledger of what each server does differently, each fact naming its defence. Populated from CI and field reports, never from documentation. |
 | RFC 5322 messages | `mail::model` | Extract-only. Nothing ever writes a message back through the parser. |
-| Signing in | `auth` | OAuth 2.0 with PKCE, a loopback redirect, and renewal. One flow for every provider. |
+| Signing in | `auth` | OAuth 2.0 with PKCE, a loopback redirect, and renewal. One flow for every provider; who signed in is read from the ID token. GNOME Online Accounts is a second source of tokens (`auth::online_accounts`). |
+| Adding an account | `sync::setup` | From a typed address to a stored account: provider, routes best first, the sign-in, and a password tried before it is stored. Below the window, so every app's window is the same logic. |
+| Completing people | `core::recipients` | A name or address completed from the address book. One matcher for a composer's recipients and an event's attendees. |
 | Where a service lives | `accounts::provider` | Manifests, not a match arm. A new provider is a file. |
 | Messages on disk | `mail::maildir` | A maildir per mailbox: `mbsync`, `mu`, and `notmuch` read the same files. |
 | IMAP | `mail::imap` | Session, cycle, durable writeback, and `watch` over IDLE. |
@@ -805,7 +807,7 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 ## Testing
 
-1276 tests in the substrate at 2.2.0, `cargo test --workspace`, and two ignored
+1372 tests in the substrate at 3.0.0, `cargo test --workspace`, and two ignored
 unless asked for: the performance baseline and the live CalDAV server test.
 
 `caldav/tests/live_server.rs` is the odd one out: it scripts nothing. Gated on
@@ -829,6 +831,14 @@ scripts an IMAP server, `live_pop3.rs` a POP3 one — asserting dot-unstuffing
 through to the bytes on disk, and that `RETR` precedes `DELE` — and
 `live_jmap.rs` a JMAP one, asserting that the message stored is the one the
 download endpoint served rather than anything reassembled from `Email/get`.
+
+Two more need something on the machine, and say so by failing rather than by
+being skipped. `mail/tests/loopback_tls.rs` generates a self-signed certificate
+per run and serves IMAP and SMTP behind STARTTLS on `127.0.0.1`, for the one
+exemption from certificate verification — and asserts the same certificate
+under `localhost` is still refused. The Online Accounts tests in `auth` start a
+`dbus-daemon` of their own with a stand-in for the GOA daemon on it; they never
+touch the session bus, and CI installs `dbus-daemon` for them.
 
 `mail/tests/live_sync.rs` is its counterpart: a scripted IMAP server on a real
 socket, driving the real client into a real maildir. It exists for the same

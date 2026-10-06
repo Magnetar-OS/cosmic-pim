@@ -7,8 +7,14 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-The next release is 3.0.0: `Pending::exchange` returns a different type and
-`Provider` gained public fields. Consumers move from `"2"` to `"3"`.
+## [3.0.0] - 2026-10-06
+
+A major version. It lands the account-onboarding work — providers a
+distribution can configure, sign-in that knows who signed in, GNOME Online
+Accounts, and `sync::setup` — and takes the three outbox changes that could
+not be made in 2.x because the types they touch were exhaustive. Consumers
+move from `"2"` to `"3"`; the per-application steps are in
+`meta/audits/2026-09-28/cosmic-pim-3.0-migration.md` in the suite's notes.
 
 ### Breaking
 
@@ -30,7 +36,8 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   it survives a restart. `Queued::may_have_been_delivered` answers the one
   question to settle before sending again. Records written by 2.x are still
   read: one being retried as `Transient`, one that had stopped as
-  `Uncertain`, since its sentence cannot say which it was.
+  `Uncertain`, since its sentence cannot say which it was. `Outbox::retry`
+  clears the failure with the attempt count.
 - **A queued reply carries what it answers.** `Outbox::queue`, `submit` and
   `schedule` take an `Option<Answers>`: the answered message's `Message-ID`,
   and where it was (`Origin`: mailbox, UID, UIDVALIDITY). `Outbox::cancel`
@@ -42,21 +49,29 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   `Vec<(String, Vec<u8>)>`. `MailReport::sent` and `DrainReport::sent` are
   `Vec<SentMessage>` (`id`, `message_id`, `answers`) in place of
   `Vec<String>`. `given_up: usize` is replaced by `stopped: Vec<Stopped>`
-  (`id`, `failure`) on all three. `MailReport::outbox_error` says when a
-  pass could not drain the outbox, or drained only part of it; that was
-  logged and dropped.
-- `Queued`, `DrainOutcome`, `MailReport` and `MailboxReport` are
-  `#[non_exhaustive]`, so the next field is not another major version.
-  `outbox::MAX_ATTEMPTS` is public.
-
-- The error enums are `#[non_exhaustive]`: `cosmic_pim_core::StoreError`, and
-  `Error` in `cosmic-pim-caldav`, `-accounts`, `-auth`, `-mail` and `-sync`. A
-  `match` on one needs a wildcard arm. `cosmic_pim_core::atomic::Error` is
-  unchanged.
-- The types new in this release are `#[non_exhaustive]` too, so they can grow
-  in 3.x: `auth::Grant`, `auth::Identity`, `auth::OnlineAccount` (built with
-  `OnlineAccount::new`), `accounts::AppPassword`, `mail::Located`, and
-  `sync::setup::{Plan, Route, Adopted, SetupError}`.
+  (`id`, `failure`) on all three. `DrainOutcome` no longer implements
+  `Clone`, `PartialEq` or `Eq`, since it can carry an error.
+- **`Pending::exchange` returns `Grant { credential, identity }`** in place
+  of the bare `OAuthCredential`. Read `grant.credential` for what it returned
+  before.
+- **`Provider` has three new public fields** — `help_url`, `domains`,
+  `app_password` — and `TokenResponse` has one, `id_token`. A struct literal
+  of either needs them.
+- **`Provider::account_for` leaves the account's `url` empty.** The sync
+  engine finds calendars and contacts from the provider's manifest by the
+  account's provider id. Accounts stored by 2.x, which carry the calendar
+  address as their URL, are read correctly as they are.
+- **Non-exhaustive types.** `Queued`, `DrainOutcome`, `MailReport` and
+  `MailboxReport`; and the error enums: `cosmic_pim_core::StoreError`, and
+  `Error` in `cosmic-pim-caldav`, `-accounts`, `-auth`, `-mail` and `-sync`.
+  A `match` on one of the enums needs a wildcard arm; the structs cannot be
+  built or exhaustively destructured outside their crate. The next field or
+  variant is then not another major version. `cosmic_pim_core::atomic::Error`
+  is unchanged.
+- **A token endpoint must be `https`.** `token::post`, and so
+  `Pending::exchange` and `refresh`, refuse any other scheme before sending
+  anything. Plain `http` is taken only for a loopback address written as a
+  literal. A redirect from a token endpoint is not followed.
 
 ### Added
 
@@ -71,22 +86,20 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   recognised from an address. The domains were a list in the code.
 - `Provider::help_url`: the page a provider's hint is about, for a dialog to
   open.
+- `Provider::app_password` and `Provider::app_password_account`: the password
+  route of a provider whose own route is the browser. Google's manifest has
+  one — an app password reaches Gmail over IMAP — and Microsoft's does not.
 - Built-in providers for Yahoo, AOL, Proton Mail (through Proton Mail Bridge),
   mailbox.org, Posteo and GMX, beside Google, Microsoft, Fastmail and iCloud.
 - `cosmic_pim_auth::Identity`, read from the ID token that comes with a
   sign-in: the address and name of whoever signed in, so a sign-in needs no
-  typed address. The token is taken only from the token endpoint's own TLS
-  response, and only when it was issued to this client id, has not expired,
-  and names an address the provider does not mark unverified.
-  `TokenResponse::id_token` is new, and is redacted in `{:?}`.
-- `cosmic_pim_mail::imap::is_loopback`.
+  typed address. See Security for when the token is believed.
 - GNOME Online Accounts as a second source of sign-ins, for an installation
   with no OAuth client id of its own: `cosmic_pim_auth::OnlineAccounts` lists
   the Google and Microsoft accounts GOA holds and fetches their access tokens
   over the session bus; `Account::for_online_account` makes an account backed
   by one, and `resolve` asks GOA for its token. The refresh token stays with
-  GOA. An id from GOA that is not a plain token is refused, because an
-  account's id names files.
+  GOA.
 - `cosmic_pim_sync::setup`: from an address to a stored, working account.
   `plan` says, with no network, which provider an address belongs to, what
   the account would bring, and every way in that can work here, best first.
@@ -96,6 +109,16 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   `adopt_online_accounts` link GOA's accounts and remove the ones GOA no
   longer has — only ever from a listing that succeeded. `services_of` says
   what a stored account brings.
+- `cosmic_pim_mail::outbox::{SendFailure, Answers, Origin, Sent, Stopped}` and
+  `cosmic_pim_sync::SentMessage`, for the changes under Breaking.
+  `Outbox::set_answers` records what an already-queued message answers, for
+  moving that fact onto the record from wherever a caller kept it.
+  `MailReport::outbox_error` says when a pass could not drain the outbox, or
+  drained only part of it. `outbox::MAX_ATTEMPTS` is public.
+- `cosmic_pim_mail::Index::locate(account, message_id) -> Vec<Located>`: every
+  mailbox and UID a message is held under, by its `Message-ID`. The way back
+  from a reference that survives a renumbering or a move to one a flag can
+  be set on.
 - `cosmic_pim_core::recipients`: completing a name or address from the
   address book as it is typed, for a mail composer's recipients and an
   event's attendees alike. `read_address_book()` reads the suite's contacts
@@ -103,58 +126,60 @@ The next release is 3.0.0: `Pending::exchange` returns a different type and
   matches for the entry being typed after the last comma, word starts
   first; `accept(field, known)` writes the chosen one in. Moved from
   Envelope so Slate does not carry a second copy.
-- `Outbox::set_answers(id, answers) -> Result<bool>` records what an
-  already-queued message answers, for moving that fact onto the record from
-  wherever a caller kept it before. It takes the record the way a drain does,
-  so it cannot edit one that is being sent.
-- `cosmic_pim_mail::Index::locate(account, message_id) -> Vec<Located>`: every
-  mailbox and UID a message is held under, by its `Message-ID`. The way back
-  from a reference that survives a renumbering or a move to one a flag can
-  be set on.
-- `Provider::app_password` and `Provider::app_password_account`: the password
-  route of a provider whose own route is the browser. Google's manifest has
-  one — an app password reaches Gmail over IMAP — and Microsoft's does not.
-
-### Fixed
-
-- Queued mail leaves in the order it was queued. A drain walked the outbox
-  directory in whatever order the filesystem listed it, so two messages
-  written moments apart could go out in either order; `Outbox::list` already
-  sorted them, and the drain now does too.
-- A provider account's address books are looked for at the provider's
-  contacts address. `Provider::account_for` stored the calendar address as the
-  account's own URL, and the sync engine then used it for both, so an account
-  created from a manifest — Fastmail, Google — never found its contacts.
+- `cosmic_pim_mail::imap::is_loopback`.
+- The types new in this release are `#[non_exhaustive]`, so they can grow in
+  3.x: `mail::outbox::{SendFailure, Answers, Sent, Stopped}`, `mail::Located`,
+  `sync::SentMessage`, `auth::{Grant, Identity, OnlineAccount}` (the last
+  built with `OnlineAccount::new`), `accounts::AppPassword`, and
+  `sync::setup::{Plan, Route, Adopted, SetupError}`.
 
 ### Changed
 
 - The minimum supported Rust version is 1.99.0, raised from 1.98.1. The pinned
   toolchain and `rust-version` move together, so the six crates no longer
   build on an older compiler.
-- `Provider::account_for` leaves the account's `url` empty; the sync engine
-  finds calendars and contacts from the provider's manifest by the account's
-  provider id.
-- `Pending::exchange` returns `Grant { credential, identity }` in place of the
-  bare `OAuthCredential`. Read `grant.credential` for what it returned before.
-  It fails when the provider sends an ID token that must not be relied on.
-- A token endpoint must be `https`. Plain `http` is taken only for a loopback
-  address written as a literal. The authorization code, the client secret and
-  every refresh token are posted there, and a manifest with a mistyped scheme
-  sent them in the clear.
-- A redirect from a token endpoint is not followed; following one repeated
-  the same form to a host the manifest never named.
 - IMAP, SMTP and POP3 connections to a host written as a loopback address
   (`127.0.0.1`, `::1`) no longer verify the server's certificate, so Proton
   Mail Bridge and other local servers work over STARTTLS and TLS. Every other
   host, including the name `localhost`, is verified as before.
 - Two manifests for one provider in the same directory are applied in file-name
   order. The order was whatever the filesystem listed.
+- A sync pass that cannot drain the outbox says so in
+  `MailReport::outbox_error`. It logged a warning and carried on.
+
+### Fixed
+
+- A provider account's address books are looked for at the provider's
+  contacts address. `Provider::account_for` stored the calendar address as the
+  account's own URL, and the sync engine then used it for both, so an account
+  created from a manifest — Fastmail, Google — never found its contacts.
+- Queued mail leaves in the order it was queued. A drain walked the outbox
+  directory in whatever order the filesystem listed it, so two messages
+  written moments apart could go out in either order; `Outbox::list` already
+  sorted them, and the drain now does too.
 - An override manifest's `[oauth.extra_params]` adds to the built-in
   parameters instead of replacing them, so an override adding one no longer
   drops Google's `access_type=offline` and with it the refresh token (audit
   F-46).
+
+### Security
+
+- An ID token is believed only when it came in the token endpoint's own TLS
+  response, was issued to this client id (`aud`), has not expired (`exp`),
+  and names an address the provider does not mark `email_verified: false`.
+  One that fails a check stops the sign-in. The signature is not verified;
+  OpenID Connect Core §3.1.3.7 allows the TLS connection to stand in for it,
+  and the requirement above that a token endpoint be `https`, with no
+  redirect followed, is what makes that hold.
+- The loopback certificate exemption applies to a literal loopback address
+  as the socket layer parses one, and to nothing else: not `localhost`, and
+  not a bracketed or padded spelling such as `[127.0.0.1]`, which `connect`
+  would hand to a resolver.
+- An account id taken from GNOME Online Accounts must be a plain token, and
+  its identity one mail address, before either is used: the id names files,
+  and the identity becomes a login and a `From`.
 - `{:?}` of a provider's `OAuth` no longer prints its client secret (audit
-  O-04).
+  O-04), and `{:?}` of a `TokenResponse` does not print its ID token.
 
 ## [2.2.0] - 2026-09-30
 
