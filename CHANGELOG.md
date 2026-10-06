@@ -22,6 +22,10 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 - `Provider::account_for` leaves the account's `url` empty; the sync engine
   finds calendars and contacts from the provider's manifest by the account's
   provider id.
+- An override manifest's `[oauth.extra_params]` adds to the built-in
+  parameters instead of replacing them, so an override adding one no longer
+  drops Google's `access_type=offline` and with it the refresh token (audit
+  F-46).
 
 ## [2.2.0] - 2026-09-30
 

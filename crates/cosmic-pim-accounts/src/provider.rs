@@ -495,7 +495,11 @@ fn merge(base: &Provider, path: &Path) -> Result<Provider> {
             oauth.scopes = v;
         }
         if let Some(v) = over.extra_params {
-            oauth.extra_params = v;
+            // Extended, not replaced, like every other layer here: an
+            // override that adds one parameter must not drop the built-in
+            // `access_type=offline`, without which Google issues no refresh
+            // token and the account stops working an hour later.
+            oauth.extra_params.extend(v);
         }
         if let Some(v) = over.redirect_port {
             oauth.redirect_port = v;
@@ -747,6 +751,32 @@ mod tests {
         assert_eq!(
             account.mail.expect("mail endpoints").imap_host,
             "outlook.office365.com"
+        );
+    }
+
+    #[test]
+    fn an_override_adding_a_parameter_keeps_the_built_in_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("google.toml"),
+            "id = \"google\"\n[oauth]\nclient_id = \"x\"\n[oauth.extra_params]\nhd = \"example.com\"\n",
+        )
+        .unwrap();
+
+        let registry = Registry::load_from(dir.path());
+        let params = &registry
+            .get("google")
+            .unwrap()
+            .oauth
+            .as_ref()
+            .unwrap()
+            .extra_params;
+
+        assert_eq!(params.get("hd").map(String::as_str), Some("example.com"));
+        assert_eq!(
+            params.get("access_type").map(String::as_str),
+            Some("offline"),
+            "the override dropped the parameter that gets a refresh token"
         );
     }
 
