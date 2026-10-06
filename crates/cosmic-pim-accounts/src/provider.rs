@@ -262,17 +262,22 @@ fn substitute(template: &str, username: &str) -> String {
 impl Provider {
     /// A ready-to-store account for this provider.
     ///
-    /// Fills in every address the manifest knows so that adding an account is
-    /// one question — who are you — rather than the eight-field dialog that
-    /// asks a user for an IMAP hostname they have never heard of. What it does
-    /// *not* do is store anything: the caller pairs this with the credential
-    /// and hands both to [`crate::AccountStore`], which keeps "an account
-    /// exists" and "its secret is saved" from ever being separable.
+    /// Names the provider and fills in the mail endpoints, so that adding an
+    /// account is one question — who are you — rather than the eight-field
+    /// dialog that asks a user for an IMAP hostname they have never heard of.
+    /// What it does *not* do is store anything: the caller pairs this with the
+    /// credential and hands both to [`crate::AccountStore`], which keeps "an
+    /// account exists" and "its secret is saved" from ever being separable.
+    ///
+    /// The account's own `url` is left empty on purpose. It is one address,
+    /// and a provider has two — calendars and address books, usually on
+    /// different hosts — which the sync engine reads from the manifest by
+    /// the provider's id. An account that carried the calendar address as its
+    /// own was asked for its contacts at that address too, and had none.
     #[must_use]
     pub fn account_for(&self, username: &str) -> crate::Account {
         let mut account = crate::Account::new(&self.name, "", username);
         account.provider = Some(self.id.clone());
-        account.url = self.calendar_url(username).unwrap_or_default();
         account.mail = self
             .services
             .mail
@@ -708,9 +713,12 @@ mod tests {
         let account = fastmail.account_for("ada@fastmail.com");
 
         assert_eq!(account.provider.as_deref(), Some("fastmail"));
+        // The provider's id is what locates its calendars and address books;
+        // see `account_for`.
+        assert!(account.url.is_empty());
         assert_eq!(
-            account.url,
-            "https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/"
+            fastmail.calendar_url(&account.username).as_deref(),
+            Some("https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/")
         );
 
         let mail = account.mail.expect("mail endpoints");
@@ -726,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_with_no_calendar_leaves_the_url_empty_rather_than_wrong() {
+    fn a_provider_with_no_calendar_names_none_rather_than_a_wrong_one() {
         // Outlook.com withdrew CalDAV. Inventing an address would produce an
         // account that fails every pass against a server that was never there.
         let registry = Registry::load_from(Path::new("/nonexistent"));
@@ -734,7 +742,8 @@ mod tests {
 
         let account = microsoft.account_for("ada@outlook.com");
 
-        assert!(account.url.is_empty());
+        assert_eq!(microsoft.calendar_url(&account.username), None);
+        assert_eq!(microsoft.contacts_url(&account.username), None);
         assert_eq!(
             account.mail.expect("mail endpoints").imap_host,
             "outlook.office365.com"

@@ -7,11 +7,21 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A provider account's address books are looked for at the provider's
+  contacts address. `Provider::account_for` stored the calendar address as the
+  account's own URL, and the sync engine then used it for both, so an account
+  created from a manifest — Fastmail, Google — never found its contacts.
+
 ### Changed
 
 - The minimum supported Rust version is 1.99.0, raised from 1.98.1. The pinned
   toolchain and `rust-version` move together, so the six crates no longer
   build on an older compiler.
+- `Provider::account_for` leaves the account's `url` empty; the sync engine
+  finds calendars and contacts from the provider's manifest by the account's
+  provider id.
 
 ## [2.2.0] - 2026-09-30
 

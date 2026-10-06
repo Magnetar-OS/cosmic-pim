@@ -346,15 +346,24 @@ pub(crate) enum Service {
 /// `https://apidata.googleusercontent.com/caldav/v2/` is not something anyone
 /// types from memory, and because the address is a property of the provider
 /// rather than of the account.
+///
+/// One URL is not the user's own even though the account carries it: before
+/// 3.0 `Provider::account_for` stored the provider's *calendar* address as
+/// the account's URL, and those accounts are still in `accounts.toml`. Taken
+/// at its word, such an account would go on asking the calendar host for its
+/// address books. So a URL that is exactly the provider's calendar address
+/// is read as "the provider's", and each service gets its own.
 pub(crate) fn service_url(account: &Account, registry: &Registry, service: Service) -> String {
-    if !account.url.trim().is_empty() {
+    let provider = account.provider.as_deref().and_then(|id| registry.get(id));
+    let own = account.url.trim();
+    let inherited = provider
+        .and_then(|provider| provider.calendar_url(&account.username))
+        .is_some_and(|calendar| calendar == own);
+    if !own.is_empty() && !inherited {
         return account.url.clone();
     }
 
-    account
-        .provider
-        .as_deref()
-        .and_then(|id| registry.get(id))
+    provider
         .and_then(|provider| match service {
             Service::Calendar => provider.calendar_url(&account.username),
             Service::Contacts => provider.contacts_url(&account.username),
@@ -413,6 +422,67 @@ mod tests {
     fn accounts_at(dir: &Path) -> AccountStore {
         let secrets = SecretStore::open_envelope_only("cosmic-pim-test", dir);
         AccountStore::open(&dir.join("accounts.toml"), secrets).unwrap()
+    }
+
+    #[test]
+    fn a_provider_account_finds_its_contacts_at_the_providers_contacts_address() {
+        // Fastmail's calendars and address books are on different hosts. An
+        // account that carried the calendar address as its own URL sent the
+        // CardDAV pass there too, and no address book was ever found.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let account = registry
+            .get("fastmail")
+            .expect("built in")
+            .account_for("ada@fastmail.com");
+
+        assert_eq!(
+            service_url(&account, &registry, Service::Calendar),
+            "https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/"
+        );
+        assert_eq!(
+            service_url(&account, &registry, Service::Contacts),
+            "https://carddav.fastmail.com/dav/addressbooks/user/ada@fastmail.com/"
+        );
+    }
+
+    #[test]
+    fn an_account_stored_before_the_fix_finds_its_contacts_too() {
+        // Such an account carries the provider's calendar address as its own
+        // URL, and nothing rewrites `accounts.toml` for it.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let provider = registry.get("fastmail").expect("built in");
+        let mut account = provider.account_for("ada@fastmail.com");
+        account.url = provider
+            .calendar_url("ada@fastmail.com")
+            .expect("a calendar");
+
+        assert_eq!(
+            service_url(&account, &registry, Service::Contacts),
+            "https://carddav.fastmail.com/dav/addressbooks/user/ada@fastmail.com/"
+        );
+        assert_eq!(
+            service_url(&account, &registry, Service::Calendar),
+            "https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/"
+        );
+    }
+
+    #[test]
+    fn a_url_the_user_typed_wins_over_the_providers_for_both_services() {
+        // A self-hosted server reached through a provider entry: the typed
+        // address is the more specific fact.
+        let registry = Registry::load_from(Path::new("/nonexistent"));
+        let mut account = registry
+            .get("fastmail")
+            .expect("built in")
+            .account_for("ada@fastmail.com");
+        account.url = "https://dav.example.org/".to_owned();
+
+        for service in [Service::Calendar, Service::Contacts] {
+            assert_eq!(
+                service_url(&account, &registry, service),
+                "https://dav.example.org/"
+            );
+        }
     }
 
     #[test]
