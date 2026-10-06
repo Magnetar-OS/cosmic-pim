@@ -106,12 +106,12 @@ On crates.io. Depend on the crates you need:
 
 ```toml
 [dependencies]
-cosmic-pim-core = "2"
-cosmic-pim-sync = "2"
+cosmic-pim-core = "3"
+cosmic-pim-sync = "3"
 
 # A contacts or calendar app with no mail: keep the mail and OpenPGP stack
 # out of the build.
-# cosmic-pim-sync = { version = "2", default-features = false }
+# cosmic-pim-sync = { version = "3", default-features = false }
 
 # Uncomment to develop against a sibling checkout.
 # [patch.crates-io]

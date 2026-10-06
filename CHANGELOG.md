@@ -7,6 +7,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+The next release is 3.0.0: `Pending::exchange` returns a different type and
+`Provider` gained public fields. Consumers move from `"2"` to `"3"`.
+
 ### Added
 
 - Provider manifests are read from system directories as well as the user's:
