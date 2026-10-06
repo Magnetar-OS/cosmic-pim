@@ -77,7 +77,10 @@ pub struct Provider {
 }
 
 /// The four things an OAuth provider differs by.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand, to leave the client secret out: a provider
+/// is exactly the kind of value that ends up in a log line.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuth {
     /// Issued to a registered application. See the module docs for why this is
     /// not shipped.
@@ -105,6 +108,23 @@ pub struct OAuth {
 
 fn default_redirect_port() -> u16 {
     49_173
+}
+
+impl std::fmt::Debug for OAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuth")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("auth_url", &self.auth_url)
+            .field("token_url", &self.token_url)
+            .field("scopes", &self.scopes)
+            .field("extra_params", &self.extra_params)
+            .field("redirect_port", &self.redirect_port)
+            .finish()
+    }
 }
 
 impl OAuth {
@@ -778,6 +798,21 @@ mod tests {
             Some("offline"),
             "the override dropped the parameter that gets a refresh token"
         );
+    }
+
+    #[test]
+    fn a_providers_client_secret_stays_out_of_debug_output() {
+        let oauth = OAuth {
+            client_secret: Some("do-not-log-me".into()),
+            ..Registry::load_from(Path::new("/nonexistent"))
+                .get("google")
+                .unwrap()
+                .oauth
+                .clone()
+                .unwrap()
+        };
+
+        assert!(!format!("{oauth:?}").contains("do-not-log-me"));
     }
 
     #[test]

@@ -26,6 +26,8 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   parameters instead of replacing them, so an override adding one no longer
   drops Google's `access_type=offline` and with it the refresh token (audit
   F-46).
+- `{:?}` of a provider's `OAuth` no longer prints its client secret (audit
+  O-04).
 
 ## [2.2.0] - 2026-09-30
 
