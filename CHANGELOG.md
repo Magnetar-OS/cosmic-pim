@@ -7,6 +7,17 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-13
+
+A minor version: every API change is an addition — `FileStamp` and
+`Account::service_url` in `cosmic-pim-accounts`, three `setup` calls for
+servers the person names or a provider the person picks, and `smtp::verify` —
+so code built against 3.0.0 compiles unchanged. The mail crate stops crashing
+on a malformed `charset` and on deep nesting, and the text it extracts is
+otherwise unchanged. CalDAV and CardDAV discovery report a refused password as
+one. Consumers stay on `"3"`; the per-application notes are in
+`meta/audits/2026-09-28/cosmic-pim-3.1-migration.md` in the suite's notes.
+
 ### Added
 
 - `account::FileStamp` (re-exported as `cosmic_pim_accounts::FileStamp`) and
