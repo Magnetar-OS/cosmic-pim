@@ -14,8 +14,13 @@
 //!   stores the account only if the server took it. A password stored
 //!   untried fails an hour later as a sync error, far from the form where it
 //!   could have been fixed.
+//! - [`add_with_mail_servers`] and [`add_with_dav_url`] — the same, at
+//!   servers the person named, for a domain whose servers cannot be found
+//!   from the address.
 //! - [`sign_in`] — the provider's own sign-in in the browser. The account is
 //!   named after whoever actually signed in, not after what was typed.
+//!   [`sign_in_with_provider`] is the same with the provider picked by the
+//!   person, for an address on a domain of its own.
 //! - [`link_online_account`] and [`adopt_online_accounts`] — an account whose
 //!   sign-in GNOME Online Accounts keeps.
 //!
@@ -243,6 +248,99 @@ pub fn add_with_password(
     Ok(id)
 }
 
+/// Stores a password account at mail servers the person named, after logging
+/// in to them with the password.
+///
+/// For an address whose servers cannot be found — a domain of its own with no
+/// autoconfig — where the form asks for them instead. `mail` is everything it
+/// asked: the protocol (`Imap`, `Pop3` or `Jmap`), the incoming server, the
+/// submission server, and `imap_username` when the login is not the address.
+/// `from_address` empty means `plan.address`.
+///
+/// The incoming login is tried first, then for IMAP and POP3 the SMTP login
+/// (JMAP sends through its own session). Only when every login was accepted
+/// is the account stored, under no provider: named servers are not a
+/// manifest's, and naming one would send the password to its calendars too.
+/// `Gmail` and `Graph` take a token, not a password, and are
+/// [`SetupError::NoRoute`].
+///
+/// Blocking, so a worker call. Returns the new account's id. `name` is as for
+/// [`add_with_password`].
+#[cfg(feature = "mail")]
+pub fn add_with_mail_servers(
+    store: &mut AccountStore,
+    plan: &Plan,
+    name: &str,
+    mut mail: cosmic_pim_accounts::MailEndpoint,
+    password: &str,
+) -> Result<String, SetupError> {
+    use cosmic_pim_accounts::MailProtocol;
+
+    if mail.from_address.trim().is_empty() {
+        mail.from_address.clone_from(&plan.address);
+    }
+    let sends_by_smtp = matches!(mail.protocol, MailProtocol::Imap | MailProtocol::Pop3);
+    let mut account = Account::new(&plan.address, "", &plan.address);
+    account.mail = Some(mail);
+    name_account(&mut account, name);
+
+    log_in_to_mail(&account, password)?;
+    if sends_by_smtp {
+        log_in_to_smtp(&account, password)?;
+    }
+
+    let id = account.id.clone();
+    store.add(account, password)?;
+    Ok(id)
+}
+
+/// Stores a calendars-and-contacts account at a CalDAV or CardDAV address the
+/// person typed, after logging in to it with the password.
+///
+/// `url` is where discovery starts — a server root, a principal or a home, as
+/// for [`Account::url`]. `username` is the login; empty means `plan.address`.
+/// The server is asked for its calendars first and, when it has none to
+/// offer, for its address books, so a contacts-only server is accepted too.
+/// A refused login is [`SetupError::Rejected`] and is not tried twice.
+///
+/// The account has no mail and no provider. Blocking. Returns the new
+/// account's id. `name` is as for [`add_with_password`].
+pub fn add_with_dav_url(
+    store: &mut AccountStore,
+    plan: &Plan,
+    name: &str,
+    url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, SetupError> {
+    use cosmic_pim_caldav::Flavor;
+
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(SetupError::NoServer(format!(
+            "“{}” is not a web address",
+            url.escape_debug()
+        )));
+    }
+    let login = match username.trim() {
+        "" => plan.address.as_str(),
+        login => login,
+    };
+    let mut account = Account::new(&plan.address, url, login);
+    name_account(&mut account, name);
+
+    if let Err(calendars) = log_in_to_dav(url, login, password, Flavor::CalDav) {
+        if matches!(calendars, SetupError::Rejected(_)) {
+            return Err(calendars);
+        }
+        log_in_to_dav(url, login, password, Flavor::CardDav).map_err(|_| calendars)?;
+    }
+
+    let id = account.id.clone();
+    store.add(account, password)?;
+    Ok(id)
+}
+
 /// The account a password would add, before anything is tried.
 fn password_account(plan: &Plan) -> Result<Account, SetupError> {
     if !plan
@@ -312,6 +410,12 @@ fn verify(account: &Account, registry: &Registry, password: &str) -> Result<(), 
 
 #[cfg(feature = "mail")]
 fn verify_mail(account: &Account, _registry: &Registry, password: &str) -> Result<(), SetupError> {
+    log_in_to_mail(account, password)
+}
+
+/// Logs in once to the account's incoming mail server.
+#[cfg(feature = "mail")]
+fn log_in_to_mail(account: &Account, password: &str) -> Result<(), SetupError> {
     use cosmic_pim_accounts::{MailProtocol, Transport};
     use cosmic_pim_mail::imap::Security;
     use cosmic_pim_mail::{Credentials, imap, jmap, pop3};
@@ -359,7 +463,26 @@ fn verify_mail(account: &Account, _registry: &Registry, password: &str) -> Resul
         MailProtocol::Gmail | MailProtocol::Graph => return Err(SetupError::NoRoute),
     };
 
-    outcome.map_err(|why| match why {
+    outcome.map_err(mail_setup_error)
+}
+
+/// Logs in once to the account's submission server, sending nothing.
+#[cfg(feature = "mail")]
+fn log_in_to_smtp(account: &Account, password: &str) -> Result<(), SetupError> {
+    let Some(mail) = account.mail.as_ref() else {
+        return Ok(());
+    };
+    cosmic_pim_mail::smtp::verify(
+        &crate::mail::smtp_endpoint(account, mail),
+        &cosmic_pim_mail::Credentials::Password(password.to_owned()),
+    )
+    .map_err(mail_setup_error)
+}
+
+/// What a failed mail login means to someone adding an account.
+#[cfg(feature = "mail")]
+fn mail_setup_error(why: cosmic_pim_mail::Error) -> SetupError {
+    match why {
         cosmic_pim_mail::Error::Auth(reason) => SetupError::Rejected(reason),
         // A refused connection is not transient to a sync loop, but to
         // someone adding an account it is the most useful thing to hear:
@@ -369,7 +492,7 @@ fn verify_mail(account: &Account, _registry: &Registry, password: &str) -> Resul
         }
         other if other.is_transient() => SetupError::Unreachable(other.to_string()),
         other => SetupError::Failed(other.to_string()),
-    })
+    }
 }
 
 /// Without the mail stack a mail login cannot be tried, and an account with
@@ -381,8 +504,6 @@ fn verify_mail(account: &Account, registry: &Registry, password: &str) -> Result
 
 /// Finds the principal on the account's calendar server, which needs a login.
 fn verify_dav(account: &Account, registry: &Registry, password: &str) -> Result<(), SetupError> {
-    use cosmic_pim_caldav::{Auth, CaldavClient, Disposition, Flavor};
-
     let url = crate::engine::service_url(account, registry, crate::engine::Service::Calendar);
     if url.is_empty() {
         // Nothing to log in to: an account with neither mail nor a calendar
@@ -390,11 +511,28 @@ fn verify_dav(account: &Account, registry: &Registry, password: &str) -> Result<
         // it through. Stored as it is rather than refused on a technicality.
         return Ok(());
     }
+    log_in_to_dav(
+        &url,
+        &account.username,
+        password,
+        cosmic_pim_caldav::Flavor::CalDav,
+    )
+}
+
+/// Finds the principal and the `flavor`'s home at `url`, which needs a login.
+fn log_in_to_dav(
+    url: &str,
+    username: &str,
+    password: &str,
+    flavor: cosmic_pim_caldav::Flavor,
+) -> Result<(), SetupError> {
+    use cosmic_pim_caldav::{Auth, CaldavClient, Disposition};
+
     let auth = Auth::Basic {
-        username: account.username.clone(),
+        username: username.to_owned(),
         password: password.to_owned(),
     };
-    CaldavClient::with_auth(&url, Flavor::CalDav, &auth)
+    CaldavClient::with_auth(url, flavor, &auth)
         .discover()
         .map_err(|why| match why.disposition() {
             Disposition::NeedsUser => SetupError::Rejected(why.to_string()),
@@ -430,6 +568,25 @@ pub fn sign_in(
     open: impl FnOnce(&str) -> std::io::Result<()>,
 ) -> Result<String, SetupError> {
     let provider = plan.provider.as_ref().ok_or(SetupError::NoRoute)?;
+    sign_in_with_provider(store, provider, &plan.address, open)
+}
+
+/// [`sign_in`] at a provider the person picked, rather than the one the
+/// address's domain belongs to.
+///
+/// For an address on a domain of its own whose mail a provider hosts — Google
+/// Workspace, Microsoft 365 — which no manifest can claim, so [`plan`] finds
+/// no provider for it. `provider` is from the [`Registry`]; it must have an
+/// OAuth client id configured here, or this is [`SetupError::NoRoute`].
+/// `address` is used only when the grant does not say who signed in.
+///
+/// Blocking, as [`sign_in`]. Returns the new account's id.
+pub fn sign_in_with_provider(
+    store: &mut AccountStore,
+    provider: &Provider,
+    address: &str,
+    open: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Result<String, SetupError> {
     let oauth = provider
         .oauth
         .as_ref()
@@ -443,7 +600,7 @@ pub fn sign_in(
     let grant = pending.exchange(&code, oauth)?;
 
     let (address, name) = grant.identity.as_ref().map_or_else(
-        || (plan.address.clone(), None),
+        || (address.trim().to_owned(), None),
         |identity| (identity.email.clone(), identity.name.clone()),
     );
     let mut account = provider.account_for(&address);
@@ -881,6 +1038,11 @@ mod tests {
     /// A token endpoint that answers once with a grant for Grace, whoever
     /// typed what.
     fn token_endpoint() -> String {
+        token_endpoint_for("grace@gmail.com")
+    }
+
+    /// A token endpoint that answers once with a grant for `email`.
+    fn token_endpoint_for(email: &'static str) -> String {
         use base64::Engine as _;
 
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -893,7 +1055,7 @@ mod tests {
                 // `e30` is `{}`; the payload is the claims below, for the
                 // client id the manifest in the test names.
                 let claims = format!(
-                    r#"{{"aud":"test","exp":{},"email":"grace@gmail.com","name":"Grace Hopper"}}"#,
+                    r#"{{"aud":"test","exp":{},"email":"{email}","name":"Grace Hopper"}}"#,
                     chrono::Utc::now().timestamp() + 3600
                 );
                 let body = format!(
@@ -942,6 +1104,315 @@ mod tests {
             "a signed-in Google account uses the Gmail engine"
         );
         assert!(store.credential(&id).unwrap().unwrap().is_renewable());
+    }
+
+    /// A Google manifest with a client id, its token endpoint answering for
+    /// `email`.
+    fn google_for(dir: &Path, email: &'static str) -> Registry {
+        let redirect_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(
+            dir.join("google.toml"),
+            format!(
+                "id = \"google\"\n[oauth]\nclient_id = \"test\"\ntoken_url = \"{}\"\n\
+                 redirect_port = {redirect_port}\n",
+                token_endpoint_for(email)
+            ),
+        )
+        .unwrap();
+        Registry::load_from(dir)
+    }
+
+    #[test]
+    fn an_address_on_its_own_domain_signs_in_at_the_provider_the_person_picked() {
+        // Google Workspace on company.example: no manifest claims the domain,
+        // so the address alone finds no way to sign in.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = google_for(dir.path(), "ada@company.example");
+        let mut store = store_at(dir.path());
+        let plan = plan(&registry, "ada@company.example", false).unwrap();
+        assert!(plan.provider.is_none());
+        assert!(matches!(
+            sign_in(&mut store, &plan, browser),
+            Err(SetupError::NoRoute)
+        ));
+
+        let google = registry.get("google").unwrap();
+        let id =
+            sign_in_with_provider(&mut store, google, &plan.address, browser).expect("signed in");
+
+        let account = store.get(&id).unwrap();
+        assert_eq!(account.username, "ada@company.example");
+        assert_eq!(account.provider.as_deref(), Some("google"));
+        assert!(account.is_oauth());
+        assert_eq!(
+            account.mail.as_ref().unwrap().protocol,
+            MailProtocol::Gmail,
+            "a Workspace account uses the Gmail engine like any other"
+        );
+    }
+
+    #[test]
+    fn a_picked_provider_with_no_client_id_here_cannot_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let registry = built_in();
+        let google = registry.get("google").unwrap();
+
+        let error = sign_in_with_provider(&mut store, google, "ada@company.example", |_| {
+            panic!("no browser may open without a client id")
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, SetupError::NoRoute), "got {error}");
+        assert_eq!(store.accounts(), []);
+    }
+
+    /// A plaintext submission server on loopback that takes one login, and
+    /// accepts it only with `password`.
+    #[cfg(feature = "mail")]
+    fn smtp_server(password: &'static str) -> u16 {
+        use base64::Engine as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut out = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let _ = write!(out, "220 local ESMTP\r\n");
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                let command = line.trim_end().to_owned();
+                line.clear();
+                let upper = command.to_ascii_uppercase();
+                let _ = if upper.starts_with("EHLO") {
+                    write!(out, "250-local\r\n250 AUTH PLAIN\r\n")
+                } else if let Some(token) = command.strip_prefix("AUTH PLAIN ") {
+                    // `\0login\0password`, base64.
+                    let given = base64::engine::general_purpose::STANDARD
+                        .decode(token)
+                        .unwrap_or_default();
+                    if given.ends_with(format!("\0{password}").as_bytes()) {
+                        write!(out, "235 2.7.0 Authentication successful\r\n")
+                    } else {
+                        write!(out, "535 5.7.8 Authentication credentials invalid\r\n")
+                    }
+                } else if upper == "QUIT" {
+                    let _ = write!(out, "221 Bye\r\n");
+                    break;
+                } else {
+                    write!(out, "250 Ok\r\n")
+                };
+            }
+        });
+        port
+    }
+
+    /// IMAP and SMTP on loopback, as a form would collect them.
+    #[cfg(feature = "mail")]
+    fn named_servers(imap_port: u16, smtp_port: u16) -> cosmic_pim_accounts::MailEndpoint {
+        use cosmic_pim_accounts::{MailEndpoint, Transport};
+        MailEndpoint {
+            imap_port,
+            imap_transport: Transport::Plaintext,
+            smtp_host: "127.0.0.1".to_owned(),
+            smtp_port,
+            smtp_transport: Transport::Plaintext,
+            ..MailEndpoint::tls("127.0.0.1")
+        }
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn named_mail_servers_that_take_the_password_are_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+        let servers = named_servers(imap_server("right"), smtp_server("right"));
+
+        let id = add_with_mail_servers(&mut store, &plan, "Ada", servers, "right")
+            .expect("both logins were accepted");
+
+        let account = store.get(&id).unwrap();
+        assert_eq!(account.provider, None);
+        assert_eq!(account.username, "ada@nowhere.example");
+        let mail = account.mail.as_ref().unwrap();
+        assert_eq!(mail.from_address, "ada@nowhere.example");
+        assert_eq!(mail.from_name, "Ada");
+        assert_eq!(mail.smtp_host, "127.0.0.1");
+        assert_eq!(store.password(&id).unwrap().as_deref(), Some("right"));
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn named_servers_are_not_stored_when_the_submission_server_refuses_the_password() {
+        // The incoming server took it and the outgoing one did not: stored,
+        // the account would read mail and fail on the first send.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+        let servers = named_servers(imap_server("right"), smtp_server("other"));
+
+        let error = add_with_mail_servers(&mut store, &plan, "", servers, "right").unwrap_err();
+
+        assert!(matches!(error, SetupError::Rejected(_)), "got {error}");
+        assert_eq!(store.accounts(), []);
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn named_servers_are_not_stored_when_the_incoming_server_refuses_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+        let servers = named_servers(imap_server("right"), smtp_server("wrong"));
+
+        let error = add_with_mail_servers(&mut store, &plan, "", servers, "wrong").unwrap_err();
+
+        assert!(matches!(error, SetupError::Rejected(_)), "got {error}");
+        assert_eq!(store.accounts(), []);
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn a_token_engine_cannot_be_named_with_a_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+        let servers = cosmic_pim_accounts::MailEndpoint {
+            protocol: MailProtocol::Gmail,
+            ..named_servers(1, 1)
+        };
+
+        let error = add_with_mail_servers(&mut store, &plan, "", servers, "x").unwrap_err();
+
+        assert!(matches!(error, SetupError::NoRoute), "got {error}");
+        assert_eq!(store.accounts(), []);
+    }
+
+    /// A WebDAV server on loopback that knows `ada` by `password`, with an
+    /// address book home and — when `calendars` — a calendar home.
+    fn dav_server(password: &'static str, calendars: bool) -> String {
+        use base64::Engine as _;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("ada:{password}"))
+        );
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let authorized = request
+                    .headers()
+                    .iter()
+                    .any(|h| h.field.equiv("Authorization") && h.value.as_str() == expected);
+                if !authorized {
+                    let challenge = "WWW-Authenticate: Basic realm=\"dav\""
+                        .parse::<tiny_http::Header>()
+                        .unwrap();
+                    let _ = request.respond(
+                        tiny_http::Response::from_string("")
+                            .with_status_code(401)
+                            .with_header(challenge),
+                    );
+                    continue;
+                }
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
+                let prop = if body.contains("current-user-principal") {
+                    "<D:current-user-principal><D:href>/principal/</D:href></D:current-user-principal>"
+                } else if body.contains("calendar-home-set") && calendars {
+                    "<C:calendar-home-set><D:href>/calendars/</D:href></C:calendar-home-set>"
+                } else if body.contains("addressbook-home-set") {
+                    "<C:addressbook-home-set><D:href>/contacts/</D:href></C:addressbook-home-set>"
+                } else {
+                    ""
+                };
+                let xml = format!(
+                    "<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\" \
+                     xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:response><D:href>{}</D:href>\
+                     <D:propstat><D:prop>{prop}</D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+                     </D:propstat></D:response></D:multistatus>",
+                    request.url()
+                );
+                let header = "Content-Type: application/xml; charset=utf-8"
+                    .parse::<tiny_http::Header>()
+                    .unwrap();
+                let _ = request.respond(
+                    tiny_http::Response::from_string(xml)
+                        .with_status_code(207)
+                        .with_header(header),
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    #[test]
+    fn a_typed_dav_address_that_takes_the_password_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+        let url = dav_server("right", true);
+
+        let id = add_with_dav_url(&mut store, &plan, "Ada", &url, "ada", "right")
+            .expect("the login was accepted");
+
+        let account = store.get(&id).unwrap();
+        assert_eq!(account.url, url);
+        assert_eq!(account.username, "ada");
+        assert_eq!(account.display_name, "Ada");
+        assert_eq!(account.provider, None);
+        assert!(account.mail.is_none());
+        assert_eq!(store.password(&id).unwrap().as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn a_typed_dav_address_that_refuses_the_password_is_rejected_not_unreachable() {
+        // A wrong password reported as "could not be reached" sends the
+        // person to check a server address that is right.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+        let url = dav_server("right", true);
+
+        let error = add_with_dav_url(&mut store, &plan, "", &url, "ada", "wrong").unwrap_err();
+
+        assert!(matches!(error, SetupError::Rejected(_)), "got {error}");
+        assert_eq!(store.accounts(), []);
+    }
+
+    #[test]
+    fn a_contacts_only_dav_server_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+        let url = dav_server("right", false);
+
+        let id = add_with_dav_url(&mut store, &plan, "", &url, "ada", "right")
+            .expect("the address book home was found");
+
+        assert_eq!(store.get(&id).unwrap().url, url);
+    }
+
+    #[test]
+    fn text_that_is_not_a_web_address_is_not_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let plan = plan(&built_in(), "ada@nowhere.example", false).unwrap();
+
+        let error =
+            add_with_dav_url(&mut store, &plan, "", "dav.nowhere.example", "", "x").unwrap_err();
+
+        assert!(matches!(error, SetupError::NoServer(_)), "got {error}");
+        assert_eq!(store.accounts(), []);
     }
 
     /// Online Accounts, as a list held in memory.

@@ -281,7 +281,7 @@ fn imap_endpoint(account: &Account, mail: &MailEndpoint) -> Endpoint {
     }
 }
 
-fn smtp_endpoint(account: &Account, mail: &MailEndpoint) -> SmtpEndpoint {
+pub(crate) fn smtp_endpoint(account: &Account, mail: &MailEndpoint) -> SmtpEndpoint {
     SmtpEndpoint {
         host: mail.submission_host().to_owned(),
         port: mail.smtp_port,

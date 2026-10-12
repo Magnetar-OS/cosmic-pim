@@ -100,6 +100,13 @@ let id = match plan.routes.first() {
 };
 ```
 
+When the address is not enough, the window asks, and three more calls take
+the answer and still try it before storing anything:
+`setup::add_with_mail_servers` for mail servers the person named,
+`setup::add_with_dav_url` for a typed CalDAV or CardDAV address, and
+`setup::sign_in_with_provider` for a Google Workspace or Microsoft 365 address
+on a domain of its own, where the person picks the provider.
+
 **Providers are data.** Google, Microsoft, Fastmail, iCloud, Yahoo, AOL,
 Proton Mail (through Proton Mail Bridge), mailbox.org, Posteo and GMX ship
 compiled in, each with the mail domains that are its own, so an address is

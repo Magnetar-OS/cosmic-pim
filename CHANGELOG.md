@@ -17,6 +17,21 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `stamp.changed(path)` reports a different version once and moves the stamp
   to it. `FileStamp::default()` is "no file". Envelope, Slate and Circle each
   carried a copy of this check; theirs can go.
+- `sync::setup::add_with_mail_servers(store, plan, name, mail: MailEndpoint,
+  password) -> Result<String, SetupError>` (feature `mail`): a password
+  account at mail servers the person named — IMAP, POP3 or JMAP, and the SMTP
+  server — for a domain whose servers cannot be discovered. It logs in to the
+  incoming server and, for IMAP and POP3, the submission server, and stores
+  the account only when both took the password.
+- `sync::setup::sign_in_with_provider(store, provider: &Provider, address,
+  open) -> Result<String, SetupError>`: `sign_in` at a provider the person
+  picked, for a Google Workspace or Microsoft 365 address on a domain no
+  manifest claims. `sign_in` is now this with the plan's provider.
+- `sync::setup::add_with_dav_url(store, plan, name, url, username, password)
+  -> Result<String, SetupError>`: a calendars-and-contacts account at a typed
+  CalDAV or CardDAV address, stored only after the login is accepted; a
+  contacts-only server is accepted, and a refused password is
+  `SetupError::Rejected`.
 - `mail::smtp::verify(endpoint, credentials) -> Result<()>`: logs in to the
   submission server and leaves, sending nothing. A refused login is
   `Error::Auth`, anything else `Error::Transport`.
