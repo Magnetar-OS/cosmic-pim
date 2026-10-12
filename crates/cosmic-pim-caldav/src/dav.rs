@@ -19,7 +19,7 @@ use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
-use crate::error::{Error, Result};
+use crate::error::{Disposition, Error, Result};
 
 /// Per-request wall-clock ceiling. CalDAV servers behind slow SSO chains can
 /// take seconds on the first PROPFIND.
@@ -1579,6 +1579,10 @@ impl CaldavClient {
     /// cleared before erroring so the next `discover()` starts from scratch
     /// instead of re-probing the same dead value; clearing any PERSISTED
     /// principal is the caller's decision.
+    ///
+    /// A refusal that needs a person — 401, 403 — is returned as the
+    /// server's own status, not folded into a protocol error: a wrong
+    /// password is not a server to retry later.
     pub fn discover(&mut self) -> Result<()> {
         if self.principal_url.is_none() {
             self.principal_url = Some(self.discover_principal()?);
@@ -1612,6 +1616,9 @@ impl CaldavClient {
                 }
                 Err(e) => {
                     self.principal_url = None;
+                    if e.disposition() == Disposition::NeedsUser {
+                        return Err(e);
+                    }
                     return Err(Error::protocol(format!(
                         "caldav: PROPFIND for calendar-home-set failed: {e}"
                     )));
@@ -1636,6 +1643,9 @@ impl CaldavClient {
                 }
                 "PROPFIND on base URL returned no current-user-principal".to_string()
             }
+            // The same credentials go to the well-known path, and would be
+            // refused there too.
+            Err(e) if e.disposition() == Disposition::NeedsUser => return Err(e),
             Err(e) => format!("PROPFIND on base URL failed: {e}"),
         };
 
@@ -1649,6 +1659,7 @@ impl CaldavClient {
                 }
                 last_error = format!("{last_error}; .well-known/caldav also returned no principal");
             }
+            Err(e) if e.disposition() == Disposition::NeedsUser => return Err(e),
             Err(e) => last_error = format!("{last_error}; .well-known/caldav also failed: {e}"),
         }
         Err(Error::protocol(format!(

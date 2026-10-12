@@ -32,6 +32,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   over 34,557 documents — this crate's and Envelope's test fixtures, 30,000
   generated ones, and every HTML file and `.eml` in the suite's checkouts —
   every one gives the same result except the two that crashed.
+- **A wrong password at CalDAV or CardDAV discovery is reported as one.**
+  `CaldavClient::discover` folded a 401 or 403 from the principal or home
+  `PROPFIND` into a protocol error, which reads as "try again later": the sync
+  engine retried a password that would never work, and `setup` told the
+  person the server could not be reached. Those statuses now come back as
+  `Error::Status`, `Disposition::NeedsUser`, and `setup` says
+  `SetupError::Rejected`.
 - **Deeply nested HTML no longer overflows the stack.** `mail::text::extract`
   walked the tree one stack frame per element, so 600 KB of nested `<span>`
   aborted a thread with a 2 MiB stack — the whole process, since a stack
