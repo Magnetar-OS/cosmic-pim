@@ -7,6 +7,21 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An HTML message no longer crashes whatever reads it.**
+  `mail::text::extract`, and so `Message::parse` for any message with an HTML
+  part, panicked on `<meta http-equiv="Content-Type" content="text/html;
+  charset">` — a `charset` with nothing after it. The panic was in html5ever
+  0.39, which `scraper` 0.27, the newest, requires. The crate now parses with
+  html5ever 0.40.1 directly, through a small tree sink of its own
+  (`text/dom.rs`) that builds the tree `scraper` built, and `scraper`,
+  `selectors`, `ego-tree` and their dependencies leave the graph. The text and
+  the hidden-content count extracted are unchanged: compared before and after
+  over 34,557 documents — this crate's and Envelope's test fixtures, 30,000
+  generated ones, and every HTML file and `.eml` in the suite's checkouts —
+  every one gives the same result except the two that crashed.
+
 ## [3.0.0] - 2026-10-06
 
 A major version. It lands the account-onboarding work — providers a

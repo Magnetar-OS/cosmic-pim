@@ -17,7 +17,7 @@ cosmic-pim-accounts = { path = "../cosmic-pim-accounts", version = "3.0.0" }
 cosmic-pim-auth = { path = "../cosmic-pim-auth", version = "3.0.0" }
 # Optional: a contacts or calendar app has no use for IMAP, SMTP, OpenPGP or
 # HTML parsing, and linking them drags pgp, rsa (RUSTSEC-2023-0071), lettre,
-# imap and scraper into its graph. On by default; Circle turns it off.
+# imap and html5ever into its graph. On by default; Circle turns it off.
 cosmic-pim-mail = { path = "../cosmic-pim-mail", version = "3.0.0", optional = true }
 
 thiserror = "2"

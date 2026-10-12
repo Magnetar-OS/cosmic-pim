@@ -59,8 +59,10 @@ quick-xml = "0.42.0"
 
 # HTML → what a human would actually see. A real html5ever tree, not a
 # tag-stripper: hostile mail is precisely where parser-differential tricks live.
-scraper = { version = "0.27.0", default-features = false, features = ["errors"] }
-ego-tree = "0.11.0"
+# Used directly, through the small tree sink in `text/dom.rs`: 0.40.1 is the
+# first html5ever that does not panic on `<meta http-equiv="Content-Type"
+# content="text/html; charset">`, and the newest `scraper` required 0.39.
+html5ever = "0.40.1"
 
 # The disposable index. `bundled` compiles SQLite from source so we never
 # depend on the host's libsqlite3 version — the same choice cosmic-pim-core

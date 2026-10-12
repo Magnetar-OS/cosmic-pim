@@ -25,17 +25,20 @@
 //! Mail has a rendering layer that hides text from humans while preserving it
 //! for anything reading the source: `display:none`, white-on-white,
 //! zero-width splices, HTML comments. A tag-stripper reads a *different
-//! message* than its user sees. So the walk is over an html5ever tree (via
-//! `scraper`) — the same tree a browser would build — and drops what a human
-//! could not have read.
+//! message* than its user sees. So the walk is over an html5ever tree — the
+//! same tree a browser would build, held by this module's own small sink
+//! ([`dom`]) — and drops what a human could not have read.
 //!
 //! And it **counts what it dropped**. A message whose visible text is three
 //! words and whose hidden text is three paragraphs is worth saying so about;
 //! silently handing on the sanitised version tells the user nothing.
 
-use ego_tree::NodeRef;
-use scraper::Html;
-use scraper::node::Node;
+mod dom;
+
+use html5ever::tendril::TendrilSink;
+use html5ever::{Attribute, LocalName, QualName, local_name, ns};
+
+use self::dom::{Data, Dom, Id};
 
 /// Bodies are cut here.
 ///
@@ -120,14 +123,16 @@ const ZERO_WIDTH: &[char] = &[
 /// Extracts the visible text of an HTML mail body.
 #[must_use]
 pub fn extract(html: &str) -> ExtractedText {
-    let doc = Html::parse_document(html);
+    let dom =
+        html5ever::parse_document(dom::Sink::default(), html5ever::ParseOpts::default()).one(html);
     let mut w = Walker {
+        dom: &dom,
         out: String::with_capacity(html.len().min(MAX_TEXT_CHARS)),
         hidden_elided: 0,
     };
     // The effective background starts unknown; mail defaults to white, which
     // is what the white-on-white attack relies on.
-    w.walk(doc.tree.root(), Some(Rgb::WHITE));
+    w.walk(Dom::DOCUMENT, Some(Rgb::WHITE));
     ExtractedText {
         text: finalize(&w.out),
         hidden_elided: w.hidden_elided,
@@ -199,26 +204,28 @@ fn contains_pair(haystack: &str, attr: &str, scheme: &str) -> bool {
     })
 }
 
-struct Walker {
+struct Walker<'a> {
+    dom: &'a Dom,
     out: String,
     hidden_elided: usize,
 }
 
-impl Walker {
+impl Walker<'_> {
     /// Depth-first walk. `bg` is the effective background color inherited
     /// from ancestors (None once an ancestor set a background we can't parse
     /// - then color-matching is skipped rather than guessed).
-    fn walk(&mut self, node: NodeRef<'_, Node>, bg: Option<Rgb>) {
-        for child in node.children() {
-            match child.value() {
-                Node::Text(t) => self.out.push_str(t),
-                Node::Comment(c) => {
+    fn walk(&mut self, node: Id, bg: Option<Rgb>) {
+        let dom = self.dom;
+        for &child in dom.children(node) {
+            match dom.data(child) {
+                Data::Text(t) => self.out.push_str(t),
+                Data::Comment(c) => {
                     if comment_has_prose(c) {
                         self.hidden_elided += 1;
                     }
                 }
-                Node::Element(el) => {
-                    let tag = el.name().to_ascii_lowercase();
+                Data::Element { name, attrs } => {
+                    let tag = str::to_ascii_lowercase(&name.local);
                     if tag == "br" {
                         self.out.push('\n');
                         continue;
@@ -226,10 +233,10 @@ impl Walker {
                     if STRUCTURAL.contains(&tag.as_str()) {
                         continue; // never content, never counted
                     }
-                    let style = InlineStyle::parse(el.attr("style").unwrap_or(""));
+                    let style = InlineStyle::parse(attr(attrs, local_name!("style")).unwrap_or(""));
                     let next_bg = style.background.map_or(bg, Some);
-                    if el.attr("hidden").is_some() || style.hides(bg) {
-                        if subtree_has_text(child) {
+                    if attr(attrs, local_name!("hidden")).is_some() || style.hides(bg) {
+                        if subtree_has_text(dom, child) {
                             self.hidden_elided += 1;
                         }
                         continue; // drop the whole subtree
@@ -243,19 +250,36 @@ impl Walker {
                         self.out.push('\n');
                     }
                 }
-                _ => {}
+                // A template's contents, a doctype: nothing a reader sees.
+                Data::Fragment | Data::Other | Data::Root => {}
             }
         }
     }
 }
 
+/// An attribute's value, by its name with no namespace — the only kind
+/// `style` and `hidden` are.
+fn attr(attrs: &[Attribute], local: LocalName) -> Option<&str> {
+    let name = QualName::new(None, ns!(), local);
+    attrs.iter().find(|a| a.name == name).map(|a| &*a.value)
+}
+
 /// Does a dropped subtree actually contain text? Empty spacer divs hidden by
 /// style are layout noise, not an attack - only text-bearing drops count.
-fn subtree_has_text(node: NodeRef<'_, Node>) -> bool {
-    node.descendants().any(|d| match d.value() {
-        Node::Text(t) => !t.trim().is_empty(),
-        _ => false,
-    })
+///
+/// Every node under `node`, a template's contents included, looked at without
+/// recursion: hidden markup is as deep as its sender makes it.
+fn subtree_has_text(dom: &Dom, node: Id) -> bool {
+    let mut stack = dom.children(node).to_vec();
+    while let Some(next) = stack.pop() {
+        if let Data::Text(t) = dom.data(next)
+            && !t.trim().is_empty()
+        {
+            return true;
+        }
+        stack.extend_from_slice(dom.children(next));
+    }
+    false
 }
 
 /// A comment "has prose" when, with anything tag-shaped and the MSO
@@ -503,6 +527,60 @@ mod tests {
         let e = extract("<p>Hello <b>world</b> &amp; friends</p><p>Second</p>");
         assert_eq!(e.text, "Hello world & friends\n\nSecond");
         assert_eq!(e.hidden_elided, 0);
+    }
+
+    #[test]
+    fn a_charset_with_no_value_in_a_meta_tag_does_not_crash_the_reader() {
+        // html5ever 0.39 looked for the `=` after `charset` one byte past the
+        // end of the attribute, and panicked. One such tag anywhere in a
+        // message took down whatever asked for its text — Envelope, before
+        // its own parser ever saw the body.
+        for content in ["text/html; charset", "text/html; charset \t", "charset"] {
+            let html = format!(
+                "<html><head><meta http-equiv=\"Content-Type\" content=\"{content}\"></head>\
+                 <body><p>Hello</p></body></html>"
+            );
+            let e = extract(&html);
+            assert_eq!(e.text, "Hello", "for content={content:?}");
+        }
+
+        let m = crate::model::Message::parse(
+            b"From: a@b\r\nSubject: T\r\nContent-Type: text/html\r\n\r\n\
+              <meta http-equiv=\"Content-Type\" content=\"text/html; charset\"><p>hi</p>\r\n",
+        )
+        .expect("parse");
+        assert_eq!(m.body.text, "hi");
+    }
+
+    #[test]
+    fn hidden_text_inside_a_template_still_counts_its_hidden_parent() {
+        // A template's contents are not shown, and are not the walk's to
+        // read, but a hidden element holding one did hide text.
+        let e = extract("<div style=\"display:none\"><template>secret</template></div><p>ok</p>");
+        assert_eq!(e.text, "ok");
+        assert_eq!(e.hidden_elided, 1);
+        let shown = extract("<template>not shown</template><p>ok</p>");
+        assert_eq!(shown.text, "ok");
+        assert_eq!(shown.hidden_elided, 0);
+    }
+
+    #[test]
+    fn a_hidden_subtree_deeper_than_the_stack_is_searched_without_recursion() {
+        // The search for text under a hidden element walks a list, not the
+        // call stack, so hostile nesting cannot overflow it.
+        const DEPTH: usize = 50_000;
+        let html = format!(
+            "<div style=\"display:none\">{}deep</div><p>ok</p>",
+            "<span>".repeat(DEPTH)
+        );
+        let e = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || extract(&html))
+            .expect("a thread")
+            .join()
+            .expect("the hidden subtree was searched without overflowing");
+        assert_eq!(e.text, "ok");
+        assert_eq!(e.hidden_elided, 1);
     }
 
     #[test]
