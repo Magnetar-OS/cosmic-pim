@@ -21,6 +21,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   over 34,557 documents — this crate's and Envelope's test fixtures, 30,000
   generated ones, and every HTML file and `.eml` in the suite's checkouts —
   every one gives the same result except the two that crashed.
+- **Deeply nested HTML no longer overflows the stack.** `mail::text::extract`
+  walked the tree one stack frame per element, so 600 KB of nested `<span>`
+  aborted a thread with a 2 MiB stack — the whole process, since a stack
+  overflow is not a panic. The walk keeps its pending work in a list; its
+  output is unchanged over the same 34,557 documents.
 
 ## [3.0.0] - 2026-10-06
 

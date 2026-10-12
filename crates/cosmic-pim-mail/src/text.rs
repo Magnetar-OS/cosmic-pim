@@ -211,12 +211,36 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    /// Depth-first walk. `bg` is the effective background color inherited
-    /// from ancestors (None once an ancestor set a background we can't parse
-    /// - then color-matching is skipped rather than guessed).
-    fn walk(&mut self, node: Id, bg: Option<Rgb>) {
+    /// Depth-first walk, in document order. `bg` is the effective
+    /// background color inherited from ancestors (None once an ancestor set a
+    /// background we can't parse - then color-matching is skipped rather than
+    /// guessed).
+    ///
+    /// The pending work is a list, not the call stack: markup nests as deep
+    /// as its sender likes, and a recursion one frame per element ran a
+    /// thread with a 2 MiB stack out of it on 600 KB of `<span>`.
+    fn walk(&mut self, root: Id, bg: Option<Rgb>) {
+        /// What is left to do, last first.
+        enum Step {
+            /// Read this node, under this inherited background.
+            Visit(Id, Option<Rgb>),
+            /// Close a block element whose children have all been read.
+            Newline,
+        }
         let dom = self.dom;
-        for &child in dom.children(node) {
+        let visit_children = |stack: &mut Vec<Step>, node: Id, bg: Option<Rgb>| {
+            stack.extend(dom.children(node).iter().rev().map(|&c| Step::Visit(c, bg)));
+        };
+        let mut stack = Vec::new();
+        visit_children(&mut stack, root, bg);
+        while let Some(step) = stack.pop() {
+            let (child, bg) = match step {
+                Step::Visit(child, bg) => (child, bg),
+                Step::Newline => {
+                    self.out.push('\n');
+                    continue;
+                }
+            };
             match dom.data(child) {
                 Data::Text(t) => self.out.push_str(t),
                 Data::Comment(c) => {
@@ -241,14 +265,11 @@ impl Walker<'_> {
                         }
                         continue; // drop the whole subtree
                     }
-                    let block = BLOCKS.contains(&tag.as_str());
-                    if block {
+                    if BLOCKS.contains(&tag.as_str()) {
                         self.out.push('\n');
+                        stack.push(Step::Newline);
                     }
-                    self.walk(child, next_bg);
-                    if block {
-                        self.out.push('\n');
-                    }
+                    visit_children(&mut stack, child, next_bg);
                 }
                 // A template's contents, a doctype: nothing a reader sees.
                 Data::Fragment | Data::Other | Data::Root => {}
@@ -581,6 +602,22 @@ mod tests {
             .expect("the hidden subtree was searched without overflowing");
         assert_eq!(e.text, "ok");
         assert_eq!(e.hidden_elided, 1);
+    }
+
+    #[test]
+    fn markup_nested_deeper_than_the_stack_is_read_without_recursion() {
+        // 50,000 open elements is 300 KB of mail. The walk read them one
+        // stack frame each, and a thread's stack is not that deep.
+        const DEPTH: usize = 50_000;
+        let html = format!("{}deep<div>er</div>", "<span>".repeat(DEPTH));
+        let e = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || extract(&html))
+            .expect("a thread")
+            .join()
+            .expect("the walk overflowed its stack");
+        assert_eq!(e.text, "deep\ner");
+        assert_eq!(e.hidden_elided, 0);
     }
 
     #[test]
