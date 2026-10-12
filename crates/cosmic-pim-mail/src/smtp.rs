@@ -163,6 +163,32 @@ pub fn send(
     }
 }
 
+/// Logs in to the submission server and leaves, sending nothing.
+///
+/// For an "add account" form, so a wrong password or port is reported while
+/// the person can still fix it instead of on the first send. A permanent
+/// refusal of the login is [`Error::Auth`]; a server that cannot be reached,
+/// a failed TLS handshake or a temporary refusal is [`Error::Transport`].
+/// Blocking.
+///
+/// # Errors
+///
+/// As above: [`Error::Auth`] or [`Error::Transport`].
+pub fn verify(endpoint: &SmtpEndpoint, credentials: &Credentials) -> crate::Result<()> {
+    let mut connection = connect(endpoint, credentials).map_err(|why| {
+        if why.is_permanent() {
+            Error::Auth(why.to_string())
+        } else {
+            Error::transport("SMTP", &why)
+        }
+    })?;
+    // Logged in is the answer; a failed QUIT changes nothing about it.
+    if let Err(why) = connection.quit() {
+        tracing::debug!(%why, "SMTP QUIT failed after a verified login");
+    }
+    Ok(())
+}
+
 /// How long any one step of the conversation may take before it is given up
 /// on — `lettre`'s own default.
 const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

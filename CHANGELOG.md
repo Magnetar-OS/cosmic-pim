@@ -17,6 +17,9 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `stamp.changed(path)` reports a different version once and moves the stamp
   to it. `FileStamp::default()` is "no file". Envelope, Slate and Circle each
   carried a copy of this check; theirs can go.
+- `mail::smtp::verify(endpoint, credentials) -> Result<()>`: logs in to the
+  submission server and leaves, sending nothing. A refused login is
+  `Error::Auth`, anything else `Error::Transport`.
 
 ### Fixed
 
