@@ -7,6 +7,17 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `account::FileStamp` (re-exported as `cosmic_pim_accounts::FileStamp`) and
+  `account::ACCOUNTS_FILE_CHECK_INTERVAL` (2 s): how a running application
+  notices that something else rewrote the shared account list.
+  `FileStamp::of(path)` is the file's size and modification time, or "no
+  file"; `FileStamp::accounts_file()` is that for `default_config_path()`;
+  `stamp.changed(path)` reports a different version once and moves the stamp
+  to it. `FileStamp::default()` is "no file". Envelope, Slate and Circle each
+  carried a copy of this check; theirs can go.
+
 ### Fixed
 
 - **An HTML message no longer crashes whatever reads it.**

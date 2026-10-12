@@ -130,6 +130,23 @@ itself, as any local server must. For a host written as a loopback address
 the TLS handshake accepts it; for every other host, including the name
 `localhost`, the certificate is verified as usual.
 
+**An account added in one application reaches the others while they run.**
+The account list is one file for the whole suite, and a running application
+notices that something else rewrote it by keeping the file's `FileStamp` —
+its size and modification time, one `stat` — and comparing it every
+`ACCOUNTS_FILE_CHECK_INTERVAL`:
+
+```rust
+use cosmic_pim_accounts::FileStamp;
+use cosmic_pim_accounts::account::default_config_path;
+
+let mut stamp = FileStamp::accounts_file(); // when the list is first read
+// …then on every tick:
+if stamp.changed(&default_config_path()) {
+    accounts.reload()?;
+}
+```
+
 ## Using these
 
 On crates.io. Depend on the crates you need:

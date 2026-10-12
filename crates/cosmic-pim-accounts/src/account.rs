@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -419,6 +420,93 @@ pub fn default_secret_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("cosmic-pim")
+}
+
+/// How often an application should look whether the shared account list
+/// changed on disk, with [`FileStamp::changed`].
+///
+/// A look is one `stat`, so this can be short: an account added in the
+/// Accounts window should appear in an open Envelope, Slate or Circle before
+/// the person has finished switching windows.
+pub const ACCOUNTS_FILE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One version of a file on disk, as far as one `stat` can tell: its size and
+/// its modification time, or that there is no file.
+///
+/// This is how a long-lived application notices that something else — the
+/// Accounts window, another app of the suite, the sync daemon — rewrote the
+/// shared account list ([`default_config_path`]) while it was running. It
+/// keeps the stamp of the version it last read, and on every
+/// [`ACCOUNTS_FILE_CHECK_INTERVAL`] asks [`changed`](Self::changed); only on
+/// `true` does it read the file again, with [`AccountStore::reload`] or
+/// [`AccountStore::open_default`].
+///
+/// # What counts as a change
+///
+/// - Two stamps are equal when the file had the same size and modification
+///   time both times, or was absent both times. A file whose metadata or
+///   modification time cannot be read stamps as absent.
+/// - Appearing, disappearing, and any write that moves the size or the
+///   modification time are changes. A rewrite that keeps both — the same
+///   number of bytes within one tick of the filesystem's clock — is not seen
+///   until the next write that does move one.
+/// - However many writes happened between two looks, they are one change:
+///   the file is read once per look, not once per write.
+///
+/// [`FileStamp::default()`] is the absent stamp, so a stamp that starts from
+/// it reports the first look at an existing file as a change. To skip that
+/// first read, start from [`FileStamp::accounts_file`] taken when the list was
+/// first read.
+///
+/// # Example
+///
+/// ```no_run
+/// use cosmic_pim_accounts::account::default_config_path;
+/// use cosmic_pim_accounts::{AccountStore, FileStamp};
+///
+/// # fn main() -> cosmic_pim_accounts::Result<()> {
+/// let mut stamp = FileStamp::accounts_file();
+/// let mut store = AccountStore::open_default()?;
+///
+/// // Every ACCOUNTS_FILE_CHECK_INTERVAL:
+/// if stamp.changed(&default_config_path()) {
+///     store.reload()?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileStamp(Option<(u64, SystemTime)>);
+
+impl FileStamp {
+    /// The stamp of the file at `path` as it is now.
+    #[must_use]
+    pub fn of(path: &Path) -> Self {
+        let read = || {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some((metadata.len(), metadata.modified().ok()?))
+        };
+        Self(read())
+    }
+
+    /// The stamp of the shared account list, [`default_config_path`], as it
+    /// is now.
+    #[must_use]
+    pub fn accounts_file() -> Self {
+        Self::of(&default_config_path())
+    }
+
+    /// Whether the file at `path` is now a different version from the one
+    /// this stamp names. When it is, the stamp moves to the new version, so
+    /// one change is reported once.
+    pub fn changed(&mut self, path: &Path) -> bool {
+        let now = Self::of(path);
+        if now == *self {
+            return false;
+        }
+        *self = now;
+        true
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1137,5 +1225,59 @@ mod tests {
             ),
             "a stale handle edited an account that no longer exists"
         );
+    }
+
+    #[test]
+    fn a_change_to_the_account_list_changes_its_stamp() {
+        // The stamp is how an account added in the Accounts window reaches
+        // an app that is already running, without a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.toml");
+        assert_eq!(FileStamp::of(&path), FileStamp::default());
+
+        std::fs::write(&path, "").unwrap();
+        let empty = FileStamp::of(&path);
+        std::fs::write(&path, "[[account]]\nid = \"a\"\n").unwrap();
+
+        assert_ne!(empty, FileStamp::default());
+        assert_ne!(FileStamp::of(&path), empty);
+    }
+
+    #[test]
+    fn the_account_list_is_read_once_per_look_however_often_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.toml");
+        let mut last = FileStamp::of(&path);
+
+        // Nothing there, nothing written: nothing to read.
+        assert!(!last.changed(&path));
+
+        // The Accounts window adding an account is several writes: the
+        // account, then what discovery found for it.
+        std::fs::write(&path, "[[account]]\nid = \"a\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "[[account]]\nid = \"a\"\nurl = \"https://dav.example\"\n",
+        )
+        .unwrap();
+        assert!(last.changed(&path));
+        assert!(!last.changed(&path), "one change was read twice");
+        assert!(!last.changed(&path));
+
+        // Every account removed, and the file with them.
+        std::fs::remove_file(&path).unwrap();
+        assert!(last.changed(&path));
+        assert!(!last.changed(&path));
+    }
+
+    #[test]
+    fn a_stamp_that_starts_absent_reads_an_existing_list_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.toml");
+        std::fs::write(&path, "").unwrap();
+
+        let mut last = FileStamp::default();
+        assert!(last.changed(&path), "the list already there was never read");
+        assert!(!last.changed(&path));
     }
 }
