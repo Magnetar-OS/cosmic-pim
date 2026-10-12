@@ -27,7 +27,7 @@
 //! zero-width splices, HTML comments. A tag-stripper reads a *different
 //! message* than its user sees. So the walk is over an html5ever tree — the
 //! same tree a browser would build, held by this module's own small sink
-//! ([`dom`]) — and drops what a human could not have read.
+//! (`text/dom.rs`) — and drops what a human could not have read.
 //!
 //! And it **counts what it dropped**. A message whose visible text is three
 //! words and whose hidden text is three paragraphs is worth saying so about;
