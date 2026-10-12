@@ -134,11 +134,15 @@ impl Plan {
 /// an address to find them at — its own, or its provider's.
 #[must_use]
 pub fn services_of(account: &Account, registry: &Registry) -> Services {
-    use crate::engine::{Service, service_url};
+    use cosmic_pim_accounts::DavService;
     Services {
         mail: account.mail.is_some(),
-        calendar: !service_url(account, registry, Service::Calendar).is_empty(),
-        contacts: !service_url(account, registry, Service::Contacts).is_empty(),
+        calendar: account
+            .service_url(registry, DavService::Calendar)
+            .is_some(),
+        contacts: account
+            .service_url(registry, DavService::Contacts)
+            .is_some(),
     }
 }
 
@@ -504,13 +508,12 @@ fn verify_mail(account: &Account, registry: &Registry, password: &str) -> Result
 
 /// Finds the principal on the account's calendar server, which needs a login.
 fn verify_dav(account: &Account, registry: &Registry, password: &str) -> Result<(), SetupError> {
-    let url = crate::engine::service_url(account, registry, crate::engine::Service::Calendar);
-    if url.is_empty() {
+    let Some(url) = account.service_url(registry, cosmic_pim_accounts::DavService::Calendar) else {
         // Nothing to log in to: an account with neither mail nor a calendar
         // address was never going to sync, and the form should not have let
         // it through. Stored as it is rather than refused on a technicality.
         return Ok(());
-    }
+    };
     log_in_to_dav(
         &url,
         &account.username,

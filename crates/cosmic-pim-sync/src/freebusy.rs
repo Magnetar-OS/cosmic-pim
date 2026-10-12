@@ -78,7 +78,9 @@ pub fn availability(
 
     let secret = cosmic_pim_auth::resolve(accounts, registry, account_id).map_err(Error::Auth)?;
     let auth = crate::engine::dav_auth(&account, &secret);
-    let url = crate::engine::service_url(&account, registry, crate::engine::Service::Calendar);
+    let url = account
+        .service_url(registry, cosmic_pim_accounts::DavService::Calendar)
+        .unwrap_or_default();
 
     let client = CaldavClient::with_auth(&url, Flavor::CalDav, &auth);
     let Some(outbox) = client.discover_scheduling()?.outbox_url else {

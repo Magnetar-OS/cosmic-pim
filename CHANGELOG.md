@@ -17,6 +17,14 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `stamp.changed(path)` reports a different version once and moves the stamp
   to it. `FileStamp::default()` is "no file". Envelope, Slate and Circle each
   carried a copy of this check; theirs can go.
+- `Account::service_url(&self, registry: &Registry, service: DavService) ->
+  Option<String>` and `account::DavService { Calendar, Contacts }`
+  (re-exported at the crate root): where an account's calendars or address
+  books live — its own URL when the user typed one, else the provider's
+  address for that service with the username filled in, and an old account
+  carrying the provider's calendar address as its URL gets each service's
+  own. `None` for a mail-only account. This was the sync engine's private
+  rule; Slate and Circle restated it, and can now ask instead.
 - `sync::setup::add_with_mail_servers(store, plan, name, mail: MailEndpoint,
   password) -> Result<String, SetupError>` (feature `mail`): a password
   account at mail servers the person named — IMAP, POP3 or JMAP, and the SMTP

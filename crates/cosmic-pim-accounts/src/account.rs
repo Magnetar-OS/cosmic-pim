@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::credential::OAuthCredential;
 use crate::error::{Error, Result};
+use crate::provider::Registry;
 use crate::secret::SecretStore;
 
 /// How an account authenticates.
@@ -387,6 +388,56 @@ impl Account {
 /// What the id of an account backed by GNOME Online Accounts starts with. See
 /// [`Account::for_online_account`].
 const ONLINE_ACCOUNT_PREFIX: &str = "goa-";
+
+/// The two services an account can have a DAV address for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DavService {
+    /// CalDAV: calendars and tasks.
+    Calendar,
+    /// CardDAV: address books.
+    Contacts,
+}
+
+impl Account {
+    /// Where this account's `service` collections live — the address the sync
+    /// engine starts discovery at. `None` when there is none: a mail-only
+    /// account, or a provider whose manifest has no such service.
+    ///
+    /// An account the user typed in carries its own URL and that wins, for
+    /// both services — it is the more specific fact, and a self-hosted server
+    /// has no manifest. An account created from a provider has an empty URL
+    /// and takes the manifest's address for each service, with `{username}`
+    /// filled in, because `https://apidata.googleusercontent.com/caldav/v2/`
+    /// is not something anyone types from memory, and because the address is
+    /// a property of the provider rather than of the account. The provider is
+    /// looked up in `registry` by [`Account::provider`].
+    ///
+    /// One URL is not the user's own even though the account carries it:
+    /// before 3.0 `Provider::account_for` stored the provider's *calendar*
+    /// address as the account's URL, and those accounts are still in
+    /// `accounts.toml`. Taken at its word, such an account would go on asking
+    /// the calendar host for its address books. So a URL that is exactly the
+    /// provider's calendar address is read as "the provider's", and each
+    /// service gets its own.
+    #[must_use]
+    pub fn service_url(&self, registry: &Registry, service: DavService) -> Option<String> {
+        let provider = self.provider.as_deref().and_then(|id| registry.get(id));
+        let own = self.url.trim();
+        let inherited = provider
+            .and_then(|provider| provider.calendar_url(&self.username))
+            .is_some_and(|calendar| calendar == own);
+        if !own.is_empty() && !inherited {
+            return Some(self.url.clone());
+        }
+
+        provider
+            .and_then(|provider| match service {
+                DavService::Calendar => provider.calendar_url(&self.username),
+                DavService::Contacts => provider.contacts_url(&self.username),
+            })
+            .filter(|url| !url.trim().is_empty())
+    }
+}
 
 /// Where account metadata lives: `$XDG_CONFIG_HOME/cosmic-pim/accounts.toml`.
 ///
@@ -1279,5 +1330,121 @@ mod tests {
         let mut last = FileStamp::default();
         assert!(last.changed(&path), "the list already there was never read");
         assert!(!last.changed(&path));
+    }
+
+    #[test]
+    fn a_provider_account_finds_its_contacts_at_the_providers_contacts_address() {
+        // Fastmail's calendars and address books are on different hosts. An
+        // account that carried the calendar address as its own URL sent the
+        // CardDAV pass there too, and no address book was ever found.
+        let registry = Registry::load_from(std::path::Path::new("/nonexistent"));
+        let account = registry
+            .get("fastmail")
+            .expect("built in")
+            .account_for("ada@fastmail.com");
+
+        assert_eq!(
+            account
+                .service_url(&registry, DavService::Calendar)
+                .unwrap(),
+            "https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/"
+        );
+        assert_eq!(
+            account
+                .service_url(&registry, DavService::Contacts)
+                .unwrap(),
+            "https://carddav.fastmail.com/dav/addressbooks/user/ada@fastmail.com/"
+        );
+    }
+
+    #[test]
+    fn an_account_stored_before_the_fix_finds_its_contacts_too() {
+        // Such an account carries the provider's calendar address as its own
+        // URL, and nothing rewrites `accounts.toml` for it.
+        let registry = Registry::load_from(std::path::Path::new("/nonexistent"));
+        let provider = registry.get("fastmail").expect("built in");
+        let mut account = provider.account_for("ada@fastmail.com");
+        account.url = provider
+            .calendar_url("ada@fastmail.com")
+            .expect("a calendar");
+
+        assert_eq!(
+            account
+                .service_url(&registry, DavService::Contacts)
+                .unwrap(),
+            "https://carddav.fastmail.com/dav/addressbooks/user/ada@fastmail.com/"
+        );
+        assert_eq!(
+            account
+                .service_url(&registry, DavService::Calendar)
+                .unwrap(),
+            "https://caldav.fastmail.com/dav/calendars/user/ada@fastmail.com/"
+        );
+    }
+
+    #[test]
+    fn a_url_the_user_typed_wins_over_the_providers_for_both_services() {
+        // A self-hosted server reached through a provider entry: the typed
+        // address is the more specific fact.
+        let registry = Registry::load_from(std::path::Path::new("/nonexistent"));
+        let mut account = registry
+            .get("fastmail")
+            .expect("built in")
+            .account_for("ada@fastmail.com");
+        account.url = "https://dav.example.org/".to_owned();
+
+        for service in [DavService::Calendar, DavService::Contacts] {
+            assert_eq!(
+                account.service_url(&registry, service).unwrap(),
+                "https://dav.example.org/"
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_that_typed_its_own_url_keeps_it() {
+        // A self-hosted server has no manifest, and a provider's address must
+        // never override one a user entered.
+        let registry = Registry::load_from(std::path::Path::new("/nonexistent"));
+        let mut account = Account::new("Nextcloud", "https://cloud.example/dav/", "ada");
+        account.provider = Some("google".into());
+
+        assert_eq!(
+            account
+                .service_url(&registry, DavService::Calendar)
+                .unwrap(),
+            "https://cloud.example/dav/"
+        );
+    }
+
+    #[test]
+    fn an_account_created_from_a_provider_takes_the_manifests_address() {
+        let registry = Registry::load_from(std::path::Path::new("/nonexistent"));
+        let mut account = Account::new("Google", "", "ada@gmail.com");
+        account.provider = Some("google".into());
+
+        assert_eq!(
+            account
+                .service_url(&registry, DavService::Calendar)
+                .unwrap(),
+            "https://apidata.googleusercontent.com/caldav/v2/"
+        );
+        assert!(
+            account
+                .service_url(&registry, DavService::Contacts)
+                .unwrap()
+                .contains("ada@gmail.com"),
+            "the username was not substituted into the CardDAV address"
+        );
+    }
+
+    #[test]
+    fn a_mail_only_account_has_no_dav_address() {
+        let registry = Registry::load_from(std::path::Path::new("/nonexistent"));
+        let account = Account::new("Mail", "", "ada@uni.example");
+
+        for service in [DavService::Calendar, DavService::Contacts] {
+            assert_eq!(account.service_url(&registry, service), None);
+        }
     }
 }
