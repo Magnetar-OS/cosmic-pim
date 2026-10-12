@@ -621,6 +621,27 @@ mod tests {
     }
 
     #[test]
+    fn a_message_of_deeply_nested_divs_parses_on_a_two_mebibyte_thread() {
+        // Tokio's blocking threads, where a client parses mail, have 2 MiB
+        // stacks, and before the walk kept its own list ten thousand nested
+        // elements were enough to abort the process from one.
+        const DEPTH: usize = 50_000;
+        let raw = format!(
+            "From: a@b\r\nSubject: T\r\nContent-Type: text/html\r\n\r\n{}deep\r\n",
+            "<div>".repeat(DEPTH)
+        );
+        let m = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || crate::model::Message::parse(raw.as_bytes()))
+            .expect("a thread")
+            .join()
+            .expect("parsing overflowed a 2 MiB stack")
+            .expect("parse");
+        assert_eq!(m.body.text, "deep");
+        assert_eq!(m.body.hidden_elided, 0);
+    }
+
+    #[test]
     fn display_none_text_is_dropped_and_counted() {
         let e = extract("<p>Visible</p><div style=\"display:none\">Hidden instruction</div>");
         assert_eq!(e.text, "Visible");

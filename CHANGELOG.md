@@ -40,10 +40,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
   `Error::Status`, `Disposition::NeedsUser`, and `setup` says
   `SetupError::Rejected`.
 - **Deeply nested HTML no longer overflows the stack.** `mail::text::extract`
-  walked the tree one stack frame per element, so 600 KB of nested `<span>`
-  aborted a thread with a 2 MiB stack — the whole process, since a stack
-  overflow is not a panic. The walk keeps its pending work in a list; its
-  output is unchanged over the same 34,557 documents.
+  walked the tree one stack frame per element, so `Message::parse` on about
+  10,000 nested elements aborted a tokio blocking thread (2 MiB of stack) —
+  the whole process, since a stack overflow is not a panic. The walk keeps
+  its pending work in a list; 50,000 nested `<div>`s parse on a 2 MiB thread,
+  and the output is unchanged over the same 34,557 documents.
 
 ## [3.0.0] - 2026-10-06
 
