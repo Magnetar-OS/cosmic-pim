@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-accounts"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-auth"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-caldav"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "base64 0.23.1",
  "calcard",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-core"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "base64 0.23.1",
  "calcard",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-mail"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-sync"
-version = "3.1.0"
+version = "3.2.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",

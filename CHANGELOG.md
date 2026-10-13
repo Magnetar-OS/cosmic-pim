@@ -7,6 +7,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-10-13
+
+A minor version with one addition, `setup::add_with_dav_login`: a typed
+CalDAV or CardDAV account from a login, with no email address and so no
+`Plan`. Code built against 3.1.0 compiles unchanged, and `add_with_dav_url`
+behaves as before. Consumers stay on `"3"`.
+
 ### Added
 
 - `sync::setup::add_with_dav_login(store, name, url, username, password) ->
