@@ -16,7 +16,8 @@
 //!   could have been fixed.
 //! - [`add_with_mail_servers`] and [`add_with_dav_url`] — the same, at
 //!   servers the person named, for a domain whose servers cannot be found
-//!   from the address.
+//!   from the address. [`add_with_dav_login`] is the DAV one for a server
+//!   form, which has a login and no address.
 //! - [`sign_in`] — the provider's own sign-in in the browser. The account is
 //!   named after whoever actually signed in, not after what was typed.
 //!   [`sign_in_with_provider`] is the same with the provider picked by the
@@ -301,17 +302,51 @@ pub fn add_with_mail_servers(
 /// Stores a calendars-and-contacts account at a CalDAV or CardDAV address the
 /// person typed, after logging in to it with the password.
 ///
-/// `url` is where discovery starts — a server root, a principal or a home, as
-/// for [`Account::url`]. `username` is the login; empty means `plan.address`.
-/// The server is asked for its calendars first and, when it has none to
-/// offer, for its address books, so a contacts-only server is accepted too.
-/// A refused login is [`SetupError::Rejected`] and is not tried twice.
+/// This is [`add_with_dav_login`] for a form that starts from an email
+/// address: the plan's address stands in for an empty `username`, and for an
+/// empty `name`.
 ///
 /// The account has no mail and no provider. Blocking. Returns the new
-/// account's id. `name` is as for [`add_with_password`].
+/// account's id.
 pub fn add_with_dav_url(
     store: &mut AccountStore,
     plan: &Plan,
+    name: &str,
+    url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, SetupError> {
+    let or_address = |text: &str| match text.trim() {
+        "" => plan.address.clone(),
+        text => text.to_owned(),
+    };
+    add_with_dav_login(
+        store,
+        &or_address(name),
+        url,
+        &or_address(username),
+        password,
+    )
+}
+
+/// Stores a calendars-and-contacts account at a CalDAV or CardDAV address and
+/// login the person typed, after logging in to it with the password.
+///
+/// For a server form, which has a login rather than an email address, so no
+/// [`Plan`] is needed. `url` is where discovery starts — a server root, a
+/// principal or a home, as for [`Account::url`]. `username` is the login, sent
+/// as typed (trimmed). The server is asked for its calendars first and, when it
+/// has none to offer, for its address books, so a contacts-only server is
+/// accepted too. A `url` that does not start `http://` or `https://` is
+/// [`SetupError::NoServer`] before any request. A refused login is
+/// [`SetupError::Rejected`] and is not tried twice; other failures report the
+/// CalDAV attempt.
+///
+/// `name` is what the account is called; empty means the login. The account
+/// has no mail and no provider. Blocking, so a worker call. Returns the new
+/// account's id.
+pub fn add_with_dav_login(
+    store: &mut AccountStore,
     name: &str,
     url: &str,
     username: &str,
@@ -326,11 +361,8 @@ pub fn add_with_dav_url(
             url.escape_debug()
         )));
     }
-    let login = match username.trim() {
-        "" => plan.address.as_str(),
-        login => login,
-    };
-    let mut account = Account::new(&plan.address, url, login);
+    let login = username.trim();
+    let mut account = Account::new(login, url, login);
     name_account(&mut account, name);
 
     if let Err(calendars) = log_in_to_dav(url, login, password, Flavor::CalDav) {
@@ -1413,6 +1445,73 @@ mod tests {
 
         let error =
             add_with_dav_url(&mut store, &plan, "", "dav.nowhere.example", "", "x").unwrap_err();
+
+        assert!(matches!(error, SetupError::NoServer(_)), "got {error}");
+        assert_eq!(store.accounts(), []);
+    }
+
+    #[test]
+    fn a_typed_dav_address_and_a_login_need_no_email_address() {
+        // A server form has a login, not an address: nothing is invented to
+        // stand in for one, and the account is named after the login.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let url = dav_server("right", true);
+
+        let id = add_with_dav_login(&mut store, "", &url, " ada ", "right")
+            .expect("the login was accepted");
+
+        let account = store.get(&id).unwrap();
+        assert_eq!(account.url, url);
+        assert_eq!(account.username, "ada");
+        assert_eq!(account.display_name, "ada");
+        assert_eq!(account.provider, None);
+        assert!(account.mail.is_none());
+        assert_eq!(store.password(&id).unwrap().as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn a_typed_dav_login_keeps_the_name_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let url = dav_server("right", true);
+
+        let id = add_with_dav_login(&mut store, "Home server", &url, "ada", "right").unwrap();
+
+        assert_eq!(store.get(&id).unwrap().display_name, "Home server");
+    }
+
+    #[test]
+    fn a_typed_dav_login_the_server_refuses_is_rejected_and_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let url = dav_server("right", true);
+
+        let error = add_with_dav_login(&mut store, "", &url, "ada", "wrong").unwrap_err();
+
+        assert!(matches!(error, SetupError::Rejected(_)), "got {error}");
+        assert_eq!(store.accounts(), []);
+    }
+
+    #[test]
+    fn a_typed_dav_login_at_a_contacts_only_server_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+        let url = dav_server("right", false);
+
+        let id = add_with_dav_login(&mut store, "", &url, "ada", "right")
+            .expect("the address book home was found");
+
+        assert_eq!(store.get(&id).unwrap().url, url);
+    }
+
+    #[test]
+    fn a_typed_dav_login_at_text_that_is_not_a_web_address_is_not_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store_at(dir.path());
+
+        let error =
+            add_with_dav_login(&mut store, "", "dav.nowhere.example", "ada", "x").unwrap_err();
 
         assert!(matches!(error, SetupError::NoServer(_)), "got {error}");
         assert_eq!(store.accounts(), []);

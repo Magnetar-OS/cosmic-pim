@@ -7,6 +7,17 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `sync::setup::add_with_dav_login(store, name, url, username, password) ->
+  Result<String, SetupError>`: `add_with_dav_url` without a `Plan`, for a
+  server form that has a login and no email address. It tries the login at the
+  typed CalDAV or CardDAV address and stores the account only when the server
+  took it; an empty `name` means the login. Slate and Circle built a plan from
+  `login@server.invalid` to call `add_with_dav_url`; they no longer need to.
+  `add_with_dav_url` is now this call with the plan's address standing in for
+  an empty name or login, and behaves as before.
+
 ## [3.1.0] - 2026-10-13
 
 A minor version: every API change is an addition — `FileStamp` and
