@@ -7,6 +7,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-10-21
+
+A minor version for a security fix in the OpenPGP reader and a raised
+minimum Rust version. The API is unchanged; consumers stay on "3".
+
 ### Changed
 
 - The minimum supported Rust version is 1.99.1, raised from 1.99.0. The pinned
