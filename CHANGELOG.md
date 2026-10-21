@@ -7,6 +7,11 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The minimum supported Rust version is 1.99.1, raised from 1.99.0. The pinned
+  toolchain and `rust-version` move together.
+
 ## [3.2.0] - 2026-10-13
 
 A minor version with one addition, `setup::add_with_dav_login`: a typed

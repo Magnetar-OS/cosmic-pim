@@ -10,5 +10,5 @@
 # assumed. CI compares the two, because nothing else does.
 # (cosmic-conventions.md: "Toolchain pinned in one place".)
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
