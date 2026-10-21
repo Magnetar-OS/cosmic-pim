@@ -11,6 +11,17 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 - The minimum supported Rust version is 1.99.1, raised from 1.99.0. The pinned
   toolchain and `rust-version` move together.
+- `cosmic-pim-mail` reads OpenPGP with rpgp 0.21, up from 0.20. No public type
+  comes from rpgp, so the API is unchanged.
+
+### Fixed
+
+- `mail::pgp::decrypt` panicked inside rpgp, rather than returning an error,
+  on a message whose X25519 session key is too short
+  ([GHSA-939f-rrrj-p2pc](https://github.com/advisories/GHSA-939f-rrrj-p2pc)).
+  Anyone who could send mail to the holder of an X25519 key could crash the
+  reader that opened it. rpgp 0.21 rejects the key, and the caller gets a
+  decryption error.
 
 ## [3.2.0] - 2026-10-13
 

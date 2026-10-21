@@ -29,7 +29,7 @@ mail-parser = "0.11"
 # only — this crate never generates a key, so rpgp's `rand` requirement (it
 # is on 0.8, a major version behind everything else here) stays out of the
 # tree entirely.
-pgp = "0.20"
+pgp = "0.21"
 
 # IMAP. `default-features = false` + `native-tls` deliberately, matching the
 # donor: `imap` links native-tls and mixing TLS stacks in one binary is a
