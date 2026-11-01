@@ -38,7 +38,7 @@ rrule = "0.14"
 # --- storage ---
 # `bundled` compiles SQLite from source so we never depend on the host's
 # libsqlite3 version.
-rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 notify = "8.2"
 
 # --- misc ---

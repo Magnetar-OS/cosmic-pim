@@ -7,6 +7,36 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-01
+
+A major version for two dependencies that are part of the API: rusqlite
+0.41 and mail-parser 1.0. Nothing of cosmic-pim's own changed shape.
+Consumers move from `"3"` to `"4"`, and an application that links rusqlite
+itself moves to 0.41 in the same change: two rusqlite majors in one binary
+both link `sqlite3` and cargo refuses the graph.
+
+### Breaking
+
+- `core::store::Error::Sqlite` carries rusqlite 0.41's `Error`, up from 0.40.
+- `mail::auth::from_message` takes a mail-parser 1.0 `Message`, up from 0.11.
+
+### Changed
+
+- Mail is parsed with mail-parser 1.0, a rewrite of 0.11. What reaches the
+  model is the same for well-formed mail; the 1,402 tests that predate it
+  pass unchanged. Malformed mail is read the way 1.0 reads it, which is closer to
+  the RFCs: a `--boundary` in the middle of a line no longer cuts a part
+  short, a final unpadded base64 quantum is decoded rather than dropped, and
+  a quoted-printable body containing `==` keeps its text rather than losing
+  the part.
+- `mail::Message::parse` returns `None` for input with no header field and
+  no blank line, which 1.0 does not read as a message. It returned an empty
+  message.
+- A `multipart/signed` message's signed entity ends where RFC 2046 ends a
+  part, before the line break that precedes the delimiter. A signature that
+  covers that line break too still verifies: both readings are tried, as
+  before, and neither adds a byte that was not transmitted.
+
 ## [3.3.0] - 2026-10-21
 
 A minor version for a security fix in the OpenPGP reader and a raised

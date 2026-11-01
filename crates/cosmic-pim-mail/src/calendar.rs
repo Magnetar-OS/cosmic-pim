@@ -9,7 +9,7 @@
 //! the calendar library, not here. That split is the whole cross-process
 //! contract: the mailer moves bytes, the calendar decides.
 
-use mail_parser::{MessageParser, MimeHeaders as _};
+use mail_parser::MessageParser;
 
 /// A scheduling payload found in a message, verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub struct Invitation {
 #[must_use]
 pub fn invitation(raw: &[u8]) -> Option<Invitation> {
     let parsed = MessageParser::default().parse(raw)?;
-    for part in &parsed.parts {
+    for part in parsed.root().parts() {
         let Some(content_type) = part.content_type() else {
             continue;
         };
@@ -44,7 +44,10 @@ pub fn invitation(raw: &[u8]) -> Option<Invitation> {
         {
             continue;
         }
-        let ics = String::from_utf8_lossy(part.contents()).into_owned();
+        let ics = part.text().map_or_else(
+            || String::from_utf8_lossy(&part.decoded()).into_owned(),
+            std::borrow::Cow::into_owned,
+        );
         // The Content-Type `method` parameter is authoritative when present
         // (RFC 6047 §2.4); the METHOD property inside the payload is the
         // fallback, because real senders routinely omit the parameter.

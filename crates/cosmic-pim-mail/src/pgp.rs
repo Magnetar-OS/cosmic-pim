@@ -45,7 +45,7 @@
 //! and [`Verdict::Invalid`], a signature that was checked and failed. The
 //! first is ordinary; the second means someone changed the message.
 
-use mail_parser::{MessageParser, MimeHeaders as _};
+use mail_parser::{MessageParser, MessagePart};
 use pgp::composed::{Deserializable as _, DetachedSignature, Message, SignedPublicKey};
 use pgp::types::{KeyDetails as _, Password};
 
@@ -175,7 +175,7 @@ pub fn decrypt(
 /* ---------------- detection ---------------- */
 
 /// The `protocol` parameter of a multipart content type, lowercased.
-fn protocol_of(part: &mail_parser::MessagePart<'_>) -> Option<String> {
+fn protocol_of(part: MessagePart<'_>) -> Option<String> {
     part.content_type()?
         .attribute("protocol")
         .map(|value| value.trim().to_ascii_lowercase())
@@ -189,12 +189,12 @@ fn protocol_of(part: &mail_parser::MessagePart<'_>) -> Option<String> {
 /// wrapped beside text of their own (the MIME-wrapping spoof). Treating the
 /// first such part found anywhere as the message's own gave the attacker's
 /// text the real sender's tick (audit F-45).
-fn root<'a>(message: &'a mail_parser::Message<'a>) -> Option<&'a mail_parser::MessagePart<'a>> {
-    message.parts.first()
+fn root<'a>(message: &'a mail_parser::Message<'_>) -> MessagePart<'a> {
+    message.root_part()
 }
 
 /// Whether `part` is a `multipart/<subtype>` naming `protocol`.
-fn is_multipart(part: &mail_parser::MessagePart<'_>, subtype: &str, protocol: &str) -> bool {
+fn is_multipart(part: MessagePart<'_>, subtype: &str, protocol: &str) -> bool {
     part.content_type()
         .is_some_and(|ct| ct.ctype().eq_ignore_ascii_case("multipart"))
         && part
@@ -204,36 +204,23 @@ fn is_multipart(part: &mail_parser::MessagePart<'_>, subtype: &str, protocol: &s
         && protocol_of(part).as_deref() == Some(protocol)
 }
 
-/// The children of a multipart part, in order.
-fn children<'a>(
-    message: &'a mail_parser::Message<'a>,
-    part: &mail_parser::MessagePart<'_>,
-) -> Vec<&'a mail_parser::MessagePart<'a>> {
-    let mail_parser::PartType::Multipart(ids) = &part.body else {
-        return Vec::new();
-    };
-    ids.iter()
-        .filter_map(|id| message.parts.get(usize::try_from(*id).ok()?))
-        .collect()
-}
-
 /// RFC 3156 §4: the message is `multipart/encrypted` naming the PGP protocol.
 ///
 /// The protocol check is what keeps S/MIME out. Both formats use the same
 /// multipart wrappers and differ only here, so a client that matches on the
 /// wrapper alone reports every S/MIME message as broken PGP.
 fn is_pgp_encrypted(message: &mail_parser::Message<'_>) -> bool {
-    root(message).is_some_and(|part| is_multipart(part, "encrypted", "application/pgp-encrypted"))
+    is_multipart(root(message), "encrypted", "application/pgp-encrypted")
 }
 
 /// The armored ciphertext of a `multipart/encrypted` message: its second
 /// part, per RFC 3156 §4 — the first is the version control part.
 fn encrypted_payload(message: &mail_parser::Message<'_>) -> Option<Vec<u8>> {
-    let root = root(message)?;
+    let root = root(message);
     if !is_multipart(root, "encrypted", "application/pgp-encrypted") {
         return None;
     }
-    let payload = *children(message, root).get(1)?;
+    let payload = root.children().nth(1)?;
     payload
         .content_type()
         .is_some_and(|ct| {
@@ -242,7 +229,7 @@ fn encrypted_payload(message: &mail_parser::Message<'_>) -> Option<Vec<u8>> {
                     .subtype()
                     .is_some_and(|s| s.eq_ignore_ascii_case("octet-stream"))
         })
-        .then(|| payload.contents().to_vec())
+        .then(|| payload.decoded().into_owned())
 }
 
 /// The byte range the signature covers, plus the armored signature.
@@ -251,26 +238,28 @@ fn encrypted_payload(message: &mail_parser::Message<'_>) -> Option<Vec<u8>> {
 /// whose first part is the signed entity and whose second is the signature.
 /// The signed range runs from the part's *header* offset to its end, because
 /// the signature was computed over the transmitted entity — headers included,
-/// not merely its decoded body.
+/// not merely its decoded body. The end is where RFC 2046 puts it: before the
+/// line break that precedes the next delimiter, which belongs to the
+/// delimiter.
 ///
 /// Only the message's root is looked at — see [`root`]. A message whose
 /// signed part sits deeper, beside unsigned parts, is not a signed message.
 fn signed_parts(message: &mail_parser::Message<'_>) -> Option<(std::ops::Range<usize>, String)> {
-    let wrapper = root(message)?;
+    let wrapper = root(message);
     if !is_multipart(wrapper, "signed", "application/pgp-signature") {
         return None;
     }
-    let parts = children(message, wrapper);
-    let content = *parts.first()?;
-    let signature_part = *parts.get(1)?;
+    let mut parts = wrapper.children();
+    let content = parts.next()?;
+    let signature_part = parts.next()?;
 
-    let armored = String::from_utf8(signature_part.contents().to_vec()).ok()?;
+    let armored = String::from_utf8(signature_part.decoded().into_owned()).ok()?;
     if !armored.contains("BEGIN PGP SIGNATURE") {
         return None;
     }
 
-    let start = usize::try_from(content.offset_header).ok()?;
-    let end = usize::try_from(content.offset_end).ok()?;
+    let start = usize::try_from(content.offset_header()).ok()?;
+    let end = usize::try_from(content.offset_end()).ok()?;
     (start < end).then_some((start..end, armored))
 }
 
@@ -279,20 +268,21 @@ fn signed_parts(message: &mail_parser::Message<'_>) -> Option<(std::ops::Range<u
 fn sender_address(message: &mail_parser::Message<'_>) -> String {
     message
         .from()
-        .and_then(mail_parser::Address::first)
-        .and_then(|addr| addr.address())
+        .and_then(|list| list.first())
+        .and_then(|mailbox| mailbox.address())
         .map(|a| a.trim().to_ascii_lowercase())
         .unwrap_or_default()
 }
 
 /// Verifies a detached signature over the exact transmitted bytes.
 ///
-/// Three candidate ranges are tried, because implementations disagree about
-/// the trailing CRLF before the boundary: RFC 3156 says the line ending
-/// belongs to the boundary rather than the content, and enough signers get
-/// this wrong in each direction that accepting only one reading rejects real,
-/// unmodified mail. All three are *narrowings* of the original bytes — none
-/// invents content — so a forgery still fails all three.
+/// Two candidate ranges are tried, because implementations disagree about
+/// the line break before the boundary: RFC 3156 says it belongs to the
+/// boundary rather than the content, and enough signers include it anyway
+/// that accepting only one reading rejects real, unmodified mail. `range` is
+/// the RFC reading; the other is the same range with that line break. Both
+/// are the transmitted bytes — neither invents content — so a forgery still
+/// fails both.
 fn verify_detached(
     raw: &[u8],
     range: std::ops::Range<usize>,
@@ -305,12 +295,14 @@ fn verify_detached(
         // be claimed. Emphatically not `Invalid`.
         return Verdict::UnknownSigner;
     };
-    let Some(signed) = raw.get(range) else {
+    let Some(signed) = raw.get(range.clone()) else {
         return Verdict::UnknownSigner;
     };
-
-    let trimmed = signed.strip_suffix(b"\r\n").unwrap_or(signed);
-    let candidates: [&[u8]; 2] = [signed, trimmed];
+    let with_line_break = [&b"\r\n"[..], b"\n"].into_iter().find_map(|eol| {
+        raw.get(range.start..range.end + eol.len())
+            .filter(|bytes| bytes.ends_with(eol))
+    });
+    let candidates: Vec<&[u8]> = std::iter::once(signed).chain(with_line_break).collect();
 
     for certificate in keys {
         let verifies = candidates.iter().any(|bytes| {
@@ -430,6 +422,17 @@ mod tests {
     /// transmitted bytes of the first part, headers included, which is the
     /// whole subtlety of RFC 3156.
     fn signed_message(secret: &SignedSecretKey, from: &str, body: &str) -> Vec<u8> {
+        signed_message_over(secret, from, body, "")
+    }
+
+    /// [`signed_message`], with `suffix` — the bytes that follow the entity
+    /// in the message — signed along with it.
+    fn signed_message_over(
+        secret: &SignedSecretKey,
+        from: &str,
+        body: &str,
+        suffix: &str,
+    ) -> Vec<u8> {
         let entity = format!("Content-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n");
         let signing: &dyn pgp::types::SigningKey = secret
             .secret_subkeys
@@ -443,7 +446,7 @@ mod tests {
             &Box::new(signing),
             &Password::empty(),
             HashAlgorithm::Sha256,
-            entity.as_bytes(),
+            format!("{entity}{suffix}").as_bytes(),
         )
         .unwrap()
         .to_armored_string(ArmorOptions::default())
@@ -457,6 +460,24 @@ mod tests {
              --BB\r\nContent-Type: application/pgp-signature\r\n\r\n{signature}\r\n--BB--\r\n"
         )
         .into_bytes()
+    }
+
+    /// RFC 3156 puts the line break before the delimiter outside the signed
+    /// entity, and the parser bounds the part the same way. A signer that
+    /// signed that line break too is still the sender: those are the bytes
+    /// on the wire.
+    #[test]
+    fn a_signature_that_also_covers_the_delimiter_line_break_verifies() {
+        let (secret, certificate) = identity("him@example.com");
+        let raw = signed_message_over(&secret, "him@example.com", "the original text", "\r\n");
+
+        let examined = examine(&raw, std::slice::from_ref(&certificate));
+        assert_eq!(
+            examined.verdict,
+            Verdict::Verified {
+                signer: "him@example.com".to_owned()
+            }
+        );
     }
 
     #[test]

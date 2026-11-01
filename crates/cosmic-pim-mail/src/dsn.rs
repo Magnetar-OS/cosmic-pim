@@ -32,8 +32,6 @@
 //! the user "that address is dead" when the truth is "your provider refused
 //! to send" hides the real problem behind a wrong one.
 
-use mail_parser::MimeHeaders as _;
-
 /// How the failure should be read — which is not the same question as which
 /// numeric class the server used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,8 +304,8 @@ fn parse_feedback_report(body: &str) -> Option<BounceRecord> {
 /// Walk a report's parts collecting the `Message-ID` of the bounced original —
 /// it may sit in a `message/rfc822` copy or a `text/rfc822-headers` extract.
 fn original_message_id_from_parts(msg: &mail_parser::Message) -> String {
-    for part in &msg.parts {
-        let Ok(text) = std::str::from_utf8(part.contents()) else {
+    for part in msg.root().parts() {
+        let Some(text) = part_text(part) else {
             continue;
         };
         for line in text.lines() {
@@ -346,13 +344,12 @@ pub fn parse_report(raw: &[u8]) -> Option<Vec<BounceRecord>> {
     }
     let report_type = ct.attribute("report-type").unwrap_or_default();
     let mut records: Vec<BounceRecord> = Vec::new();
-    for part in &msg.parts {
-        let part_subtype = part
-            .content_type()
-            .and_then(mail_parser::ContentType::subtype);
-        let Ok(text) = std::str::from_utf8(part.contents()) else {
+    for part in msg.root().parts() {
+        let part_subtype = part.content_type().and_then(|ct| ct.subtype());
+        let Some(text) = part_text(part) else {
             continue;
         };
+        let text = &*text;
         match part_subtype {
             Some(sub) if sub.eq_ignore_ascii_case("delivery-status") => {
                 records.extend(parse_delivery_status(text));
@@ -482,10 +479,25 @@ fn extract_status_code(text: &str) -> String {
 }
 
 fn human_text(msg: &mail_parser::Message) -> String {
-    (0..msg.text_body.len())
-        .filter_map(|i| msg.body_text(i))
-        .collect::<Vec<_>>()
-        .join("\n")
+    msg.text_bodies().collect::<Vec<_>>().join("\n")
+}
+
+/// A part's body as UTF-8 text: a text part decoded from its charset, any
+/// other leaf part's transfer-decoded bytes when they are UTF-8 — a
+/// `message/delivery-status` part, or the raw copy of a bounced message.
+/// `None` for a multipart, whose body is its children's.
+fn part_text<'m>(part: mail_parser::MessagePart<'m>) -> Option<std::borrow::Cow<'m, str>> {
+    if part.is_multipart() {
+        return None;
+    }
+    part.text().or_else(|| match part.decoded() {
+        std::borrow::Cow::Borrowed(bytes) => std::str::from_utf8(bytes)
+            .ok()
+            .map(std::borrow::Cow::Borrowed),
+        std::borrow::Cow::Owned(bytes) => {
+            String::from_utf8(bytes).ok().map(std::borrow::Cow::Owned)
+        }
+    })
 }
 
 fn first_lines(text: &str, count: usize) -> String {

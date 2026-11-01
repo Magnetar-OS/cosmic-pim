@@ -18,12 +18,12 @@ readme = "../../README.md"
 # Atomic writes and the Contact model a sender resolves against. The mail crate
 # stands *beside* cosmic-pim-caldav rather than on it: IMAP is not a WebDAV
 # flavour and shares none of its plumbing.
-cosmic-pim-core = { path = "../cosmic-pim-core", version = "3.3.0" }
+cosmic-pim-core = { path = "../cosmic-pim-core", version = "4.0.0" }
 
 # The parser boundary. `mail-parser` reads; nothing here ever writes a message
 # back through it — the maildir file holds the server's RFC 5322 bytes verbatim,
 # exactly as the vdir holds a server's iCalendar text.
-mail-parser = "0.11"
+mail-parser = "1.0"
 
 # OpenPGP (RFC 4880) and PGP/MIME (RFC 3156). Verification and decryption
 # only — this crate never generates a key, so rpgp's `rand` requirement (it
@@ -67,7 +67,7 @@ html5ever = "0.40.1"
 # The disposable index. `bundled` compiles SQLite from source so we never
 # depend on the host's libsqlite3 version — the same choice cosmic-pim-core
 # makes for the calendar's cache, and for the same reason.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Mail quoting: what a `>` prefix is, and reading one back off a line. The
 # reply builder here writes the markers a composer will later have to parse,

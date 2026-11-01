@@ -45,7 +45,7 @@ pub fn bytes_of(raw: &[u8], index: usize) -> Result<Vec<u8>> {
     parsed
         .attachments()
         .nth(index)
-        .map(|part| part.contents().to_vec())
+        .map(|part| part.decoded().into_owned())
         .ok_or_else(|| Error::Draft("that attachment is not in the message".into()))
 }
 
@@ -258,6 +258,46 @@ a,b\r\n1,2\r\n\
 
         let bytes = bytes_of(WITH_ATTACHMENT, 0).unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes).trim_end(), "a,b\r\n1,2");
+    }
+
+    /// An image a `multipart/related` HTML body refers to by `cid:` is
+    /// listed, marked inline — the reader and "save all" leave it out — and
+    /// the real attachment after it is still found by its own index.
+    #[test]
+    fn an_image_the_body_refers_to_is_listed_as_inline() {
+        let raw = b"From: a@example.com\r\n\
+Subject: Logo\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"m\"\r\n\
+\r\n\
+--m\r\n\
+Content-Type: multipart/related; boundary=\"r\"\r\n\
+\r\n\
+--r\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<p><img src=\"cid:logo\"></p>\r\n\
+--r\r\n\
+Content-Type: image/png\r\n\
+Content-ID: <logo>\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+iVBORw0KGgo=\r\n\
+--r--\r\n\
+--m\r\n\
+Content-Type: text/csv; name=\"report.csv\"\r\n\
+Content-Disposition: attachment; filename=\"report.csv\"\r\n\
+\r\n\
+a,b\r\n\
+--m--\r\n";
+        let message = Message::parse(raw).unwrap();
+        let listed: Vec<(&str, bool)> = message
+            .attachments
+            .iter()
+            .map(|a| (a.name.as_str(), a.inline))
+            .collect();
+        assert_eq!(listed, [("attachment", true), ("report.csv", false)]);
+        assert_eq!(bytes_of(raw, 1).unwrap(), b"a,b");
     }
 
     #[test]

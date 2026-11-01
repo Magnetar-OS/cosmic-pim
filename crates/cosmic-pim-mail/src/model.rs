@@ -22,7 +22,7 @@
 //! them. Anything that needs a header we did not extract re-parses the file.
 
 use chrono::{DateTime, TimeZone as _, Utc};
-use mail_parser::{Message as ParsedMessage, MessageParser, MimeHeaders as _};
+use mail_parser::{Message as ParsedMessage, MessageParser};
 
 use crate::text::{self, ExtractedText};
 
@@ -405,10 +405,9 @@ impl Message {
         // walker: `extract_plain` exists precisely because html5ever would
         // read a line like `use <div> for layout` as markup.
         let sent_html = msg
-            .html_body
-            .first()
-            .and_then(|index| msg.part(*index))
-            .and_then(mail_parser::MessagePart::content_type)
+            .html_body()
+            .next()
+            .and_then(|part| part.content_type())
             .is_some_and(|ct| {
                 ct.ctype().eq_ignore_ascii_case("text")
                     && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("html"))
@@ -443,11 +442,11 @@ impl Message {
             attachments: attachments(msg),
             auth: crate::auth::from_message(msg),
             unsubscribe: unsubscribe_targets(msg),
-            one_click_unsubscribe: msg.header_raw("List-Unsubscribe-Post").is_some_and(|text| {
+            one_click_unsubscribe: raw_header(msg, "List-Unsubscribe-Post").is_some_and(|text| {
                 text.to_ascii_lowercase()
                     .contains("list-unsubscribe=one-click")
             }),
-            list_id: msg.header_raw("List-Id").and_then(|raw| {
+            list_id: raw_header(msg, "List-Id").and_then(|raw| {
                 // `Display Name <the.actual.id>` — the bracketed part is the
                 // identifier; a bare value without brackets is taken whole.
                 let raw = raw.trim();
@@ -487,14 +486,22 @@ fn strip_angles(id: &str) -> String {
         .to_string()
 }
 
-/// `mail_parser` hands back one address, a group, or a list behind one type;
-/// flatten all three into the shape a UI iterates over.
-fn mailboxes(address: Option<&mail_parser::Address<'_>>) -> Vec<Mailbox> {
-    let Some(address) = address else {
+/// The text of a header as written, after the colon: no RFC 2047 decoding,
+/// no parse into a form. Folded lines stay folded; every caller here scans
+/// for a token or brackets, which folding does not move.
+fn raw_header<'m>(msg: &'m ParsedMessage<'_>, name: &str) -> Option<std::borrow::Cow<'m, str>> {
+    msg.headers()
+        .get(name)
+        .map(|header| String::from_utf8_lossy(header.raw_value()))
+}
+
+/// `mail_parser` keeps an address field's mailboxes and groups in document
+/// order; flatten the groups into the shape a UI iterates over.
+fn mailboxes(list: Option<mail_parser::AddressList<'_>>) -> Vec<Mailbox> {
+    let Some(list) = list else {
         return Vec::new();
     };
-    address
-        .iter()
+    list.mailboxes()
         .filter_map(|addr| {
             let email = addr.address()?.trim();
             if email.is_empty() {
@@ -517,8 +524,8 @@ fn mailboxes(address: Option<&mail_parser::Address<'_>>) -> Vec<Mailbox> {
 /// purpose: they have to cope with the malformed headers real mail carries, and
 /// handing them a list that a parser already gave up on would hide exactly the
 /// cases they exist to handle.
-fn header_id_list(value: &mail_parser::HeaderValue<'_>) -> String {
-    value.as_text_list().map_or_else(String::new, |ids| {
+fn header_id_list(value: Option<mail_parser::TextList<'_>>) -> String {
+    value.map_or_else(String::new, |ids| {
         ids.iter()
             .map(|id| format!("<{}>", id.trim().trim_matches(['<', '>'])))
             .collect::<Vec<_>>()
@@ -532,11 +539,11 @@ fn unsubscribe_targets(msg: &ParsedMessage<'_>) -> Vec<String> {
     // The raw header, not the parsed value: mail-parser reads the
     // angle-bracketed URLs as an address list, and a `https:` URL is not an
     // address it can represent.
-    let Some(value) = msg.header_raw("List-Unsubscribe") else {
+    let Some(value) = raw_header(msg, "List-Unsubscribe") else {
         return Vec::new();
     };
     let mut targets = Vec::new();
-    let mut rest = value;
+    let mut rest = &*value;
     while let Some(start) = rest.find('<') {
         let Some(end) = rest[start..].find('>') else {
             break;
@@ -566,7 +573,7 @@ fn attachments(msg: &ParsedMessage<'_>) -> Vec<Attachment> {
                     None => ct.ctype().to_string(),
                 },
             ),
-            size: part.len(),
+            size: part.decoded_len(),
             inline: part.content_id().is_some(),
         })
         .collect()

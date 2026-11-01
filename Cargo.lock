@@ -466,10 +466,10 @@ dependencies = [
  "ahash",
  "chrono",
  "chrono-tz",
- "hashify",
+ "hashify 0.2.9",
  "jmap-tools",
  "mail-builder",
- "mail-parser",
+ "mail-parser 0.11.9",
  "serde",
  "serde_json",
  "uuid",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-accounts"
-version = "3.3.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-auth"
-version = "3.3.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-caldav"
-version = "3.3.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.23.1",
  "calcard",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-core"
-version = "3.3.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.23.1",
  "calcard",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-mail"
-version = "3.3.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -780,7 +780,7 @@ dependencies = [
  "imap",
  "imap-proto",
  "lettre",
- "mail-parser",
+ "mail-parser 1.0.0",
  "native-tls",
  "openssl",
  "pgp",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-sync"
-version = "3.3.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1262,6 +1262,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
 
 [[package]]
+name = "encodify"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e95d6e27686e1d6991a3077f4dbec9d33d18903466d234165ad86cd08c3ebc79"
+dependencies = [
+ "memchr",
+ "simdutf8",
+]
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1585,6 +1595,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "hashify"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66f5a65bf7824ada2de4a2cf9fa0981dabffc5392bb8550767c3c3d71ed52e4d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -2081,7 +2102,7 @@ version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5bdcd368dcd58a5efaac10c142fb8cddb4d2949af1297b624df3ff0db4cbff54"
 dependencies = [
- "hashify",
+ "hashify 0.2.9",
  "serde",
  "serde_json",
 ]
@@ -2222,9 +2243,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2270,7 +2291,19 @@ version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ec00bda90c6e645a54506c630c2820cd6b1890cfd2b0a169b50f74b2b8c7c86"
 dependencies = [
- "hashify",
+ "hashify 0.2.9",
+]
+
+[[package]]
+name = "mail-parser"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "908e05ffd2f281e4494cdb77552e6df2dc1476da22af811685b37773d415b2df"
+dependencies = [
+ "encodify",
+ "hashify 0.3.1",
+ "memchr",
+ "simdutf8",
 ]
 
 [[package]]
@@ -3264,9 +3297,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.2",
  "chrono",
@@ -3588,6 +3621,12 @@ dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphasher"
