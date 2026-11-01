@@ -282,8 +282,10 @@ pub fn export_collection(meta: &CalendarMeta) -> String {
 /// data and the rename are fsynced) and a reader — vdirsyncer, khal, our own
 /// watcher — never observes a half-written `.ics`.
 ///
-/// This is the unguarded form: it always wins. Use [`write_event_if_unchanged`]
-/// anywhere a second writer might be touching the same file.
+/// Guarded against the file changing between the read it patches and the
+/// rename, as [`write_event_if_unchanged`] with no token is. To guard a whole
+/// editing session — the file read when an editor opened, written when it
+/// saves — pass that read's token to [`write_event_if_unchanged`].
 pub fn write_event(meta: &CalendarMeta, event: &Event) -> Result<(), StoreError> {
     write_event_if_unchanged(meta, event, None).map(|_| ())
 }
@@ -291,9 +293,15 @@ pub fn write_event(meta: &CalendarMeta, event: &Event) -> Result<(), StoreError>
 /// Writes an event, refusing to clobber a file that changed since it was read.
 ///
 /// `expected` is the [`atomic::FileState`] the caller got when it last read the
-/// file. If the file on disk no longer matches, the write is refused with
-/// [`StoreError::Conflict`] and the incoming version is preserved next to the
-/// target as a `.conflict` file — neither side is lost.
+/// file ([`event_file_state`]). If the file on disk no longer matches, the
+/// write is refused with [`StoreError::Conflict`] and the incoming version is
+/// preserved next to the target as a `.conflict` file — neither side is lost.
+///
+/// With `None`, the token is taken here, just before the file is read for
+/// patching: the write is still refused if the file changes between that read
+/// and the rename. Patching a document that a pull rewrote in that window
+/// would write the pull's other components back as they were before it (the
+/// same race contacts guard against, audit F-15).
 ///
 /// This exists for the sync engine. A CalDAV pull and a user edit race on the
 /// same `.ics` routinely, and "last writer wins" silently destroys whichever
@@ -308,6 +316,10 @@ pub fn write_event_if_unchanged(
     }
 
     let target = meta.path.join(&event.file_name);
+    let expected = match expected {
+        Some(expected) => Some(expected),
+        None => atomic::state_of(&target)?,
+    };
 
     // A recurring event's overrides share the file. Serialising the whole file
     // from this one event would delete them, so an existing document is

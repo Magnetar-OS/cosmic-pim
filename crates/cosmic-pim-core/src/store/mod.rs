@@ -349,13 +349,49 @@ impl Store {
     }
 
     /// Writes an event and re-indexes its calendar.
+    ///
+    /// Refused with [`StoreError::Conflict`] if the file changes between the
+    /// read this patches and the write; see [`vdir::write_event`]. An editor
+    /// that wants the whole session guarded uses [`Self::save_if_unchanged`].
     pub fn save(&mut self, event: &Event) -> Result<(), StoreError> {
+        self.save_if_unchanged(event, None)
+    }
+
+    /// The concurrency token for an event's file as it is now: what an editor
+    /// takes when it opens the event, to hand back to
+    /// [`Self::save_if_unchanged`]. `None` when the file does not exist.
+    pub fn event_state(
+        &self,
+        calendar_id: &str,
+        file_name: &str,
+    ) -> Result<Option<crate::atomic::FileState>, StoreError> {
+        let meta = self
+            .calendar(calendar_id)
+            .ok_or_else(|| StoreError::UnknownCalendar(calendar_id.to_owned()))?;
+        vdir::event_file_state(meta, file_name)
+    }
+
+    /// [`Self::save`], refused with [`StoreError::Conflict`] when the event's
+    /// file is no longer as it was at `expected` — the token an editor took
+    /// with [`Self::event_state`] when it opened the event.
+    ///
+    /// A sync pass that pulls a new version of the event while it is being
+    /// edited would otherwise lose that version to the save, and the next push
+    /// would send the stale edit over it with the pull's own etag. Refused,
+    /// the edit is kept beside the file as a `.conflict` copy, the index is
+    /// left alone, and the caller decides: take a fresh token and save again
+    /// to overwrite, or drop the edit.
+    pub fn save_if_unchanged(
+        &mut self,
+        event: &Event,
+        expected: Option<crate::atomic::FileState>,
+    ) -> Result<(), StoreError> {
         let meta = self
             .calendar(&event.calendar_id)
             .ok_or_else(|| StoreError::UnknownCalendar(event.calendar_id.clone()))?
             .clone();
 
-        vdir::write_event(&meta, event)?;
+        vdir::write_event_if_unchanged(&meta, event, expected)?;
         self.index.sync_calendar(&meta)?;
         Ok(())
     }
@@ -1104,6 +1140,59 @@ mod tests {
         assert!(
             restored.iter().all(|o| o.summary == "Renamed"),
             "the generated instance should be back: {restored:?}"
+        );
+    }
+
+    /// An editor that opened an event before a sync pulled a new version of
+    /// it must not save over that version: the save is refused, the edit is
+    /// kept beside the file, and a fresh token lets a deliberate second save
+    /// through.
+    #[test]
+    fn a_save_from_a_stale_editor_is_refused_and_a_fresh_token_lets_it_through() {
+        let (_dir, mut store) = store();
+        let cal = store.create_calendar("Personal", Rgb(1, 2, 3)).unwrap();
+        let mut event = Event::draft(
+            &cal.id,
+            day(2026, 8, 4).and_hms_opt(9, 0, 0).unwrap(),
+            store.local,
+        );
+        event.summary = "Lunch".into();
+        store.save(&event).unwrap();
+
+        // The editor opens the event and takes its token.
+        let opened = store.event_state(&cal.id, &event.file_name).unwrap();
+        assert!(opened.is_some());
+
+        // A pull rewrites it meanwhile: a different length, so the token's
+        // size differs even within the same second.
+        let mut pulled = event.clone();
+        pulled.summary = "Lunch with Ada, moved to the café".into();
+        store.save(&pulled).unwrap();
+
+        let mut edited = event.clone();
+        edited.summary = "Lunch (edited)".into();
+        let refused = store.save_if_unchanged(&edited, opened);
+        let Err(StoreError::Conflict { conflict, .. }) = refused else {
+            panic!("expected a conflict, got {refused:?}");
+        };
+        assert!(
+            std::fs::read_to_string(&conflict)
+                .unwrap()
+                .contains("Lunch (edited)"),
+            "the edit is kept beside the file"
+        );
+        assert_eq!(
+            store.event(&cal.id, &event.uid).unwrap().unwrap().summary,
+            "Lunch with Ada, moved to the café",
+            "the pulled version is still the event"
+        );
+
+        // Saving again on purpose, with the file's token as it is now.
+        let fresh = store.event_state(&cal.id, &event.file_name).unwrap();
+        store.save_if_unchanged(&edited, fresh).unwrap();
+        assert_eq!(
+            store.event(&cal.id, &event.uid).unwrap().unwrap().summary,
+            "Lunch (edited)"
         );
     }
 
