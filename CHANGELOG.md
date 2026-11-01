@@ -7,6 +7,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.1.1] - 2026-11-01
+
+### Changed
+
+- The crates require the latest releases of their dependencies: uuid 1.29
+  and cosmic-ext-nib-text 1.2.1.
+
 ## [4.1.0] - 2026-11-01
 
 ### Added
