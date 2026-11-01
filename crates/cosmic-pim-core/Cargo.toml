@@ -42,7 +42,7 @@ rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 notify = "8.2"
 
 # --- misc ---
-uuid = { version = "1.26", features = ["v4"] }
+uuid = { version = "1.29", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
 dirs = "7"
