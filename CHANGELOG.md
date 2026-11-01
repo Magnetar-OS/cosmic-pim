@@ -7,6 +7,37 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-11-01
+
+### Fixed
+
+- An image or other media part sent with `Content-Disposition: inline` and
+  no `Content-ID` — a photo after the text of a `multipart/mixed` mail — is
+  listed in `Message::attachments` again, and `attachment::bytes_of` finds
+  it. mail-parser 1.0 counts such a part as body media, as RFC 8621 does,
+  and 4.0.0 took its attachment list as it stood; this crate extracts the
+  body as text, so the part was shown nowhere and could not be saved.
+
+### Notes
+
+What 4.0 changes in practice, measured by parsing mail-parser's own corpora
+of 0.11 and 1.0 — 895 messages, many deliberately malformed — with 3.3.0
+and with this release and comparing the extracted `Message`. 836 come out
+the same. The rest are the parser fixes 1.0 lists, seen from here:
+
+- 3.3.0 panicked on one of them (a malformed multipart); 4.0 reads it.
+- A header name with a stray colon, blank or form feed no longer passes for
+  `From:`: 3.3.0 showed the address an attacker put there, 4.0 shows the
+  one DKIM and DMARC verify.
+- A `--boundary` inside a line no longer cuts the body short, and several
+  `message/rfc822` parts that 3.3.0 read as one are three.
+- In damaged mail, text that 3.3.0 filed as a nameless attachment is the
+  body.
+- A `multipart/alternative` whose HTML part has a file name shows the plain
+  text, and offers the HTML as an attachment (RFC 8621).
+- An attachment's size is its transfer-decoded byte count — what saving it
+  writes. 3.3.0 measured a text attachment after charset conversion.
+
 ## [4.0.0] - 2026-11-01
 
 A major version for two dependencies that are part of the API: rusqlite

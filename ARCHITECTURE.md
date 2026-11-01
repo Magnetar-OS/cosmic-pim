@@ -807,7 +807,7 @@ the substrate, the project-level conventions and the deliberate divergences:
 
 ## Testing
 
-1404 tests in the substrate at 4.0.0, `cargo test --workspace`, and two ignored
+1405 tests in the substrate at 4.0.1, `cargo test --workspace`, and two ignored
 unless asked for: the performance baseline and the live CalDAV server test.
 
 `caldav/tests/live_server.rs` is the odd one out: it scripts nothing. Gated on

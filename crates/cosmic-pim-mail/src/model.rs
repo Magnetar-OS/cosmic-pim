@@ -558,8 +558,29 @@ fn unsubscribe_targets(msg: &ParsedMessage<'_>) -> Vec<String> {
     targets
 }
 
+/// The parts a reader offers as files, in document order.
+///
+/// mail-parser's attachment list follows RFC 8621, which counts an image or
+/// other media the sender marked inline as part of the *body*. A JMAP client
+/// that renders the body shows it there; this crate extracts the body as
+/// text, so such a part would be shown nowhere and could not be saved. It is
+/// listed here instead, as mail-parser 0.11 listed it. Text and HTML parts of
+/// the body are not files and are left out.
+///
+/// [`crate::attachment::bytes_of`] indexes this same sequence.
+pub(crate) fn attachment_parts<'m>(
+    msg: &'m ParsedMessage<'_>,
+) -> impl Iterator<Item = mail_parser::MessagePart<'m>> {
+    msg.root().parts().filter(|part| {
+        part.is_attachment()
+            || ((part.in_text_body() || part.in_html_body())
+                && !part.is_text()
+                && !part.is_multipart())
+    })
+}
+
 fn attachments(msg: &ParsedMessage<'_>) -> Vec<Attachment> {
-    msg.attachments()
+    attachment_parts(msg)
         .map(|part| Attachment {
             name: part
                 .attachment_name()

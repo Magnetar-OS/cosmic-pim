@@ -42,8 +42,7 @@ pub fn bytes_of(raw: &[u8], index: usize) -> Result<Vec<u8>> {
         .parse(raw)
         .ok_or_else(|| Error::Draft("that message could not be read".into()))?;
 
-    parsed
-        .attachments()
+    crate::model::attachment_parts(&parsed)
         .nth(index)
         .map(|part| part.decoded().into_owned())
         .ok_or_else(|| Error::Draft("that attachment is not in the message".into()))
@@ -298,6 +297,38 @@ a,b\r\n\
             .collect();
         assert_eq!(listed, [("attachment", true), ("report.csv", false)]);
         assert_eq!(bytes_of(raw, 1).unwrap(), b"a,b");
+    }
+
+    /// An image sent with `Content-Disposition: inline` after the text is
+    /// body media to RFC 8621, and mail-parser 1.0 leaves it out of its
+    /// attachment list. The body here is text, so it would be shown nowhere
+    /// and could not be saved: it stays listed, and its bytes come out.
+    #[test]
+    fn an_inline_image_after_the_text_is_still_offered() {
+        let raw = b"From: a@example.com\r\n\
+Subject: Photo\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"m\"\r\n\
+\r\n\
+--m\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Here it is.\r\n\
+--m\r\n\
+Content-Type: image/png; name=\"ball.png\"\r\n\
+Content-Disposition: inline; filename=\"ball.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+iVBORw0KGgo=\r\n\
+--m--\r\n";
+        let message = Message::parse(raw).unwrap();
+        let listed: Vec<(&str, bool)> = message
+            .attachments
+            .iter()
+            .map(|a| (a.name.as_str(), a.inline))
+            .collect();
+        assert_eq!(listed, [("ball.png", false)]);
+        assert_eq!(bytes_of(raw, 0).unwrap(), b"\x89PNG\r\n\x1a\n");
     }
 
     #[test]
