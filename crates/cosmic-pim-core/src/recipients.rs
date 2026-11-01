@@ -14,8 +14,11 @@
 //! form that completes from it opens — and match against that copy on every
 //! keystroke ([`complete`], [`accept`]).
 //!
-//! A field is a comma-separated list. What is completed is the entry being
-//! typed, after the last comma; the ones before it are left as they are.
+//! A field is a comma-separated list, as an RFC 5322 address list is: a comma
+//! inside a quoted display name (`"Lovelace, Ada" <ada@example>`) or between
+//! angle brackets does not end a recipient ([`split`], [`parse`]). What is
+//! completed is the entry being typed, after the last separating comma; the
+//! ones before it are left as they are.
 
 use std::path::Path;
 
@@ -33,19 +36,12 @@ pub struct Known {
 }
 
 impl Known {
-    /// How it is written into a recipient field: `Name <address>`.
-    ///
-    /// A comma in the name is dropped rather than quoted: the field is split
-    /// on commas, and "Lovelace, Ada" would come back as two recipients.
+    /// How it is written into a recipient field: `Name <address>`, with the
+    /// name quoted when it holds a comma or another character that would
+    /// change how the field reads ([`mailbox`]).
     #[must_use]
     pub fn mailbox(&self) -> String {
-        let name = self.name.replace(',', " ");
-        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-        if name.is_empty() || name.eq_ignore_ascii_case(&self.address) {
-            self.address.clone()
-        } else {
-            format!("{name} <{}>", self.address)
-        }
+        mailbox(&self.name, &self.address)
     }
 }
 
@@ -114,14 +110,134 @@ pub fn read_address_book_at(root: &Path) -> Vec<Known> {
     }
 }
 
-/// What is being typed: the text after the last comma.
-fn typing(field: &str) -> &str {
-    field.rsplit(',').next().unwrap_or(field).trim()
+/// Writes one recipient: `address` alone when there is no name to show,
+/// `Name <address>` otherwise.
+///
+/// A name holding any of RFC 5322's specials — a comma above all — is
+/// quoted, with `"` and `\` escaped inside, so the field reads back as the
+/// one recipient it is ([`parse`]). Whitespace runs in the name collapse to
+/// one space.
+#[must_use]
+pub fn mailbox(name: &str, address: &str) -> String {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() || name.eq_ignore_ascii_case(address) {
+        return address.to_owned();
+    }
+    if name.contains([',', ';', '<', '>', '"', '\\', '@', ':', '(', ')', '[', ']']) {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\" <{address}>")
+    } else {
+        format!("{name} <{address}>")
+    }
 }
 
-/// The recipients already finished: everything before the last comma.
+/// The byte offsets of the commas in `field` that separate recipients: not
+/// one inside double quotes (where a backslash escapes the next character)
+/// or inside angle brackets.
+fn separators(field: &str) -> Vec<usize> {
+    let mut at = Vec::new();
+    let (mut quoted, mut escaped, mut angle) = (false, false, false);
+    for (index, c) in field.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => quoted = true,
+            '<' => angle = true,
+            '>' => angle = false,
+            ',' if !angle => at.push(index),
+            _ => {}
+        }
+    }
+    at
+}
+
+/// The recipients in a field, each trimmed, empty ones left out.
+#[must_use]
+pub fn split(field: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut start = 0;
+    for at in separators(field).into_iter().chain([field.len()]) {
+        let entry = field[start..at].trim();
+        if !entry.is_empty() {
+            entries.push(entry);
+        }
+        start = at + 1;
+    }
+    entries
+}
+
+/// One recipient, as typed, into its display name and its address: `Name
+/// <address>`, `"Quoted, Name" <address>` or a bare `address`. The name is
+/// unquoted and unescaped; the address is returned as written.
+#[must_use]
+pub fn parse(entry: &str) -> (Option<String>, String) {
+    let entry = entry.trim();
+    // The angle bracket that opens the address: the last one outside quotes,
+    // so a `<` inside a quoted name is not mistaken for it.
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut open = None;
+    for (index, c) in entry.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            quoted = true;
+        } else if c == '<' {
+            open = Some(index);
+        }
+    }
+    let Some(open) = open else {
+        return (None, entry.to_owned());
+    };
+    let address = entry[open + 1..]
+        .trim_end()
+        .trim_end_matches('>')
+        .trim()
+        .to_owned();
+    let name = entry[..open].trim();
+    let name = match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(inner) => {
+            let mut unescaped = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    unescaped.extend(chars.next());
+                } else {
+                    unescaped.push(c);
+                }
+            }
+            unescaped
+        }
+        None => name.to_owned(),
+    };
+    let name = name.trim();
+    ((!name.is_empty()).then(|| name.to_owned()), address)
+}
+
+/// What is being typed: the text after the last separating comma.
+fn typing(field: &str) -> &str {
+    separators(field)
+        .last()
+        .map_or(field, |&at| &field[at + 1..])
+        .trim()
+}
+
+/// The recipients already finished: everything before the last separating
+/// comma.
 fn finished(field: &str) -> &str {
-    field.rfind(',').map_or("", |at| &field[..at])
+    separators(field).last().map_or("", |&at| &field[..at])
 }
 
 /// The completions for what is being typed at the end of `field`.
@@ -337,7 +453,71 @@ mod tests {
             address: "ada@analytical.example".to_owned(),
         };
 
-        assert_eq!(known.mailbox(), "Lovelace Ada <ada@analytical.example>");
+        assert_eq!(
+            known.mailbox(),
+            "\"Lovelace, Ada\" <ada@analytical.example>"
+        );
+        assert_eq!(
+            split(&format!("{}, grace@navy.example", known.mailbox()))
+                .into_iter()
+                .map(parse)
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some("Lovelace, Ada".to_owned()),
+                    "ada@analytical.example".to_owned()
+                ),
+                (None, "grace@navy.example".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_with_quotes_and_backslashes_round_trips() {
+        let written = mailbox(r#"Ada "Countess" \ Lovelace"#, "ada@analytical.example");
+        assert_eq!(
+            written,
+            r#""Ada \"Countess\" \\ Lovelace" <ada@analytical.example>"#
+        );
+        assert_eq!(
+            parse(&written),
+            (
+                Some(r#"Ada "Countess" \ Lovelace"#.to_owned()),
+                "ada@analytical.example".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn fields_split_on_commas_outside_quotes_and_brackets_only() {
+        assert_eq!(
+            split(r#"ada@x.example, "Doe, Jane" <jane@y.example> ,, Bob <bob@z.example>"#),
+            [
+                "ada@x.example",
+                r#""Doe, Jane" <jane@y.example>"#,
+                "Bob <bob@z.example>"
+            ]
+        );
+        assert_eq!(split("  , ,"), Vec::<&str>::new());
+        assert_eq!(
+            parse("Bob Smith <Bob@Example.NET>"),
+            (Some("Bob Smith".to_owned()), "Bob@Example.NET".to_owned())
+        );
+        assert_eq!(parse("cleo@x.org"), (None, "cleo@x.org".to_owned()));
+    }
+
+    #[test]
+    fn completing_after_a_quoted_comma_keeps_the_finished_recipient_whole() {
+        let ada = "\"Lovelace, Ada\" <ada@analytical.example>";
+        let field = format!("{ada}, gra");
+        assert_eq!(
+            addresses(&complete(&book(), &field)),
+            ["grace@navy.example"]
+        );
+        assert_eq!(
+            accept(&field, &book()[2]),
+            format!("{ada}, Grace Hopper <grace@navy.example>, ")
+        );
     }
 
     #[test]
