@@ -34,7 +34,7 @@ quick-xml = "0.42.0"
 # the document's own VTIMEZONE blocks to resolve a TZID when it reformats a
 # time. Pinned together with core's copy on purpose: two versions here would
 # mean the read path and the write path could disagree about a zone.
-calcard = "0.3.13"
+calcard = "0.3.14"
 
 # Basic auth header encoding. App passwords are still how most self-hosted
 # CalDAV is reached, OAuth notwithstanding.

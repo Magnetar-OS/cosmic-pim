@@ -23,7 +23,7 @@ chrono = { version = "0.4.45", features = ["clock", "serde"] }
 chrono-tz = "0.10.4"
 # Only for `local_timezone()`: jiff reads /etc/localtime and TZ. It is already
 # in the workspace graph via libcosmic's calendar widget, so this is free.
-jiff = "0.2.35"
+jiff = "0.2.38"
 
 # --- iCalendar / recurrence ---
 # calcard is the suite's single iCalendar/vCard parser. It replaced the
@@ -32,7 +32,7 @@ jiff = "0.2.35"
 # two parsers with different TZID handling reading the SAME vdir is a genuine
 # bug source, not a style preference. It also parses vCard, which is what makes
 # a contacts app a new module rather than a new dependency.
-calcard = "0.3.13"
+calcard = "0.3.14"
 rrule = "0.14"
 
 # --- storage ---
@@ -48,7 +48,7 @@ tracing = "0.1"
 dirs = "7"
 serde = { version = "1.0.229", features = ["derive"] }
 # The watcher hands debounced bursts to the UI over a tokio channel.
-tokio = { version = "1.53", features = ["sync", "time"] }
+tokio = { version = "1.54", features = ["sync", "time"] }
 
 # Inline PHOTO payloads are base64 in both vCard dialects; setting one means
 # encoding. Same version as cosmic-pim-accounts, deliberately.
@@ -56,7 +56,7 @@ base64 = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1.53", features = ["macros", "rt", "time"] }
+tokio = { version = "1.54", features = ["macros", "rt", "time"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
