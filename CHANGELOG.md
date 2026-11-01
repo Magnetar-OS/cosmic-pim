@@ -7,6 +7,33 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-11-01
+
+### Added
+
+- `Store::event_state` and `Store::save_if_unchanged` (cosmic-pim-core):
+  an editor takes the event file's token when it opens the event and saves
+  against it. If a sync pulled a new version of the event meanwhile, the
+  save is refused with `StoreError::Conflict` and the edit is kept beside
+  the file as a `.conflict` copy, instead of replacing the pulled version
+  and having the next push send the stale edit over the server's.
+- `recipients::split`, `recipients::parse` and `recipients::mailbox`
+  (cosmic-pim-core): an address field split on commas outside quoted names
+  and angle brackets, an entry read into its unquoted name and its address,
+  and a recipient written back with its name quoted when it holds an
+  RFC 5322 special.
+
+### Changed
+
+- Every event write is guarded against the file changing between the read
+  it patches and the rename (`vdir::write_event`, and so `Store::save`), and
+  fails with `StoreError::Conflict` when it does. It used to write the pull's
+  other components back as they were before it.
+- `Known::mailbox` quotes a name holding a comma (`"Lovelace, Ada"
+  <ada@…>`) instead of dropping the comma, and completion finds the entry
+  being typed with the same quote-aware splitting.
+- calcard 0.3.14, jiff 0.2.38, tokio 1.54.
+
 ## [4.0.1] - 2026-11-01
 
 ### Fixed
