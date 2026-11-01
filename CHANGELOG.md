@@ -7,6 +7,13 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.1.2] - 2026-11-01
+
+### Changed
+
+- cosmic-pim-mail requires cosmic-ext-nib-text 1.2.2, whose published crate
+  states the same minimum Rust version as this workspace (1.99.1).
+
 ## [4.1.1] - 2026-11-01
 
 ### Changed

@@ -668,9 +668,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cosmic-ext-nib-model"
-version = "1.2.1"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0264c11e35fff11f117bfb7f454601ffc9df4708c141bf8f293b7ce312f6126"
+checksum = "67563315201ec9ebdc48778a5710c21d759789e359f576584434b18aacc2aa68"
 dependencies = [
  "regex",
  "thiserror",
@@ -679,9 +679,9 @@ dependencies = [
 
 [[package]]
 name = "cosmic-ext-nib-text"
-version = "1.2.1"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "237bf8ceea04feac191f5c43a60388b31102f76561afa96243f6653885cbc634"
+checksum = "8a170580d56c749c9f540e58c7f20d4c751423390081828370f2a569be9296aa"
 dependencies = [
  "cosmic-ext-nib-model",
  "unicode-segmentation",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-accounts"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-auth"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-caldav"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "base64 0.23.1",
  "calcard",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-core"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "base64 0.23.1",
  "calcard",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-mail"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-pim-sync"
-version = "4.1.1"
+version = "4.1.2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
