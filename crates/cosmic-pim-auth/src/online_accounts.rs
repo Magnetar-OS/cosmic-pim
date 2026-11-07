@@ -33,15 +33,22 @@
 //! rather than activating it. A desktop without GOA installed is the ordinary
 //! case, and asking the bus to start a service that is not there costs a
 //! timeout on every launch.
+//!
+//! # Blocking
+//!
+//! Every method waits for the daemon's answer on the calling thread, driving
+//! the bus with [`zbus::block_on`]. Call them from a worker thread, as the
+//! sync engine and the applications do — never from inside an async task,
+//! where `block_on` panics or stalls the runtime it would be waiting on.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use cosmic_pim_accounts::OAuthCredential;
-use zbus::blocking::{Connection, Proxy, fdo::DBusProxy, fdo::ObjectManagerProxy};
+use zbus::fdo::{DBusProxy, ManagedObjects, ObjectManagerProxy};
 use zbus::names::BusName;
-use zbus::zvariant::OwnedValue;
+use zbus::{Connection, OwnedVariant, Proxy};
 
 use crate::error::{Error, Result};
 
@@ -140,9 +147,12 @@ impl OnlineAccounts {
     /// `Ok(None)` when it is not — which is every desktop that does not ship
     /// it, and not an error.
     pub fn connect() -> Result<Option<Self>> {
-        let connection = zbus::blocking::connection::Builder::session()
-            .and_then(|builder| builder.method_timeout(CALL_TIMEOUT).build())
-            .map_err(bus_error)?;
+        let connection = zbus::block_on(
+            zbus::connection::Builder::session()
+                .method_timeout(CALL_TIMEOUT)
+                .build(),
+        )
+        .map_err(bus_error)?;
         Self::on(connection)
     }
 
@@ -150,20 +160,20 @@ impl OnlineAccounts {
     /// in a test.
     pub fn on(connection: Connection) -> Result<Option<Self>> {
         let name = BusName::try_from(BUS).map_err(|why| Error::Protocol(why.to_string()))?;
-        let running = DBusProxy::new(&connection)
-            .and_then(|bus| bus.name_has_owner(name).map_err(Into::into))
-            .map_err(bus_error)?;
+        let running = zbus::block_on(async {
+            DBusProxy::new(&connection)
+                .await?
+                .name_has_owner(name)
+                .await
+                .map_err(zbus::Error::from)
+        })
+        .map_err(bus_error)?;
         Ok(running.then_some(Self { connection }))
     }
 
     /// Every account GOA holds that carries an OAuth grant.
     pub fn list(&self) -> Result<Vec<OnlineAccount>> {
-        let objects = ObjectManagerProxy::builder(&self.connection)
-            .destination(BUS)
-            .and_then(|builder| builder.path(ROOT))
-            .and_then(|builder| builder.build())
-            .and_then(|manager| manager.get_managed_objects().map_err(Into::into))
-            .map_err(bus_error)?;
+        let objects = zbus::block_on(self.managed_objects()).map_err(bus_error)?;
 
         let mut accounts: Vec<OnlineAccount> = objects
             .values()
@@ -195,18 +205,19 @@ impl OnlineAccounts {
     /// way to get the next token is to ask here again.
     pub fn access_token(&self, id: &str) -> Result<OAuthCredential> {
         let path = self.path_of(id)?;
-        let proxy = |interface: &'static str| {
-            Proxy::new(&self.connection, BUS, path.as_str(), interface).map_err(bus_error)
-        };
+        let proxy =
+            |interface: &'static str| Proxy::new(&self.connection, BUS, path.as_str(), interface);
 
-        // Ask GOA to make sure the grant is live before asking for a token:
-        // `GetAccessToken` alone hands back whatever is cached.
-        proxy(ACCOUNT)?
-            .call::<_, _, i32>("EnsureCredentials", &())
-            .map_err(call_error)?;
-        let (access_token, expires_in): (String, i32) = proxy(OAUTH2)?
-            .call("GetAccessToken", &())
-            .map_err(call_error)?;
+        let (access_token, expires_in): (String, i32) = zbus::block_on(async {
+            // Ask GOA to make sure the grant is live before asking for a
+            // token: `GetAccessToken` alone hands back whatever is cached.
+            proxy(ACCOUNT)
+                .await?
+                .call::<_, _, i32>("EnsureCredentials", &())
+                .await?;
+            proxy(OAUTH2).await?.call("GetAccessToken", &()).await
+        })
+        .map_err(call_error)?;
 
         Ok(OAuthCredential {
             access_token,
@@ -231,12 +242,7 @@ impl OnlineAccounts {
     ///
     /// Looked up rather than built from the id: the path is GOA's to choose.
     fn path_of(&self, id: &str) -> Result<String> {
-        let objects = ObjectManagerProxy::builder(&self.connection)
-            .destination(BUS)
-            .and_then(|builder| builder.path(ROOT))
-            .and_then(|builder| builder.build())
-            .and_then(|manager| manager.get_managed_objects().map_err(Into::into))
-            .map_err(bus_error)?;
+        let objects = zbus::block_on(self.managed_objects()).map_err(bus_error)?;
         objects
             .iter()
             .find(|(_, interfaces)| {
@@ -252,15 +258,27 @@ impl OnlineAccounts {
                 )
             })
     }
+
+    /// Every object GOA exports, with its interfaces and their properties.
+    async fn managed_objects(&self) -> zbus::Result<ManagedObjects> {
+        ObjectManagerProxy::builder(&self.connection)
+            .destination(BUS)
+            .path(ROOT)
+            .build()
+            .await?
+            .get_managed_objects()
+            .await
+            .map_err(zbus::Error::from)
+    }
 }
 
-fn text(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+fn text(properties: &HashMap<String, OwnedVariant>, key: &str) -> Option<String> {
     properties
         .get(key)
         .and_then(|value| value.downcast_ref::<String>().ok())
 }
 
-fn flag(properties: &HashMap<String, OwnedValue>, key: &str) -> bool {
+fn flag(properties: &HashMap<String, OwnedVariant>, key: &str) -> bool {
     properties
         .get(key)
         .and_then(|value| value.downcast_ref::<bool>().ok())
@@ -298,7 +316,7 @@ fn call_error(why: zbus::Error) -> Error {
 pub(crate) mod testing {
     use std::io::BufRead as _;
 
-    use zbus::blocking::Connection;
+    use zbus::Connection;
 
     use super::{BUS, ROOT};
 
@@ -360,43 +378,30 @@ pub(crate) mod testing {
 
         /// A new connection to this bus.
         pub(crate) fn connect(&self) -> Connection {
-            zbus::blocking::connection::Builder::address(self.address.as_str())
-                .expect("a valid bus address")
-                .build()
+            zbus::block_on(zbus::connection::Builder::address(self.address.as_str()).build())
                 .expect("connecting to the private bus")
         }
 
         /// Puts a stand-in GOA daemon on the bus, holding `accounts`. The
         /// returned connection is the daemon: drop it and the name is gone.
         pub(crate) fn serve(&self, accounts: Vec<FakeAccount>) -> Connection {
-            let mut builder = zbus::blocking::connection::Builder::address(self.address.as_str())
-                .expect("a valid bus address")
-                .serve_at(ROOT, zbus::fdo::ObjectManager)
-                .expect("the object manager");
+            let mut builder = zbus::connection::Builder::address(self.address.as_str())
+                .serve_at(ROOT, zbus::fdo::ObjectManager);
             for account in accounts {
                 // Owned: the builder keeps the path past this iteration.
-                let path =
-                    zbus::zvariant::ObjectPath::try_from(format!("{ROOT}/Accounts/{}", account.id))
-                        .expect("a valid object path");
+                let path = zbus::ObjectPath::try_from(format!("{ROOT}/Accounts/{}", account.id))
+                    .expect("a valid object path");
                 if account.oauth {
-                    builder = builder
-                        .serve_at(
-                            path.clone(),
-                            FakeOAuth2 {
-                                token: account.token.clone(),
-                            },
-                        )
-                        .expect("the OAuth2 interface");
+                    builder = builder.serve_at(
+                        path.clone(),
+                        FakeOAuth2 {
+                            token: account.token.clone(),
+                        },
+                    );
                 }
-                builder = builder
-                    .serve_at(path, account)
-                    .expect("the account interface");
+                builder = builder.serve_at(path, account);
             }
-            builder
-                .name(BUS)
-                .expect("the GOA name")
-                .build()
-                .expect("the stand-in daemon")
+            zbus::block_on(builder.name(BUS).build()).expect("the stand-in daemon")
         }
     }
 

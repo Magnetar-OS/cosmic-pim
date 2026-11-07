@@ -23,7 +23,7 @@ chrono = { version = "0.4.45", features = ["clock", "serde"] }
 chrono-tz = "0.10.4"
 # Only for `local_timezone()`: jiff reads /etc/localtime and TZ. It is already
 # in the workspace graph via libcosmic's calendar widget, so this is free.
-jiff = "0.2.38"
+jiff = "0.2.39"
 
 # --- iCalendar / recurrence ---
 # calcard is the suite's single iCalendar/vCard parser. It replaced the
