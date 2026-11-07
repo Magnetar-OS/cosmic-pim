@@ -7,6 +7,17 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-11-07
+
+### Changed
+
+- **Breaking:** cosmic-pim-auth is built on zbus 6, as libcosmic and the
+  applications now are. `OnlineAccounts::on` takes a zbus 6
+  `zbus::Connection` instead of a zbus 5 `zbus::blocking::Connection`. The
+  other methods are unchanged and still block the calling thread: call them
+  from a worker thread, never from inside an async task.
+- The crates require toml 1.2, uuid 1.29.1 and jiff 0.2.39.
+
 ## [4.1.2] - 2026-11-01
 
 ### Changed
