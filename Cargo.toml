@@ -10,14 +10,14 @@ members = [
 ]
 
 [workspace.package]
-version = "5.0.0"
+version = "6.0.0"
 edition = "2024"
 # MPL-2.0 throughout. The applications built on these crates are GPL-3.0-only
 # and link them without absorbing them — see LICENSING.md for why the split
 # exists and the one trap (Exhibit B) to avoid.
 license = "MPL-2.0"
 repository = "https://github.com/Magnetar-OS/cosmic-pim"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 
 [profile.release]
 lto = "thin"

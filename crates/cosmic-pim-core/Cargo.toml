@@ -23,7 +23,7 @@ chrono = { version = "0.4.45", features = ["clock", "serde"] }
 chrono-tz = "0.10.4"
 # Only for `local_timezone()`: jiff reads /etc/localtime and TZ. It is already
 # in the workspace graph via libcosmic's calendar widget, so this is free.
-jiff = "0.2.39"
+jiff = "1.0.1"
 
 # --- iCalendar / recurrence ---
 # calcard is the suite's single iCalendar/vCard parser. It replaced the
@@ -38,7 +38,7 @@ rrule = "0.14"
 # --- storage ---
 # `bundled` compiles SQLite from source so we never depend on the host's
 # libsqlite3 version.
-rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.43", features = ["bundled", "chrono"] }
 notify = "8.2"
 
 # --- misc ---

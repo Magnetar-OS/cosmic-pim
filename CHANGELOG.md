@@ -7,6 +7,20 @@ Cargo's reading of [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-11-21
+
+### Changed
+
+- **Breaking:** cosmic-pim-core and cosmic-pim-mail are built on rusqlite
+  0.43. `StoreError::Sqlite` carries a rusqlite 0.43 `rusqlite::Error`, so
+  code that matches on it moves with it, and an application linking
+  rusqlite itself has to be on 0.43 too: two rusqlite majors cannot share
+  one bundled SQLite in a build.
+- The minimum supported Rust version is 1.100.0, raised from 1.99.1. The
+  pinned toolchain and `rust-version` move together.
+- The crates require jiff 1.0.1, the major libcosmic resolves, uuid 1.29.3
+  and cosmic-ext-nib-text 1.2.3.
+
 ## [5.0.0] - 2026-11-07
 
 ### Changed
