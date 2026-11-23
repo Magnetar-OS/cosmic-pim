@@ -7,4 +7,7 @@
 # or a fix for one of these, is noticed on the next push.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 (Marvin timing side channel), reached through pgp 0.20 from cosmic-pim-mail. No fixed rsa release exists (0.10 is a release candidate) and pgp 0.20 requires rsa ^0.9. The mail crate verifies with public keys; the attack needs private-key operations. Revisit when pgp moves to rsa 0.10 (audit C-03)." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (operations meant to be constant-time vary with the operands), reached through pgp 0.21 by way of elliptic-curve 0.13 and cx448. The fix is 0.7.6+, which pgp cannot take until it leaves elliptic-curve 0.13; 0.21.1 is the newest pgp. Same position as RUSTSEC-2023-0071: PGP runs on the user's machine, once per message they open, with no oracle exposed. Revisit on the pgp release that moves to elliptic-curve 0.14." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono was declared unmaintained on 2026-09-14; no patched release exists. It is the domain time type here because rrule 0.14 and the iCalendar layer are built on it (see cosmic-pim-core/Cargo.toml). Revisit when rrule offers a jiff or time backend." },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained along with chrono (RUSTSEC-2026-0543) and is required by rrule 0.14 for the same reason. Revisit together." },
 ]
