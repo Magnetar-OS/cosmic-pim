@@ -173,9 +173,9 @@ pub fn split(field: &str) -> Vec<&str> {
     entries
 }
 
-/// One recipient, as typed, into its display name and its address: `Name
-/// <address>`, `"Quoted, Name" <address>` or a bare `address`. The name is
-/// unquoted and unescaped; the address is returned as written.
+/// One recipient, as typed, into its display name and its address:
+/// `Name <address>`, `"Quoted, Name" <address>` or a bare `address`. The name
+/// is unquoted and unescaped; the address is returned as written.
 #[must_use]
 pub fn parse(entry: &str) -> (Option<String>, String) {
     let entry = entry.trim();
